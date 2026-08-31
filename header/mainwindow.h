@@ -42,6 +42,8 @@ class SecurityManager;
 class PointModel;
 class VerificationManager;
 class DeliveryManager;
+class McpServer;
+class AgentToolRegistry;
 
 struct PollTask;
 struct BatchTask;
@@ -58,6 +60,7 @@ private:
     void initActions();
     void initAdvancedFeatures();
     void initMenus();
+    void initMcpAgent();                       // AI/MCP：构建共用工具注册表与 MCP 服务器
     QModbusDataUnit readRequest() const;
     QModbusDataUnit writeRequest() const;
 
@@ -92,6 +95,7 @@ private slots:
     void showTemplateManager();
     void showScriptConsole();
     void toggleRemoteServer();
+    void toggleMcpServer();
     void showPluginManager();
     void showPointManager();
     void showVerificationManager();
@@ -134,6 +138,8 @@ private:
     PointModel *m_pointModel;
     VerificationManager *m_verificationManager;
     DeliveryManager *m_deliveryManager;
+    McpServer *m_mcpServer = nullptr;              // MCP 服务器（AI 能力出口之一）
+    AgentToolRegistry *m_agentTools = nullptr;     // AI Agent / MCP 共用工具注册表
     QMap<int, int> m_pointChartSeriesMap;
     QMap<int, int> m_pointDashboardGaugeMap;
 };

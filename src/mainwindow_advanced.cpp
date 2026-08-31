@@ -20,6 +20,8 @@
 #include "deliverymanager.h"
 #include "logviewer.h"
 #include "settingsdialog.h"
+#include "mcpserver.h"     // AI/MCP：MCP 服务器（Streamable HTTP + tools/resources/prompts）
+#include "agenttool.h"     // AI/MCP：Agent/MCP 共用工具注册表
 
 #include <QFileDialog>
 #include <QMessageBox>
@@ -1042,6 +1044,478 @@ void MainWindow::toggleRemoteServer()
         } else {
             statusBar()->showMessage("远程服务启动失败", 5000);
         }
+    }
+}
+
+// ==================== AI / MCP 支持 ====================
+// 设计文档：doc/AI_AGENT_MCP_DESIGN.md
+// 工具注册表（AgentToolRegistry）是内嵌 AI Agent（agent 分支）与 MCP Server（本分支）
+// 的共用层：工具定义一次，两端复用。
+
+// ---- 枚举与结构体 -> JSON 序列化辅助 ----
+
+static QString alarmConditionToString(AlarmCondition condition)
+{
+    switch (condition) {
+    case AlarmCondition::GreaterThan: return QStringLiteral("GreaterThan");
+    case AlarmCondition::LessThan:    return QStringLiteral("LessThan");
+    case AlarmCondition::Equal:       return QStringLiteral("Equal");
+    case AlarmCondition::NotEqual:    return QStringLiteral("NotEqual");
+    case AlarmCondition::InRange:     return QStringLiteral("InRange");
+    case AlarmCondition::OutOfRange:  return QStringLiteral("OutOfRange");
+    case AlarmCondition::BitSet:      return QStringLiteral("BitSet");
+    case AlarmCondition::BitClear:    return QStringLiteral("BitClear");
+    }
+    return QStringLiteral("GreaterThan");
+}
+
+static bool alarmConditionFromString(const QString &text, AlarmCondition &out)
+{
+    const QString t = text.trimmed();
+    if (t == QLatin1String("GreaterThan")) out = AlarmCondition::GreaterThan;
+    else if (t == QLatin1String("LessThan")) out = AlarmCondition::LessThan;
+    else if (t == QLatin1String("Equal")) out = AlarmCondition::Equal;
+    else if (t == QLatin1String("NotEqual")) out = AlarmCondition::NotEqual;
+    else if (t == QLatin1String("InRange")) out = AlarmCondition::InRange;
+    else if (t == QLatin1String("OutOfRange")) out = AlarmCondition::OutOfRange;
+    else if (t == QLatin1String("BitSet")) out = AlarmCondition::BitSet;
+    else if (t == QLatin1String("BitClear")) out = AlarmCondition::BitClear;
+    else return false;
+    return true;
+}
+
+static QString alarmSeverityToString(AlarmSeverity severity)
+{
+    switch (severity) {
+    case AlarmSeverity::Info:     return QStringLiteral("Info");
+    case AlarmSeverity::Warning:  return QStringLiteral("Warning");
+    case AlarmSeverity::Critical: return QStringLiteral("Critical");
+    }
+    return QStringLiteral("Info");
+}
+
+static AlarmSeverity alarmSeverityFromString(const QString &text)
+{
+    const QString t = text.trimmed();
+    if (t == QLatin1String("Warning")) return AlarmSeverity::Warning;
+    if (t == QLatin1String("Critical")) return AlarmSeverity::Critical;
+    return AlarmSeverity::Info;
+}
+
+static QJsonObject deviceConfigToJson(const DeviceConfig &config)
+{
+    return QJsonObject{
+        {QStringLiteral("id"), config.id},
+        {QStringLiteral("name"), config.name},
+        {QStringLiteral("isTcp"), config.isTcp},
+        {QStringLiteral("portOrAddress"), config.portOrAddress},
+        {QStringLiteral("serverAddress"), config.serverAddress},
+        {QStringLiteral("parity"), config.parity},
+        {QStringLiteral("baud"), config.baud},
+        {QStringLiteral("dataBits"), config.dataBits},
+        {QStringLiteral("stopBits"), config.stopBits},
+        {QStringLiteral("responseTime"), config.responseTime},
+        {QStringLiteral("numberOfRetries"), config.numberOfRetries},
+        {QStringLiteral("pollIntervalMs"), config.pollIntervalMs},
+        {QStringLiteral("connected"), config.connected},
+        {QStringLiteral("lastError"), config.lastError}
+    };
+}
+
+static QJsonObject alarmRuleToJson(const AlarmRule &rule)
+{
+    return QJsonObject{
+        {QStringLiteral("id"), rule.id},
+        {QStringLiteral("name"), rule.name},
+        {QStringLiteral("enabled"), rule.enabled},
+        {QStringLiteral("serverAddress"), rule.serverAddress},
+        {QStringLiteral("registerType"), rule.registerType},
+        {QStringLiteral("registerTypeName"), registerTypeName(rule.registerType)},
+        {QStringLiteral("address"), rule.address},
+        {QStringLiteral("condition"), alarmConditionToString(rule.condition)},
+        {QStringLiteral("threshold1"), rule.threshold1},
+        {QStringLiteral("threshold2"), rule.threshold2},
+        {QStringLiteral("severity"), alarmSeverityToString(rule.severity)},
+        {QStringLiteral("message"), rule.message},
+        {QStringLiteral("debounceMs"), rule.debounceMs},
+        {QStringLiteral("acknowledged"), rule.acknowledged}
+    };
+}
+
+static QJsonObject alarmEventToJson(const AlarmEvent &event)
+{
+    return QJsonObject{
+        {QStringLiteral("id"), static_cast<qint64>(event.id)},
+        {QStringLiteral("timestamp"), event.timestamp.toString(Qt::ISODateWithMs)},
+        {QStringLiteral("ruleId"), event.ruleId},
+        {QStringLiteral("ruleName"), event.ruleName},
+        {QStringLiteral("severity"), alarmSeverityToString(event.severity)},
+        {QStringLiteral("message"), event.message},
+        {QStringLiteral("value"), event.value},
+        {QStringLiteral("acknowledged"), event.acknowledged}
+    };
+}
+
+static QJsonObject historyRecordToJson(const HistoryRecord &record)
+{
+    QJsonArray values;
+    for (quint16 value : record.values)
+        values.append(static_cast<int>(value));
+    return QJsonObject{
+        {QStringLiteral("id"), static_cast<qint64>(record.id)},
+        {QStringLiteral("timestamp"), record.timestamp.toString(Qt::ISODateWithMs)},
+        {QStringLiteral("serverAddress"), record.serverAddress},
+        {QStringLiteral("registerType"), static_cast<int>(record.registerType)},
+        {QStringLiteral("registerTypeName"), registerTypeName(static_cast<int>(record.registerType))},
+        {QStringLiteral("startAddress"), record.startAddress},
+        {QStringLiteral("count"), record.count},
+        {QStringLiteral("values"), values}
+    };
+}
+
+// 常量说明：QModbusDataUnit 寄存器类型编号 1~4 对应 Modbus 功能码
+static const char *kRegisterTypeHint =
+    "registerType: 1=DiscreteInputs(读离散输入), 2=Coils(读写线圈), 3=InputRegisters(读输入寄存器), 4=HoldingRegisters(读写保持寄存器)";
+
+void MainWindow::initMcpAgent()
+{
+    // ---------- 共用工具注册表 ----------
+    // 危险工具（写寄存器/改报警规则/轮询控制）受 MCP 写入闸门控制，
+    // agent 分支的内嵌助手将复用同一注册表并叠加"人工确认"环节。
+    m_agentTools = new AgentToolRegistry();
+
+    {   // 1. 系统状态
+        AgentTool tool;
+        tool.name = QStringLiteral("get_system_status");
+        tool.description = QStringLiteral("获取 FieldLink 运行状态：连接状态、连接类型(RTU/TCP)、轮询状态、活跃报警数、最近通信成功/失败时间与连续失败次数。排查问题前先调用它。");
+        tool.inputSchema = AgentTool::makeSchema(QStringLiteral("无参数"), QJsonObject{});
+        tool.handler = [this](const QJsonObject &) {
+            QJsonObject status = buildRemoteStatus();
+            status["success"] = true;
+            return status;
+        };
+        m_agentTools->registerTool(tool);
+    }
+    {   // 2. 设备列表
+        AgentTool tool;
+        tool.name = QStringLiteral("list_devices");
+        tool.description = QStringLiteral("列出全部已配置的 Modbus 设备（TCP/RTU、端口或串口、从站地址、串口参数、连接状态）。");
+        tool.inputSchema = AgentTool::makeSchema(QStringLiteral("无参数"), QJsonObject{});
+        tool.handler = [this](const QJsonObject &) {
+            QJsonArray devices;
+            const auto all = m_deviceManager->allDevices();
+            for (const DeviceConfig &config : all)
+                devices.append(deviceConfigToJson(config));
+            return QJsonObject{
+                {QStringLiteral("success"), true},
+                {QStringLiteral("count"), static_cast<int>(all.size())},
+                {QStringLiteral("devices"), devices}};
+        };
+        m_agentTools->registerTool(tool);
+    }
+    {   // 3. 读寄存器
+        AgentTool tool;
+        tool.name = QStringLiteral("read_registers");
+        tool.description = QStringLiteral("对已连接的 Modbus 设备执行一次读操作并返回寄存器值。") + QLatin1String(kRegisterTypeHint) + QStringLiteral("。读取结果会自动存入历史数据库。");
+        tool.inputSchema = AgentTool::makeSchema(QStringLiteral("读寄存器参数"), QJsonObject{
+            {QStringLiteral("serverAddress"), AgentTool::property(QStringLiteral("number"), QStringLiteral("Modbus 从站地址(1-247)"))},
+            {QStringLiteral("registerType"), AgentTool::property(QStringLiteral("number"), QStringLiteral("寄存器类型编号(1-4)，1=DiscreteInputs 2=Coils 3=InputRegisters 4=HoldingRegisters"))},
+            {QStringLiteral("startAddress"), AgentTool::property(QStringLiteral("number"), QStringLiteral("起始地址(0 起)"))},
+            {QStringLiteral("count"), AgentTool::property(QStringLiteral("number"), QStringLiteral("读取数量(1-2000)"))}
+        }, {QStringLiteral("serverAddress"), QStringLiteral("registerType"), QStringLiteral("startAddress"), QStringLiteral("count")});
+        tool.handler = [this](const QJsonObject &args) {
+            return executeRemoteRead(args.value(QStringLiteral("serverAddress")).toInt(1),
+                                     args.value(QStringLiteral("registerType")).toInt(4),
+                                     args.value(QStringLiteral("startAddress")).toInt(),
+                                     args.value(QStringLiteral("count")).toInt(1));
+        };
+        m_agentTools->registerTool(tool);
+    }
+    {   // 4. 写寄存器（危险）
+        AgentTool tool;
+        tool.name = QStringLiteral("write_registers");
+        tool.description = QStringLiteral("向 Modbus 设备写入寄存器值（危险操作：会真实改变现场设备状态，需写入闸门开启）。") + QLatin1String(kRegisterTypeHint);
+        tool.dangerous = true;
+        tool.inputSchema = AgentTool::makeSchema(QStringLiteral("写寄存器参数"), QJsonObject{
+            {QStringLiteral("serverAddress"), AgentTool::property(QStringLiteral("number"), QStringLiteral("Modbus 从站地址(1-247)"))},
+            {QStringLiteral("registerType"), AgentTool::property(QStringLiteral("number"), QStringLiteral("寄存器类型编号，通常为 2=Coils 或 4=HoldingRegisters"))},
+            {QStringLiteral("startAddress"), AgentTool::property(QStringLiteral("number"), QStringLiteral("起始地址(0 起)"))},
+            {QStringLiteral("values"), AgentTool::property(QStringLiteral("array"), QStringLiteral("要写入的值数组，例如 [100, 200]"))}
+        }, {QStringLiteral("serverAddress"), QStringLiteral("registerType"), QStringLiteral("startAddress"), QStringLiteral("values")});
+        tool.handler = [this](const QJsonObject &args) {
+            QVector<quint16> values;
+            const QJsonArray array = args.value(QStringLiteral("values")).toArray();
+            for (const QJsonValue &v : array)
+                values.append(static_cast<quint16>(v.toInt()));
+            if (values.isEmpty())
+                return QJsonObject{{QStringLiteral("success"), false}, {QStringLiteral("error"), QStringLiteral("values 不能为空")}};
+            return executeRemoteWrite(args.value(QStringLiteral("serverAddress")).toInt(1),
+                                      args.value(QStringLiteral("registerType")).toInt(4),
+                                      args.value(QStringLiteral("startAddress")).toInt(),
+                                      values);
+        };
+        m_agentTools->registerTool(tool);
+    }
+    {   // 5. 历史查询
+        AgentTool tool;
+        tool.name = QStringLiteral("query_history");
+        tool.description = QStringLiteral("按时间区间查询 SQLite 历史采集数据，可按从站地址/寄存器类型/起始地址过滤。时间格式为 ISO 8601（如 2026-01-31T08:00:00）。");
+        tool.inputSchema = AgentTool::makeSchema(QStringLiteral("历史查询参数"), QJsonObject{
+            {QStringLiteral("fromIso"), AgentTool::property(QStringLiteral("string"), QStringLiteral("起始时间 ISO8601，如 2026-01-31T00:00:00"))},
+            {QStringLiteral("toIso"), AgentTool::property(QStringLiteral("string"), QStringLiteral("结束时间 ISO8601"))},
+            {QStringLiteral("serverAddress"), AgentTool::property(QStringLiteral("number"), QStringLiteral("从站地址过滤，-1 表示不过滤"))},
+            {QStringLiteral("registerType"), AgentTool::property(QStringLiteral("number"), QStringLiteral("寄存器类型编号过滤(1-4)，-1 表示不过滤"))},
+            {QStringLiteral("startAddress"), AgentTool::property(QStringLiteral("number"), QStringLiteral("起始地址过滤，-1 表示不过滤"))},
+            {QStringLiteral("maxResults"), AgentTool::property(QStringLiteral("number"), QStringLiteral("最多返回条数，默认 200"))}
+        }, {QStringLiteral("fromIso"), QStringLiteral("toIso")});
+        tool.handler = [this](const QJsonObject &args) {
+            const QDateTime from = QDateTime::fromString(args.value(QStringLiteral("fromIso")).toString(), Qt::ISODateWithMs);
+            const QDateTime to = QDateTime::fromString(args.value(QStringLiteral("toIso")).toString(), Qt::ISODateWithMs);
+            if (!from.isValid() || !to.isValid())
+                return QJsonObject{{QStringLiteral("success"), false}, {QStringLiteral("error"), QStringLiteral("时间格式无效，请使用 ISO8601，如 2026-01-31T08:00:00")}};
+            const int maxResults = args.value(QStringLiteral("maxResults")).toInt(200);
+            const auto records = m_historyData->query(from, to,
+                                                      args.value(QStringLiteral("serverAddress")).toInt(-1),
+                                                      args.value(QStringLiteral("registerType")).toInt(-1),
+                                                      args.value(QStringLiteral("startAddress")).toInt(-1));
+            QJsonArray items;
+            for (int i = 0; i < records.size() && i < maxResults; ++i)
+                items.append(historyRecordToJson(records[i]));
+            QJsonObject result;
+            result["success"] = true;
+            result["totalMatched"] = static_cast<int>(records.size());
+            result["returned"] = static_cast<int>(items.size());
+            if (records.size() > maxResults)
+                result["note"] = QStringLiteral("结果超出 maxResults，仅返回前 %1 条，可缩小时间范围或加过滤条件").arg(maxResults);
+            result["records"] = items;
+            return result;
+        };
+        m_agentTools->registerTool(tool);
+    }
+    {   // 6. 最近记录
+        AgentTool tool;
+        tool.name = QStringLiteral("get_recent_records");
+        tool.description = QStringLiteral("获取历史数据库中最近 N 条采集记录（默认 100 条），适合快速了解最新数据。");
+        tool.inputSchema = AgentTool::makeSchema(QStringLiteral("最近记录参数"), QJsonObject{
+            {QStringLiteral("count"), AgentTool::property(QStringLiteral("number"), QStringLiteral("返回条数，默认 100"))}
+        });
+        tool.handler = [this](const QJsonObject &args) {
+            const int count = args.value(QStringLiteral("count")).toInt(100);
+            const auto records = m_historyData->lastRecords(count);
+            QJsonArray items;
+            for (const HistoryRecord &record : records)
+                items.append(historyRecordToJson(record));
+            return QJsonObject{
+                {QStringLiteral("success"), true},
+                {QStringLiteral("count"), static_cast<int>(records.size())},
+                {QStringLiteral("records"), items}};
+        };
+        m_agentTools->registerTool(tool);
+    }
+    {   // 7. 历史统计
+        AgentTool tool;
+        tool.name = QStringLiteral("get_history_stats");
+        tool.description = QStringLiteral("获取历史数据库统计信息（当前总记录数），用于日报与容量评估。");
+        tool.inputSchema = AgentTool::makeSchema(QStringLiteral("无参数"), QJsonObject{});
+        tool.handler = [this](const QJsonObject &) {
+            return QJsonObject{
+                {QStringLiteral("success"), true},
+                {QStringLiteral("totalRecords"), m_historyData->totalRecords()}};
+        };
+        m_agentTools->registerTool(tool);
+    }
+    {   // 8. 报警规则列表
+        AgentTool tool;
+        tool.name = QStringLiteral("get_alarm_rules");
+        tool.description = QStringLiteral("获取当前配置的全部报警规则（条件/阈值/严重度/去抖/启用状态）。");
+        tool.inputSchema = AgentTool::makeSchema(QStringLiteral("无参数"), QJsonObject{});
+        tool.handler = [this](const QJsonObject &) {
+            QJsonArray items;
+            const auto rules = m_alarmManager->allRules();
+            for (const AlarmRule &rule : rules)
+                items.append(alarmRuleToJson(rule));
+            return QJsonObject{
+                {QStringLiteral("success"), true},
+                {QStringLiteral("count"), static_cast<int>(rules.size())},
+                {QStringLiteral("rules"), items}};
+        };
+        m_agentTools->registerTool(tool);
+    }
+    {   // 9. 报警历史
+        AgentTool tool;
+        tool.name = QStringLiteral("get_alarm_history");
+        tool.description = QStringLiteral("获取最近的报警事件（时间/规则/严重度/触发值/确认状态）。");
+        tool.inputSchema = AgentTool::makeSchema(QStringLiteral("报警历史参数"), QJsonObject{
+            {QStringLiteral("maxCount"), AgentTool::property(QStringLiteral("number"), QStringLiteral("最多返回条数，默认 50"))}
+        });
+        tool.handler = [this](const QJsonObject &args) {
+            const int maxCount = args.value(QStringLiteral("maxCount")).toInt(50);
+            const auto events = m_alarmManager->alarmHistory(maxCount);
+            QJsonArray items;
+            for (const AlarmEvent &event : events)
+                items.append(alarmEventToJson(event));
+            return QJsonObject{
+                {QStringLiteral("success"), true},
+                {QStringLiteral("count"), static_cast<int>(events.size())},
+                {QStringLiteral("events"), items}};
+        };
+        m_agentTools->registerTool(tool);
+    }
+    {   // 10. 新增报警规则（危险）
+        AgentTool tool;
+        tool.name = QStringLiteral("add_alarm_rule");
+        tool.description = QStringLiteral("新增一条报警规则（危险操作：将立即参与报警判定，需写入闸门开启）。condition 取值：GreaterThan/LessThan/Equal/NotEqual/InRange/OutOfRange/BitSet/BitClear；severity 取值：Info/Warning/Critical。");
+        tool.dangerous = true;
+        tool.inputSchema = AgentTool::makeSchema(QStringLiteral("报警规则参数"), QJsonObject{
+            {QStringLiteral("name"), AgentTool::property(QStringLiteral("string"), QStringLiteral("规则名称"))},
+            {QStringLiteral("serverAddress"), AgentTool::property(QStringLiteral("number"), QStringLiteral("Modbus 从站地址"))},
+            {QStringLiteral("registerType"), AgentTool::property(QStringLiteral("number"), QStringLiteral("寄存器类型编号(1-4)"))},
+            {QStringLiteral("address"), AgentTool::property(QStringLiteral("number"), QStringLiteral("监控的寄存器地址"))},
+            {QStringLiteral("condition"), AgentTool::property(QStringLiteral("string"), QStringLiteral("触发条件，见工具描述中的取值列表"))},
+            {QStringLiteral("threshold1"), AgentTool::property(QStringLiteral("number"), QStringLiteral("阈值 1（比较阈值/区间下限/位判断值）"))},
+            {QStringLiteral("threshold2"), AgentTool::property(QStringLiteral("number"), QStringLiteral("阈值 2（仅 InRange/OutOfRange 需要，区间上限）"))},
+            {QStringLiteral("severity"), AgentTool::property(QStringLiteral("string"), QStringLiteral("严重度 Info/Warning/Critical，默认 Info"))},
+            {QStringLiteral("message"), AgentTool::property(QStringLiteral("string"), QStringLiteral("报警提示消息"))},
+            {QStringLiteral("debounceMs"), AgentTool::property(QStringLiteral("number"), QStringLiteral("去抖时间(毫秒)，默认 0"))}
+        }, {QStringLiteral("name"), QStringLiteral("serverAddress"), QStringLiteral("registerType"), QStringLiteral("address"), QStringLiteral("condition")});
+        tool.handler = [this](const QJsonObject &args) {
+            AlarmRule rule;
+            rule.id = 0;
+            rule.name = args.value(QStringLiteral("name")).toString();
+            rule.enabled = true;
+            rule.serverAddress = args.value(QStringLiteral("serverAddress")).toInt();
+            rule.registerType = args.value(QStringLiteral("registerType")).toInt(4);
+            rule.address = args.value(QStringLiteral("address")).toInt();
+            AlarmCondition condition = AlarmCondition::GreaterThan;
+            if (!alarmConditionFromString(args.value(QStringLiteral("condition")).toString(), condition))
+                return QJsonObject{{QStringLiteral("success"), false}, {QStringLiteral("error"), QStringLiteral("condition 取值无效")}};
+            rule.condition = condition;
+            rule.threshold1 = args.value(QStringLiteral("threshold1")).toDouble();
+            rule.threshold2 = args.value(QStringLiteral("threshold2")).toDouble();
+            rule.severity = alarmSeverityFromString(args.value(QStringLiteral("severity")).toString());
+            rule.message = args.value(QStringLiteral("message")).toString();
+            rule.debounceMs = args.value(QStringLiteral("debounceMs")).toInt();
+            rule.acknowledged = false;
+            const int ruleId = m_alarmManager->addRule(rule);
+            if (m_securityManager)
+                m_securityManager->audit(QStringLiteral("mcp"), QStringLiteral("ALARM_RULE_ADD"),
+                                         QStringLiteral("id=%1 name=%2 addr=%3/%4").arg(ruleId).arg(rule.name).arg(rule.serverAddress).arg(rule.address));
+            return QJsonObject{
+                {QStringLiteral("success"), true},
+                {QStringLiteral("ruleId"), ruleId},
+                {QStringLiteral("rule"), alarmRuleToJson(rule)}};
+        };
+        m_agentTools->registerTool(tool);
+    }
+    {   // 11. 轮询控制（危险）
+        AgentTool tool;
+        tool.name = QStringLiteral("polling_control");
+        tool.description = QStringLiteral("启动或停止全部轮询采集任务（危险操作：影响采集节奏，需写入闸门开启）。");
+        tool.dangerous = true;
+        tool.inputSchema = AgentTool::makeSchema(QStringLiteral("轮询控制参数"), QJsonObject{
+            {QStringLiteral("action"), AgentTool::property(QStringLiteral("string"), QStringLiteral("start 或 stop"))}
+        }, {QStringLiteral("action")});
+        tool.handler = [this](const QJsonObject &args) {
+            const QString action = args.value(QStringLiteral("action")).toString().trimmed().toLower();
+            if (action == QLatin1String("start"))
+                m_pollManager->startAll();
+            else if (action == QLatin1String("stop"))
+                m_pollManager->stopAll();
+            else
+                return QJsonObject{{QStringLiteral("success"), false}, {QStringLiteral("error"), QStringLiteral("action 仅支持 start/stop")}};
+            if (m_securityManager)
+                m_securityManager->audit(QStringLiteral("mcp"), QStringLiteral("POLLING"), action);
+            return QJsonObject{
+                {QStringLiteral("success"), true},
+                {QStringLiteral("action"), action},
+                {QStringLiteral("pollingRunning"), m_pollManager->isRunning()}};
+        };
+        m_agentTools->registerTool(tool);
+    }
+
+    // ---------- MCP 服务器 ----------
+    m_mcpServer = new McpServer(this);
+    m_mcpServer->setToolRegistry(m_agentTools);
+    m_mcpServer->setResourceProvider([this](const QString &uri) -> QJsonValue {
+        if (uri == QLatin1String("fieldlink://status"))
+            return buildRemoteStatus();
+        if (uri == QLatin1String("fieldlink://devices")) {
+            QJsonArray devices;
+            const auto all = m_deviceManager->allDevices();
+            for (const DeviceConfig &config : all)
+                devices.append(deviceConfigToJson(config));
+            return QJsonObject{{QStringLiteral("devices"), devices}};
+        }
+        if (uri == QLatin1String("fieldlink://alarms/rules")) {
+            QJsonArray items;
+            const auto rules = m_alarmManager->allRules();
+            for (const AlarmRule &rule : rules)
+                items.append(alarmRuleToJson(rule));
+            return QJsonObject{{QStringLiteral("rules"), items}};
+        }
+        if (uri == QLatin1String("fieldlink://alarms/history")) {
+            QJsonArray items;
+            const auto events = m_alarmManager->alarmHistory(100);
+            for (const AlarmEvent &event : events)
+                items.append(alarmEventToJson(event));
+            return QJsonObject{{QStringLiteral("events"), items}};
+        }
+        if (uri == QLatin1String("fieldlink://history/last")) {
+            QJsonArray items;
+            const auto records = m_historyData->lastRecords(100);
+            for (const HistoryRecord &record : records)
+                items.append(historyRecordToJson(record));
+            return QJsonObject{{QStringLiteral("records"), items}};
+        }
+        return QJsonValue();   // 未知资源
+    });
+    connect(m_mcpServer, &McpServer::logLine, this, [this](const QString &message) {
+        logMessage(message, 2);
+    });
+
+    logMessage(QStringLiteral("AI/MCP 已就绪：注册 %1 个工具（菜单 Advanced -> MCP Service (AI) 启动）").arg(m_agentTools->count()));
+}
+
+void MainWindow::toggleMcpServer()
+{
+    if (!m_mcpServer || !m_agentTools)
+        return;
+
+    if (m_mcpServer->isRunning()) {
+        m_mcpServer->stop();
+        statusBar()->showMessage(QStringLiteral("MCP 服务已关闭"), 3000);
+        logMessage(QStringLiteral("MCP 服务已关闭"));
+        return;
+    }
+
+    bool ok = false;
+    const QString token = QInputDialog::getText(this, QStringLiteral("MCP 服务鉴权"),
+        QStringLiteral("API Token（留空 = 不鉴权，仅建议本机调试时使用）:"),
+        QLineEdit::Password, QString(), &ok);
+    if (!ok)
+        return;
+    if (!token.isEmpty())
+        m_securityManager->setApiToken(token);   // 与远程服务共用同一令牌体系
+
+    const auto enableWrite = QMessageBox::question(this, QStringLiteral("MCP 写入权限"),
+        QStringLiteral("是否允许 AI 客户端执行写操作（写寄存器/新增报警规则/轮询控制）？"),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    m_mcpServer->setAuthToken(token);
+    m_mcpServer->setWriteEnabled(enableWrite == QMessageBox::Yes);
+
+    const int port = m_appSettings.value(QStringLiteral("mcp/port"), 8180).toInt();
+    if (m_mcpServer->start(static_cast<quint16>(port))) {
+        m_appSettings.setValue(QStringLiteral("mcp/port"), m_mcpServer->port());
+        statusBar()->showMessage(QStringLiteral("MCP 服务已启动 端口: %1 工具: %2 写入: %3")
+                                     .arg(m_mcpServer->port())
+                                     .arg(m_agentTools->count())
+                                     .arg(m_mcpServer->writeEnabled() ? QStringLiteral("开启") : QStringLiteral("关闭")), 5000);
+        logMessage(QStringLiteral("MCP 服务已启动 端口: %1 工具: %2 写入: %3")
+                       .arg(m_mcpServer->port())
+                       .arg(m_agentTools->count())
+                       .arg(m_mcpServer->writeEnabled() ? QStringLiteral("开启") : QStringLiteral("关闭")));
+    } else {
+        statusBar()->showMessage(QStringLiteral("MCP 服务启动失败"), 5000);
     }
 }
 

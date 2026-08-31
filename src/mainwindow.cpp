@@ -23,6 +23,8 @@
 #include "verificationmanager.h"
 #include "deliverymanager.h"
 #include "thememanager.h"  // 深色/浅色主题切换
+#include "mcpserver.h"     // AI/MCP：MCP 服务器
+#include "agenttool.h"     // AI/MCP：共用工具注册表
 
 #include <QModbusTcpClient>
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
@@ -707,6 +709,9 @@ void MainWindow::initAdvancedFeatures()
     m_reliabilityManager->start();
 
     m_deviceManager->loadFromSettings(m_appSettings);
+
+    // ---------- AI/MCP：初始化共用工具注册表与 MCP 服务器 ----------
+    initMcpAgent();
 }
 
 void MainWindow::initMenus()
@@ -769,6 +774,7 @@ void MainWindow::initMenus()
     advMenu->addAction(tr("Device Templates"), this, &MainWindow::showTemplateManager);
     advMenu->addAction(tr("Script Console"), this, &MainWindow::showScriptConsole);
     advMenu->addAction(tr("Remote Service"), this, &MainWindow::toggleRemoteServer);
+    advMenu->addAction(tr("MCP Service (AI)"), this, &MainWindow::toggleMcpServer);
     advMenu->addAction(tr("Plugin Manager"), this, &MainWindow::showPluginManager);
     advMenu->addAction(tr("Point Manager"), this, &MainWindow::showPointManager);
     advMenu->addAction(tr("Verification Tests"), this, &MainWindow::showVerificationManager);

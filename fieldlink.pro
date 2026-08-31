@@ -38,7 +38,9 @@ SOURCES += src/main.cpp\
         src/pointmodel.cpp \
         src/verificationmanager.cpp \
         src/deliverymanager.cpp \
-        src/crashlogger.cpp
+        src/crashlogger.cpp \
+        src/agenttool.cpp \
+        src/mcpserver.cpp
 
 HEADERS  += header/mainwindow.h \
          header/settingsdialog.h \
@@ -65,7 +67,9 @@ HEADERS  += header/mainwindow.h \
         header/verificationmanager.h \
         header/deliverymanager.h \
         header/crashlogger.h \
-        header/thememanager.h
+        header/thememanager.h \
+        header/agenttool.h \
+        header/mcpserver.h
 
 FORMS    += mainwindow.ui \
          settingsdialog.ui
