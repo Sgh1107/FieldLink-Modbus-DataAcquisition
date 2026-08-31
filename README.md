@@ -100,58 +100,65 @@ mingw32-make -j8        # Linux 下使用 make -j8
 
 ## 📝 项目结构说明
 
+源代码与头文件分离存放：**头文件在 `header/`，源文件在 `src/`**，其余工程资源保留在根目录。
+
 ```
 FieldLink-Modbus-DataAcquisition/
-├── main.cpp                  # 程序入口：主题初始化、崩溃捕获、Modbus 日志开关
-├── mainwindow.*              # 主窗口：连接控制、手动读写、菜单与功能入口
-├── mainwindow_advanced.cpp   # 主窗口高级功能实现（仪表盘/点位/安全/交付等集成）
-├── mainwindow.ui             # 主界面 UI 文件
-│
-├── ── 通信层 ──
-├── devicemanager.*           # 设备管理：Modbus TCP/RTU 客户端生命周期与配置持久化
-├── devicetemplate.*          # 设备模板：寄存器点表定义（类型/字节序/缩放/单位）
-├── pollmanager.*             # 轮询采集：多任务独立定时器
-├── batchtaskmanager.*        # 批量读写任务：顺序执行、排序、延时
-├── writeregistermodel.*      # 写寄存器数据模型
-├── dataparser.*              # 数据解析
-│
-├── ── 数据层 ──
-├── historydata.*             # 历史数据：SQLite 存储与查询
-├── dataexporter.*            # 数据导出（CSV）
-├── configprofile.*           # 配置档案：整站配置保存/恢复
-├── alarmmanager.*            # 报警管理：规则触发/去抖/确认/历史
-│
-├── ── 可视化 ──
-├── realtimechart.*           # 实时曲线
-├── dashboard.*               # 仪表盘
-├── pointmodel.*              # 点位管理：点位与图表/仪表绑定
-│
-├── ── 扩展与远程 ──
-├── remoteserver.*            # 内置 HTTP JSON API 服务（状态/读/写）
-├── scriptengine.*            # QJSEngine 脚本控制台
-├── plugininterface.h         # 插件标准接口
-├── pluginmanager.*           # 插件加载与管理
-│
-├── ── 可靠性与安全 ──
-├── reliabilitymanager.*      # 自动重连/心跳/连续失败告警
-├── securitymanager.*         # 用户/角色/权限、Token 鉴权
-├── crashlogger.*             # 全局崩溃捕获与日志
-├── logviewer.*               # 运行日志查看器
-│
-├── ── 工程化工具 ──
-├── verificationmanager.*     # 验证计划与报告导出
-├── deliverymanager.*         # 交付清单/环境检查/手册生成/打包
-├── deploy/package_windows.ps1  # Windows 发布打包脚本
-├── thememanager.h            # 深色/浅色主题（Fusion + QSS）
-├── settingsdialog.*          # 设置对话框
-│
-├── fieldlink.pro             # qmake 工程文件
+├── fieldlink.pro             # qmake 工程文件（已配置 src/ 与 header/ 目录）
 ├── fieldlink.qrc             # 资源文件（图标等）
+├── mainwindow.ui             # 主界面 UI 文件
+├── settingsdialog.ui         # 设置对话框 UI 文件
+│
+├── header/                   # 全部头文件（*.h）
+│   ├── mainwindow.h          # 主窗口：连接控制、手动读写、菜单与功能入口
+│   │
+│   ├── ── 通信层 ──
+│   ├── devicemanager.h       # 设备管理：Modbus TCP/RTU 客户端生命周期与配置持久化
+│   ├── devicetemplate.h      # 设备模板：寄存器点表定义（类型/字节序/缩放/单位）
+│   ├── pollmanager.h         # 轮询采集：多任务独立定时器
+│   ├── batchtaskmanager.h    # 批量读写任务：顺序执行、排序、延时
+│   ├── writeregistermodel.h  # 写寄存器数据模型
+│   ├── dataparser.h          # 数据解析
+│   │
+│   ├── ── 数据层 ──
+│   ├── historydata.h         # 历史数据：SQLite 存储与查询
+│   ├── dataexporter.h        # 数据导出（CSV）
+│   ├── configprofile.h       # 配置档案：整站配置保存/恢复
+│   ├── alarmmanager.h        # 报警管理：规则触发/去抖/确认/历史
+│   │
+│   ├── ── 可视化 ──
+│   ├── realtimechart.h       # 实时曲线
+│   ├── dashboard.h           # 仪表盘
+│   ├── pointmodel.h          # 点位管理：点位与图表/仪表绑定
+│   │
+│   ├── ── 扩展与远程 ──
+│   ├── remoteserver.h        # 内置 HTTP JSON API 服务（状态/读/写）
+│   ├── scriptengine.h        # QJSEngine 脚本控制台
+│   ├── plugininterface.h     # 插件标准接口
+│   ├── pluginmanager.h       # 插件加载与管理
+│   │
+│   ├── ── 可靠性与安全 ──
+│   ├── reliabilitymanager.h  # 自动重连/心跳/连续失败告警
+│   ├── securitymanager.h     # 用户/角色/权限、Token 鉴权
+│   ├── crashlogger.h         # 全局崩溃捕获与日志
+│   ├── logviewer.h           # 运行日志查看器
+│   │
+│   └── ── 工程化工具 ──
+│   ├── verificationmanager.h # 验证计划与报告导出
+│   ├── deliverymanager.h     # 交付清单/环境检查/手册生成/打包
+│   └── thememanager.h        # 深色/浅色主题（Fusion + QSS）
+│
+├── src/                      # 全部源文件（*.cpp，与 header/ 中头文件一一对应）
+│   ├── main.cpp              # 程序入口：主题初始化、崩溃捕获、Modbus 日志开关
+│   ├── mainwindow.cpp        # 主窗口实现
+│   └── mainwindow_advanced.cpp # 主窗口高级功能实现（仪表盘/点位/安全/交付等集成）
+│
 ├── style/                    # dark.qss / light.qss 主题样式
 ├── translations/             # 界面翻译（zh_CN，构建期嵌入资源）
 ├── images/                   # 界面图标资源
+├── deploy/package_windows.ps1  # Windows 发布打包脚本
 ├── doc/                      # Modbus 文档
-└── build/                    # 构建输出目录
+└── build/                    # 构建输出目录（Makefile 由 qmake 自动生成）
 ```
 
 ---
