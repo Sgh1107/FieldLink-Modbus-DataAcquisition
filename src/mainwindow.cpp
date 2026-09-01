@@ -23,6 +23,7 @@
 #include "verificationmanager.h"
 #include "deliverymanager.h"
 #include "thememanager.h"  // 深色/浅色主题切换
+#include "mqttclient.h"    // MQTT 发布端客户端
 
 #include <QModbusTcpClient>
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
@@ -276,6 +277,9 @@ void MainWindow::onStateChanged(int state)
         ui->connectButton->setText(tr("Disconnect"));
 
     updateConnectionChip(connected);
+
+    // MQTT：设备连接状态变化时发布保留消息（上位机/网关可据此判断现场在线）
+    publishMqttStatus(connected);
 
     if (m_dashboard) {
         m_dashboard->setConnectionStatus(connected,
@@ -707,6 +711,9 @@ void MainWindow::initAdvancedFeatures()
     m_reliabilityManager->start();
 
     m_deviceManager->loadFromSettings(m_appSettings);
+
+    // ---------- MQTT：初始化发布端客户端与遥测/报警挂钩 ----------
+    initMqttSupport();
 }
 
 void MainWindow::initMenus()
@@ -769,6 +776,7 @@ void MainWindow::initMenus()
     advMenu->addAction(tr("Device Templates"), this, &MainWindow::showTemplateManager);
     advMenu->addAction(tr("Script Console"), this, &MainWindow::showScriptConsole);
     advMenu->addAction(tr("Remote Service"), this, &MainWindow::toggleRemoteServer);
+    advMenu->addAction(tr("MQTT Publishing"), this, &MainWindow::showMqttSettings);
     advMenu->addAction(tr("Plugin Manager"), this, &MainWindow::showPluginManager);
     advMenu->addAction(tr("Point Manager"), this, &MainWindow::showPointManager);
     advMenu->addAction(tr("Verification Tests"), this, &MainWindow::showVerificationManager);

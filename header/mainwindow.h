@@ -42,6 +42,7 @@ class SecurityManager;
 class PointModel;
 class VerificationManager;
 class DeliveryManager;
+class MqttClient;
 
 struct PollTask;
 struct BatchTask;
@@ -58,6 +59,7 @@ private:
     void initActions();
     void initAdvancedFeatures();
     void initMenus();
+    void initMqttSupport();                    // MQTT：初始化发布端客户端与遥测/报警挂钩
     QModbusDataUnit readRequest() const;
     QModbusDataUnit writeRequest() const;
 
@@ -92,6 +94,7 @@ private slots:
     void showTemplateManager();
     void showScriptConsole();
     void toggleRemoteServer();
+    void showMqttSettings();
     void showPluginManager();
     void showPointManager();
     void showVerificationManager();
@@ -105,6 +108,8 @@ private slots:
     QJsonObject buildRemoteStatus() const;
     QJsonObject executeRemoteRead(int serverAddress, int registerType, int startAddress, int count);
     QJsonObject executeRemoteWrite(int serverAddress, int registerType, int startAddress, const QVector<quint16> &values);
+    void publishMqttTelemetry(int serverAddress, int registerType, int startAddress, const QVector<quint16> &values);
+    void publishMqttStatus(bool connected);
 
 private:
     Ui::MainWindow *ui;
@@ -134,6 +139,7 @@ private:
     PointModel *m_pointModel;
     VerificationManager *m_verificationManager;
     DeliveryManager *m_deliveryManager;
+    MqttClient *m_mqttClient = nullptr;            // MQTT 发布端客户端
     QMap<int, int> m_pointChartSeriesMap;
     QMap<int, int> m_pointDashboardGaugeMap;
 };

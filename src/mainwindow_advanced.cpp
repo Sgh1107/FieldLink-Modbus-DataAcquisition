@@ -20,6 +20,7 @@
 #include "deliverymanager.h"
 #include "logviewer.h"
 #include "settingsdialog.h"
+#include "mqttclient.h"    // MQTT 发布端客户端
 
 #include <QFileDialog>
 #include <QMessageBox>
@@ -262,6 +263,10 @@ void MainWindow::onPollRequest(const PollTask &task)
                     m_pluginManager->notifyDataReceived(task.serverAddress,
                         static_cast<int>(task.registerType), task.startAddress, values);
 
+                    // MQTT：轮询数据实时上送
+                    publishMqttTelemetry(task.serverAddress,
+                        static_cast<int>(task.registerType), task.startAddress, values);
+
                     m_dashboard->appendCommunicationLog(QStringLiteral("READ OK addr=%1 count=%2 first=%3")
                         .arg(task.startAddress)
                         .arg(task.quantity)
@@ -300,6 +305,10 @@ void MainWindow::onBatchReadTask(const BatchTask &task)
                     for (uint i = 0; i < result.valueCount(); ++i)
                         values.append(result.value(i));
                     m_batchTaskManager->onTaskFinished(task.id, true, QString(), values);
+
+                    // MQTT：批量读取数据上送
+                    publishMqttTelemetry(task.serverAddress,
+                        static_cast<int>(task.registerType), task.startAddress, values);
                 } else {
                     m_batchTaskManager->onTaskFinished(task.id, false, reply->errorString(), {});
                 }
@@ -1043,6 +1052,207 @@ void MainWindow::toggleRemoteServer()
             statusBar()->showMessage("远程服务启动失败", 5000);
         }
     }
+}
+
+// ==================== MQTT 支持 ====================
+// 极简 MQTT 3.1.1 发布端（QoS0）：
+//   - 遥测主题 {前缀}data/{从站}/{寄存器类型}/{起始地址}  —— 轮询/批量读取成功后上送
+//   - 报警主题 {前缀}alarm/triggered                     —— AlarmManager 信号驱动
+//   - 状态主题 {前缀}status (retain)                     —— 设备连接状态变化时上送
+
+void MainWindow::initMqttSupport()
+{
+    m_mqttClient = new MqttClient(this);
+
+    // 读取持久化配置（mqtt/ 配置节）
+    const QString host = m_appSettings.value(QStringLiteral("mqtt/host"), QStringLiteral("127.0.0.1")).toString();
+    const int port = m_appSettings.value(QStringLiteral("mqtt/port"), 1883).toInt();
+    QString clientId = m_appSettings.value(QStringLiteral("mqtt/clientId")).toString();
+    if (clientId.isEmpty()) {
+        clientId = QStringLiteral("fieldlink-%1")
+                       .arg(QRandomGenerator::global()->bounded(100000, 999999));
+        m_appSettings.setValue(QStringLiteral("mqtt/clientId"), clientId);
+    }
+    const QString username = m_appSettings.value(QStringLiteral("mqtt/username")).toString();
+    const QString password = m_appSettings.value(QStringLiteral("mqtt/password")).toString();
+    const int keepalive = m_appSettings.value(QStringLiteral("mqtt/keepalive"), 60).toInt();
+
+    m_mqttClient->setBroker(host, static_cast<quint16>(port));
+    m_mqttClient->setCredentials(clientId, username, password);
+    m_mqttClient->setKeepAlive(keepalive);
+
+    // 客户端事件进运行日志
+    connect(m_mqttClient, &MqttClient::connected, this, [this]() {
+        logMessage(QStringLiteral("MQTT 已连接 broker %1").arg(m_mqttClient->brokerInfo()));
+    });
+    connect(m_mqttClient, &MqttClient::disconnected, this, [this]() {
+        logMessage(QStringLiteral("MQTT 与 broker 断开"), 2);
+    });
+    connect(m_mqttClient, &MqttClient::errorOccurred, this, [this](const QString &message) {
+        logMessage(message, 3);
+    });
+
+    // 报警事件实时上送（severity 转文本）
+    connect(m_alarmManager, &AlarmManager::alarmTriggered, this, [this](const AlarmEvent &event) {
+        if (!m_mqttClient->isConnectedToBroker())
+            return;
+        QJsonObject obj;
+        obj[QStringLiteral("id")] = static_cast<qint64>(event.id);
+        obj[QStringLiteral("timestamp")] = event.timestamp.toString(Qt::ISODateWithMs);
+        obj[QStringLiteral("ruleId")] = event.ruleId;
+        obj[QStringLiteral("ruleName")] = event.ruleName;
+        obj[QStringLiteral("severity")] =
+            event.severity == AlarmSeverity::Critical ? QStringLiteral("Critical")
+            : event.severity == AlarmSeverity::Warning ? QStringLiteral("Warning")
+                                                       : QStringLiteral("Info");
+        obj[QStringLiteral("message")] = event.message;
+        obj[QStringLiteral("value")] = event.value;
+        obj[QStringLiteral("acknowledged")] = event.acknowledged;
+
+        const QString prefix = m_appSettings.value(QStringLiteral("mqtt/topicPrefix"),
+                                                   QStringLiteral("fieldlink/")).toString();
+        m_mqttClient->publishJson(prefix + QStringLiteral("alarm/triggered"), obj);
+    });
+
+    // 曾经启用过 MQTT：启动时自动重连 broker
+    if (m_appSettings.value(QStringLiteral("mqtt/enabled"), false).toBool())
+        m_mqttClient->connectToBroker();
+}
+
+void MainWindow::showMqttSettings()
+{
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("MQTT 发布设置"));
+    dialog.resize(430, 320);
+    auto *form = new QFormLayout(&dialog);
+
+    auto *hostEdit = new QLineEdit(
+        m_appSettings.value(QStringLiteral("mqtt/host"), QStringLiteral("127.0.0.1")).toString(), &dialog);
+    auto *portSpin = new QSpinBox(&dialog);
+    portSpin->setRange(1, 65535);
+    portSpin->setValue(m_appSettings.value(QStringLiteral("mqtt/port"), 1883).toInt());
+    auto *clientEdit = new QLineEdit(m_appSettings.value(QStringLiteral("mqtt/clientId")).toString(), &dialog);
+    clientEdit->setPlaceholderText(QStringLiteral("留空自动生成"));
+    auto *userEdit = new QLineEdit(m_appSettings.value(QStringLiteral("mqtt/username")).toString(), &dialog);
+    auto *passEdit = new QLineEdit(m_appSettings.value(QStringLiteral("mqtt/password")).toString(), &dialog);
+    passEdit->setEchoMode(QLineEdit::Password);
+    auto *prefixEdit = new QLineEdit(
+        m_appSettings.value(QStringLiteral("mqtt/topicPrefix"), QStringLiteral("fieldlink/")).toString(), &dialog);
+    auto *keepaliveSpin = new QSpinBox(&dialog);
+    keepaliveSpin->setRange(10, 3600);
+    keepaliveSpin->setValue(m_appSettings.value(QStringLiteral("mqtt/keepalive"), 60).toInt());
+    keepaliveSpin->setSuffix(QStringLiteral(" 秒"));
+
+    form->addRow(QStringLiteral("Broker 地址"), hostEdit);
+    form->addRow(QStringLiteral("端口"), portSpin);
+    form->addRow(QStringLiteral("ClientID"), clientEdit);
+    form->addRow(QStringLiteral("用户名(可选)"), userEdit);
+    form->addRow(QStringLiteral("密码(可选)"), passEdit);
+    form->addRow(QStringLiteral("主题前缀"), prefixEdit);
+    form->addRow(QStringLiteral("KeepAlive"), keepaliveSpin);
+
+    auto *statusLabel = new QLabel(
+        m_mqttClient->isConnectedToBroker()
+            ? QStringLiteral("已连接 %1").arg(m_mqttClient->brokerInfo())
+            : QStringLiteral("未连接"),
+        &dialog);
+    form->addRow(QStringLiteral("状态"), statusLabel);
+
+    auto *buttonBox = new QDialogButtonBox(QDialogButtonBox::Save, &dialog);
+    connect(buttonBox, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    auto *connectBtn = new QPushButton(QStringLiteral("保存并连接"), &dialog);
+    auto *disconnectBtn = new QPushButton(QStringLiteral("断开"), &dialog);
+    buttonBox->addButton(connectBtn, QDialogButtonBox::ActionRole);
+    buttonBox->addButton(disconnectBtn, QDialogButtonBox::ActionRole);
+    form->addRow(buttonBox);
+
+    auto saveSettings = [this, hostEdit, portSpin, clientEdit, userEdit, passEdit, prefixEdit, keepaliveSpin]() {
+        m_appSettings.setValue(QStringLiteral("mqtt/host"), hostEdit->text().trimmed());
+        m_appSettings.setValue(QStringLiteral("mqtt/port"), portSpin->value());
+        if (!clientEdit->text().trimmed().isEmpty())
+            m_appSettings.setValue(QStringLiteral("mqtt/clientId"), clientEdit->text().trimmed());
+        m_appSettings.setValue(QStringLiteral("mqtt/username"), userEdit->text());
+        m_appSettings.setValue(QStringLiteral("mqtt/password"), passEdit->text());
+        QString prefix = prefixEdit->text();
+        if (!prefix.isEmpty() && !prefix.endsWith(QLatin1Char('/')))
+            prefix += QLatin1Char('/');
+        m_appSettings.setValue(QStringLiteral("mqtt/topicPrefix"), prefix);
+        m_appSettings.setValue(QStringLiteral("mqtt/keepalive"), keepaliveSpin->value());
+    };
+
+    connect(connectBtn, &QPushButton::clicked, &dialog, [this, saveSettings, statusLabel]() {
+        saveSettings();
+        m_mqttClient->setBroker(
+            m_appSettings.value(QStringLiteral("mqtt/host")).toString(),
+            static_cast<quint16>(m_appSettings.value(QStringLiteral("mqtt/port"), 1883).toInt()));
+        m_mqttClient->setCredentials(
+            m_appSettings.value(QStringLiteral("mqtt/clientId")).toString(),
+            m_appSettings.value(QStringLiteral("mqtt/username")).toString(),
+            m_appSettings.value(QStringLiteral("mqtt/password")).toString());
+        m_mqttClient->setKeepAlive(m_appSettings.value(QStringLiteral("mqtt/keepalive"), 60).toInt());
+        m_appSettings.setValue(QStringLiteral("mqtt/enabled"), true);
+        m_mqttClient->connectToBroker();
+        statusLabel->setText(QStringLiteral("正在连接..."));
+    });
+
+    connect(disconnectBtn, &QPushButton::clicked, &dialog, [this, statusLabel]() {
+        m_appSettings.setValue(QStringLiteral("mqtt/enabled"), false);
+        m_mqttClient->disconnectFromBroker();
+        statusLabel->setText(QStringLiteral("已断开"));
+    });
+
+    connect(m_mqttClient, &MqttClient::connected, statusLabel, [statusLabel, this]() {
+        statusLabel->setText(QStringLiteral("已连接 %1").arg(m_mqttClient->brokerInfo()));
+    });
+    connect(m_mqttClient, &MqttClient::disconnected, statusLabel, [statusLabel]() {
+        statusLabel->setText(QStringLiteral("未连接"));
+    });
+    connect(m_mqttClient, &MqttClient::errorOccurred, statusLabel, [statusLabel](const QString &message) {
+        statusLabel->setText(message);
+    });
+
+    dialog.exec();
+}
+
+void MainWindow::publishMqttTelemetry(int serverAddress, int registerType, int startAddress,
+                                      const QVector<quint16> &values)
+{
+    if (!m_mqttClient || !m_mqttClient->isConnectedToBroker() || values.isEmpty())
+        return;
+
+    QJsonObject obj;
+    obj[QStringLiteral("timestamp")] = QDateTime::currentDateTime().toString(Qt::ISODateWithMs);
+    obj[QStringLiteral("serverAddress")] = serverAddress;
+    obj[QStringLiteral("registerType")] = registerTypeName(registerType);
+    obj[QStringLiteral("startAddress")] = startAddress;
+    obj[QStringLiteral("count")] = values.size();
+    QJsonArray vals;
+    for (quint16 value : values)
+        vals.append(static_cast<int>(value));
+    obj[QStringLiteral("values")] = vals;
+
+    const QString prefix = m_appSettings.value(QStringLiteral("mqtt/topicPrefix"),
+                                               QStringLiteral("fieldlink/")).toString();
+    const QString topic = QStringLiteral("%1data/%2/%3/%4")
+                              .arg(prefix).arg(serverAddress)
+                              .arg(registerTypeName(registerType)).arg(startAddress);
+    m_mqttClient->publishJson(topic, obj);
+}
+
+void MainWindow::publishMqttStatus(bool connected)
+{
+    if (!m_mqttClient || !m_mqttClient->isConnectedToBroker())
+        return;
+
+    QJsonObject obj;
+    obj[QStringLiteral("connected")] = connected;
+    obj[QStringLiteral("endpoint")] = ui->portEdit ? ui->portEdit->currentText() : QString();
+    obj[QStringLiteral("timestamp")] = QDateTime::currentDateTime().toString(Qt::ISODateWithMs);
+
+    const QString prefix = m_appSettings.value(QStringLiteral("mqtt/topicPrefix"),
+                                               QStringLiteral("fieldlink/")).toString();
+    // retain=true：订阅方上线即可获得最后一次现场在线状态
+    m_mqttClient->publishJson(prefix + QStringLiteral("status"), obj, true);
 }
 
 void MainWindow::showPluginManager()
