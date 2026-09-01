@@ -11,15 +11,17 @@
 
 ```mermaid
 flowchart LR
-    CD[Claude Desktop / Cursor<br/>MCP 客户端] == stdio ==> BR[deploy/mcp_stdio_bridge.py<br/>stdio 桥]
-    BR == HTTP POST /mcp ==> FS[FieldLink McpServer<br/>Streamable HTTP, 端口 8180]
+    CD[Claude Desktop / Cursor<br/>MCP 客户端] == stdio ==> BR[deploy/mcp_stdio_bridge.py<br/>stdio 桥 + 会话透传]
+    BR == "HTTP POST /mcp<br/>(Mcp-Session-Id)" ==> FS[FieldLink McpServer<br/>Streamable HTTP, 端口 8180]
+    FS == "GET /mcp SSE<br/>notifications/message" --> BR
     CURL[curl / PowerShell<br/>直接 HTTP 测试] == HTTP ==> FS
     FS --> REG[AgentToolRegistry<br/>共用工具注册表]
     REG --> MOD[Modbus 设备 / SQLite 历史 / 报警 / 轮询]
+    CONF[GUI 人工确认框<br/>危险操作逐次批准] -.-> FS
 ```
 
-- **MCP 服务器内置于程序**（`src/mcpserver.cpp`），传输层为 Streamable HTTP（MCP 2025-06-18 规范），无状态模式
-- **stdio 桥**（`deploy/mcp_stdio_bridge.py`，纯标准库）供只支持 stdio 传输的客户端使用
+- **MCP 服务器内置于程序**（`src/mcpserver.cpp`），传输层为 Streamable HTTP（MCP 2025-06-18 规范），支持会话管理与 SSE 服务端通知
+- **stdio 桥**（`deploy/mcp_stdio_bridge.py`，纯标准库）供只支持 stdio 传输的客户端使用，自动透传 `Mcp-Session-Id`
 - **工具注册表**（`header/agenttool.h`）与 agent 分支的内嵌 AI 助手**共用**——工具定义一次，两端复用
 
 ## 二、启动服务
@@ -27,7 +29,8 @@ flowchart LR
 1. 启动 FieldLink，菜单 **Advanced → MCP Service (AI)**
 2. 弹窗输入 **API Token**（留空 = 不鉴权，仅建议本机调试时使用）
 3. 选择**是否允许写入**（写寄存器 / 新增报警规则 / 轮询控制）——默认禁止，这是安全闸门
-4. 状态栏显示：`MCP 服务已启动 端口: 8180 工具: 11 写入: 关闭`
+4. 若选择允许写入，会继续询问**是否逐次弹窗人工确认**（默认开启，强烈建议保持）
+5. 状态栏显示：`MCP 服务已启动 端口: 8180 工具: 11 写入: 开启 会话: 宽容 限流: 30/min`
 
 端口默认 8180，通过 `mcp/port` 配置项持久化；运行日志写入程序日志（Log Viewer 可查）。
 
@@ -116,31 +119,54 @@ Cursor 等其他支持 MCP 的客户端配置方式类似（command = python，a
 
 **Prompts**（`prompts/get`）：`daily_report`（运行日报）、`troubleshoot`（故障排查）、`alarm_review`（报警规则体检）——都是指导 AI 分步调用工具的模板。
 
-## 七、安全设计
+## 七、安全设计（六层防线）
 
-- **Token 鉴权**：`Authorization: Bearer <token>` 或 `X-Api-Token` 头，与远程服务共用 `SecurityManager` 令牌体系
-- **写入闸门**：三个危险工具默认不可用，启动服务时显式选择
-- **审计**：写寄存器/报警规则/轮询控制全部写入 `SecurityManager` 审计日志（operator 记为 `mcp`）
-- **DNS 重绑定防护**：非 localhost 的 Origin 头直接 403
-- **参数校验**：所有工具参数按 JSON Schema 校验，缺失/类型不符直接拒绝
+| 层级 | 机制 | 说明 |
+| --- | --- | --- |
+| 1 | **Token 鉴权** | `Authorization: Bearer <token>` 或 `X-Api-Token` 头，与远程服务共用 `SecurityManager` 令牌体系 |
+| 2 | **写入闸门** | 三个危险工具默认不可用，启动服务时显式选择；未开启时调用返回 `isError` |
+| 3 | **GUI 人工确认** | 写入闸门开启后，每次危险工具调用仍会在主界面弹出确认框（显示工具名+完整参数），本机操作员点「Yes」才执行；`mcp/writeConfirmation` 配置项可关闭（不建议） |
+| 4 | **审计日志** | 写寄存器/报警规则/轮询控制全部写入 `SecurityManager` 审计日志（operator 记为 `mcp`），确认结果也进运行日志 |
+| 5 | **传输层防护** | 非 localhost 的 Origin 头直接 403（DNS 重绑定防护）；每 IP 每分钟 30 次 POST 滑动窗口限流（超出 429）；参数 JSON Schema 强校验 |
+| 6 | **会话管理** | initialize 签发 `Mcp-Session-Id`（30 分钟空闲过期）；默认宽容模式兼容简单客户端，可切换强制模式拒绝无会话请求 |
 
-## 八、故障排查
+## 八、会话与 SSE 通知
+
+**会话**：`initialize` 响应头会携带 `Mcp-Session-Id`；规范客户端（如 Claude Code HTTP 传输）会自动回传。服务器默认**宽容模式**（不带会话 ID 也能用，兼容 stdio 桥等简单客户端），需要严格隔离时可在代码中 `setRequireSession(true)` 切换为强制模式。`DELETE /mcp` 可主动终止会话。
+
+**SSE 通知通道**：客户端对 `GET /mcp`（`Accept: text/event-stream`）建立长连接后，服务器主动推送：
+
+- `notifications/message` —— 运行日志（鉴权失败、限流触发、危险操作确认结果、客户端接入等），每 15 秒发送心跳保活
+- `notifications/tools/list_changed` —— 工具集变更时广播（预留）
+
+客户端可通过 `logging/setLevel` 调整接收日志的最低级别（debug/info/notice/warning/error）。
+
+```bash
+# 观察 SSE 通知流（保持运行）
+curl -N -H "Accept: text/event-stream" -H "X-Api-Token: 你的Token" http://127.0.0.1:8180/mcp
+```
+
+## 九、故障排查
 
 | 现象 | 原因与处理 |
 | --- | --- |
 | 桥脚本报"无法连接" | FieldLink 未启动或未在菜单中开启 MCP 服务 |
 | HTTP 401 | Token 不一致；桥 `--token` 参数与服务启动时输入的需一致 |
 | HTTP 403 origin not allowed | 跨源访问被拦截，属预期防护 |
+| HTTP 429 rate limit exceeded | 触发限流（30 次/分钟/IP），稍后再试或调低 AI 客户端请求频率 |
+| HTTP 404 session expired | 强制会话模式下会话过期/无效，重新 initialize |
 | 工具返回 isError「写入闸门未开启」 | 重新启动 MCP 服务并选择允许写入 |
+| 界面弹出"MCP 危险操作确认" | AI 正在请求写操作，核对工具与参数后选择允许/拒绝 |
 | 工具返回「Modbus device not connected」 | 先在主界面连接设备（RTU/TCP） |
 | 端口被占用 | 启动失败状态栏提示；换端口（`mcp/port` 配置项） |
 
-## 九、与 agent 分支的关系
+## 十、与 agent 分支的关系
 
 `AgentToolRegistry` 是两端共用的工具层：agent 分支的内嵌 AI 助手将复用这里的 11 个工具定义，
-并在此基础上叠加 LLM Function Calling 循环与"写操作人工确认卡片"。在 mcp 分支调整工具时，
-合并到 agent 分支后内嵌助手自动获得同样的能力。
+并在此基础上叠加 LLM Function Calling 循环。内嵌助手的写操作同样走"写入闸门 + 人工确认"防线，
+只是确认框从 MCP 回调换成了 AgentService 的确认流。
 
 ---
 
-*协议参考：[MCP Transports 规范 2025-06-18](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)*
+*协议参考：[MCP Transports 规范 2025-06-18](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)；
+会话管理与 SSE 通知设计借鉴自 [pros/mcp_server](../..) 项目的 HttpStreamTransport 与 MCPBuilder。*

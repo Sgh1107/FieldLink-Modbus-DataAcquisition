@@ -1436,6 +1436,25 @@ void MainWindow::initMcpAgent()
     // ---------- MCP 服务器 ----------
     m_mcpServer = new McpServer(this);
     m_mcpServer->setToolRegistry(m_agentTools);
+
+    // 危险工具人工确认（human-in-the-loop）：
+    // 外部 AI 客户端调用 write_registers / add_alarm_rule / polling_control 时，
+    // 即便写入闸门开启，也会在主界面弹出确认框，本机操作员同意才真正执行。
+    // 确认行为可通过 mcp/writeConfirmation 配置项关闭（默认开启）。
+    m_mcpServer->setDangerousConfirmHandler(
+        [this](const QString &toolName, const QJsonObject &arguments) -> bool {
+            if (!m_appSettings.value(QStringLiteral("mcp/writeConfirmation"), true).toBool())
+                return true;   // 操作员已关闭逐次确认
+            const QString summary = QString::fromUtf8(
+                QJsonDocument(arguments).toJson(QJsonDocument::Compact));
+            const auto choice = QMessageBox::question(this,
+                QStringLiteral("MCP 危险操作确认"),
+                QStringLiteral("AI 客户端请求执行写操作：\n\n工具：%1\n参数：%2\n\n是否允许执行？")
+                    .arg(toolName, summary),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+            return choice == QMessageBox::Yes;
+        });
+
     m_mcpServer->setResourceProvider([this](const QString &uri) -> QJsonValue {
         if (uri == QLatin1String("fieldlink://status"))
             return buildRemoteStatus();
@@ -1502,6 +1521,13 @@ void MainWindow::toggleMcpServer()
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
     m_mcpServer->setAuthToken(token);
     m_mcpServer->setWriteEnabled(enableWrite == QMessageBox::Yes);
+    if (enableWrite == QMessageBox::Yes) {
+        // 写入开启时，额外确认是否逐次弹窗人工确认（human-in-the-loop，默认开启）
+        const auto needConfirm = QMessageBox::question(this, QStringLiteral("写操作人工确认"),
+            QStringLiteral("每次危险写操作是否弹出确认框，由本机操作员逐次批准？\n（安全建议：开启；关闭后 AI 可直接执行已放行的写操作）"),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
+        m_appSettings.setValue(QStringLiteral("mcp/writeConfirmation"), needConfirm == QMessageBox::Yes);
+    }
 
     const int port = m_appSettings.value(QStringLiteral("mcp/port"), 8180).toInt();
     if (m_mcpServer->start(static_cast<quint16>(port))) {

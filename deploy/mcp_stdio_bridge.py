@@ -8,6 +8,9 @@ FieldLink MCP stdio 桥接脚本
 
   AI 客户端 ⇄ (stdio, 按行分隔 JSON-RPC) ⇄ 本脚本 ⇄ (HTTP POST /mcp) ⇄ FieldLink
 
+支持 Mcp-Session-Id 会话透传：initialize 响应中服务器签发的会话 ID
+会被保存并自动附加到后续请求头。
+
 仅使用 Python 标准库，无需 pip install。
 """
 
@@ -32,36 +35,44 @@ def log(message: str) -> None:
     print(f"[fieldlink-mcp-bridge] {message}", file=sys.stderr, flush=True)
 
 
-def forward(payload: bytes, base_url: str, token: str, timeout: float) -> bytes | None:
-    """把一条 JSON-RPC 消息 POST 到 FieldLink /mcp，返回响应体（通知返回 None）。"""
+def forward(payload: bytes, base_url: str, token: str, timeout: float,
+            session_id: str | None) -> tuple[bytes | None, str | None]:
+    """把一条 JSON-RPC 消息 POST 到 FieldLink /mcp。
+
+    返回 (响应体或 None, 服务器新签发的会话 ID 或 None)。
+    通知类消息返回 (None, ...)。
+    """
     headers = {"Content-Type": "application/json"}
     if token:
         headers["X-Api-Token"] = token
         headers["Authorization"] = f"Bearer {token}"
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
 
     request = urllib.request.Request(base_url, data=payload, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.read() or None
+            new_session = response.headers.get("Mcp-Session-Id")
+            return (response.read() or None), new_session
     except urllib.error.HTTPError as error:
         body = error.read()
         # 4xx 时服务器一般会带 JSON-RPC error 体，原样回传给客户端
         if body:
-            return body
+            return body, None
         if error.code == 401:
-            return json.dumps({
+            return (json.dumps({
                 "jsonrpc": "2.0", "id": None,
                 "error": {"code": -32000, "message": f"HTTP {error.code}: 鉴权失败，请检查 --token 与 FieldLink 中输入的 Token 是否一致"}
-            }).encode("utf-8")
-        return json.dumps({
+            }).encode("utf-8"), None)
+        return (json.dumps({
             "jsonrpc": "2.0", "id": None,
             "error": {"code": -32000, "message": f"HTTP {error.code}: {error.reason}"}
-        }).encode("utf-8")
+        }).encode("utf-8"), None)
     except (urllib.error.URLError, OSError) as error:
-        return json.dumps({
+        return (json.dumps({
             "jsonrpc": "2.0", "id": None,
             "error": {"code": -32000, "message": f"无法连接 FieldLink MCP 服务: {error}（请确认程序已启动并开启 MCP 服务）"}
-        }).encode("utf-8")
+        }).encode("utf-8"), None)
 
 
 def main() -> int:
@@ -79,26 +90,21 @@ def main() -> int:
     base_url = f"http://{args.host}:{args.port}/mcp"
     log(f"桥接已就绪: stdio <-> {base_url} (token={'已配置' if args.token else '未配置'})")
 
+    session_id: str | None = None
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
 
-        # 取 id 用于失败时回错；通知无需响应
-        request_id = None
-        try:
-            parsed = json.loads(line)
-            if isinstance(parsed, dict) and "id" in parsed:
-                request_id = parsed["id"]
-        except json.JSONDecodeError:
-            request_id = None
-
-        response = forward(line.encode("utf-8"), base_url, args.token, args.timeout)
+        response, new_session = forward(line.encode("utf-8"), base_url,
+                                        args.token, args.timeout, session_id)
+        if new_session and new_session != session_id:
+            session_id = new_session
+            log(f"已获取 MCP 会话 ID: {session_id[:8]}...")
         if response:
             sys.stdout.write(response.decode("utf-8", errors="replace").strip() + "\n")
             sys.stdout.flush()
         # 202（通知）无响应体，不写 stdout
-        _ = request_id  # 失败回错已由 forward 生成的 error 响应覆盖
 
     log("stdin 已关闭，桥接退出")
     return 0
