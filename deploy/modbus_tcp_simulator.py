@@ -30,8 +30,11 @@ import socket
 import struct
 import threading
 import time
+import signal
+import sys
 
 # ---------------- 数据模型 ----------------
+
 
 class DataStore:
     """模拟从站数据区，后台线程让数值持续变化，方便观察曲线与报警。"""
@@ -44,10 +47,11 @@ class DataStore:
         self.discrete: list[bool] = [False] * 32
         self._t0 = time.time()
         self._walk = 1000
+        self.running = True  # 新增：运行标志
         threading.Thread(target=self._tick, daemon=True).start()
 
     def _tick(self) -> None:
-        while True:
+        while self.running:  # 检查运行标志
             t = time.time() - self._t0
             with self.lock:
                 self.holding[0] = int(250 + 100 * math.sin(t / 30))      # 温度 15.0~35.0°C
@@ -60,6 +64,10 @@ class DataStore:
                 self.input[1] = self._walk % 65536
                 self.discrete[0] = (int(t) % 10) < 5                     # 每 5 秒翻转
             time.sleep(0.5)
+
+    def stop(self) -> None:
+        """停止数据更新线程"""
+        self.running = False
 
     def read_regs(self, table: list[int], addr: int, qty: int) -> list[int]:
         with self.lock:
@@ -300,6 +308,7 @@ def selftest(port: int, unit: int) -> int:
     check("未实现功能返回异常码 0x01", resp[0] == 0xAB and resp[1] == EX_ILLEGAL_FUNCTION)
 
     client.close()
+    store.stop()  # 停止数据更新线程
     server.close()
     print(f"自检完成：{'全部通过' if failures == 0 else f'{failures} 项失败'}")
     return 0 if failures == 0 else 1
@@ -314,6 +323,65 @@ def accept_loop(server: socket.socket, store: DataStore, unit: int) -> None:
         threading.Thread(target=serve_client, args=(client, store, unit), daemon=True).start()
 
 
+class ModbusSimulator:
+    """Modbus模拟器类，封装了服务器和信号处理"""
+    
+    def __init__(self, host: str, port: int, unit: int):
+        self.host = host
+        self.port = port
+        self.unit = unit
+        self.store = DataStore()
+        self.server: socket.socket | None = None
+        self.running = True
+        
+    def start(self) -> None:
+        """启动模拟器服务器"""
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server.bind((self.host, self.port))
+        self.server.listen(8)
+        # 设置超时以便检查运行标志
+        self.server.settimeout(1.0)
+        
+        print(f"Modbus TCP 从站模拟器已启动")
+        print(f"  监听: {self.host}:{self.port}  从站地址: {self.unit}")
+        print(f"  提示: FieldLink 中连接类型选 TCP，地址填 127.0.0.1:{self.port}，从站地址填 {self.unit}")
+        print(f"  reg0=模拟温度(正弦)  reg1=随机游走  reg2=42  Ctrl+C 退出")
+        
+        while self.running:
+            try:
+                client, addr = self.server.accept()
+                if not self.running:  # 在停止过程中
+                    client.close()
+                    break
+                print(f"  客户端接入: {addr[0]}:{addr[1]}")
+                threading.Thread(target=serve_client, args=(client, self.store, self.unit), daemon=True).start()
+            except socket.timeout:
+                continue  # 超时后重新检查running标志
+            except OSError:
+                # socket被关闭，退出循环
+                break
+    
+    def stop(self) -> None:
+        """停止模拟器"""
+        print("\n正在停止Modbus模拟器...")
+        self.running = False
+        self.store.stop()  # 停止数据更新线程
+        if self.server:
+            try:
+                self.server.close()
+            except:
+                pass
+
+
+def signal_handler(simulator: ModbusSimulator):
+    """信号处理函数"""
+    def handler(signum, frame):
+        print(f"\n收到终止信号 (Signal {signum})")
+        simulator.stop()
+    return handler
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="FieldLink Modbus TCP 从站模拟器")
     parser.add_argument("--port", type=int, default=1502, help="监听端口（默认 1502）")
@@ -325,22 +393,24 @@ def main() -> int:
     if args.selftest:
         return selftest(args.port, args.unit)
 
-    store = DataStore()
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((args.host, args.port))
-    server.listen(8)
-    print(f"Modbus TCP 从站模拟器已启动")
-    print(f"  监听: {args.host}:{args.port}  从站地址: {args.unit}")
-    print(f"  提示: FieldLink 中连接类型选 TCP，地址填 127.0.0.1:{args.port}，从站地址填 {args.unit}")
-    print(f"  reg0=模拟温度(正弦)  reg1=随机游走  reg2=42  Ctrl+C 退出")
+    # 创建模拟器实例
+    simulator = ModbusSimulator(args.host, args.port, args.unit)
+    
+    # 注册信号处理器
+    signal.signal(signal.SIGINT, signal_handler(simulator))
+    signal.signal(signal.SIGTERM, signal_handler(simulator))
+    
     try:
-        while True:
-            client, addr = server.accept()
-            print(f"  客户端接入: {addr[0]}:{addr[1]}")
-            threading.Thread(target=serve_client, args=(client, store, args.unit), daemon=True).start()
+        simulator.start()
     except KeyboardInterrupt:
-        print("\n模拟器已退出")
+        # 双重保险
+        print("\n收到KeyboardInterrupt")
+        simulator.stop()
+    finally:
+        # 清理所有客户端连接
+        print("Modbus模拟器已停止")
+        # 关闭所有socket连接（在serv_client中会自动关闭）
+    
     return 0
 
 
