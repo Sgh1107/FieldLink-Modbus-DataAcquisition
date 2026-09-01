@@ -8,6 +8,7 @@ ReliabilityManager::ReliabilityManager(QObject *parent)
     , m_heartbeatIntervalMs(5000)
     , m_maxContinuousFailures(3)
     , m_continuousFailures(0)
+    , m_userIntentConnected(false)
 {
     m_reconnectTimer.setSingleShot(false);
     m_heartbeatTimer.setSingleShot(false);
@@ -49,8 +50,19 @@ void ReliabilityManager::setMaxContinuousFailures(int count)
 bool ReliabilityManager::autoReconnectEnabled() const { return m_autoReconnectEnabled; }
 bool ReliabilityManager::heartbeatEnabled() const { return m_heartbeatEnabled; }
 int ReliabilityManager::continuousFailures() const { return m_continuousFailures; }
+bool ReliabilityManager::userIntentConnected() const { return m_userIntentConnected; }
 QDateTime ReliabilityManager::lastSuccessTime() const { return m_lastSuccessTime; }
 QDateTime ReliabilityManager::lastFailureTime() const { return m_lastFailureTime; }
+
+void ReliabilityManager::setUserIntentConnected(bool connected)
+{
+    m_userIntentConnected = connected;
+    if (!connected) {
+        // 用户明确不想要连接（启动阶段/手动断开）：立即停止重连循环
+        m_reconnectTimer.stop();
+        emit recoveryStateChanged(QStringLiteral("已停止自动重连（用户断开）"));
+    }
+}
 
 void ReliabilityManager::start()
 {
@@ -91,13 +103,15 @@ void ReliabilityManager::notifyFailure(const QString &reason)
 void ReliabilityManager::notifyDisconnected()
 {
     notifyFailure(QStringLiteral("设备断线"));
-    if (m_autoReconnectEnabled && !m_reconnectTimer.isActive())
+    // 仅在用户希望保持连接时才自动重连（意外断线场景）；
+    // 启动阶段 / 手动断开后（意图为 false）不再触发
+    if (m_userIntentConnected && m_autoReconnectEnabled && !m_reconnectTimer.isActive())
         m_reconnectTimer.start(m_reconnectIntervalMs);
 }
 
 void ReliabilityManager::onReconnectTimeout()
 {
-    if (m_autoReconnectEnabled)
+    if (m_autoReconnectEnabled && m_userIntentConnected)
         emit reconnectRequested();
 }
 

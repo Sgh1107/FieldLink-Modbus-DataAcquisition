@@ -60,6 +60,7 @@ private:
     void initAdvancedFeatures();
     void initMenus();
     void initMqttSupport();                    // MQTT：初始化发布端客户端与遥测/报警挂钩
+    void attemptModbusConnection();            // 执行一次 Modbus 连接动作（手动/自动重连共用）
     QModbusDataUnit readRequest() const;
     QModbusDataUnit writeRequest() const;
 

@@ -17,6 +17,11 @@ public:
     void setReconnectIntervalMs(int intervalMs);
     void setHeartbeatIntervalMs(int intervalMs);
     void setMaxContinuousFailures(int count);
+    // 用户意图：是否希望保持与设备的连接。
+    // 只有意图为"已连接"时，意外断线才会触发自动重连；
+    // 手动断开应置为 false，重连循环立即停止；程序启动默认 false（不自动连接）。
+    void setUserIntentConnected(bool connected);
+    bool userIntentConnected() const;
 
     bool autoReconnectEnabled() const;
     bool heartbeatEnabled() const;
@@ -49,6 +54,7 @@ private:
     int m_heartbeatIntervalMs;
     int m_maxContinuousFailures;
     int m_continuousFailures;
+    bool m_userIntentConnected;
     QString m_lastFailureReason;
     QDateTime m_lastSuccessTime;
     QDateTime m_lastFailureTime;
