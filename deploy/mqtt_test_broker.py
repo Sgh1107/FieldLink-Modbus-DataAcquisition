@@ -22,6 +22,8 @@ import argparse
 import socket
 import struct
 import threading
+import signal
+import sys
 
 
 def log(message: str) -> None:
@@ -37,6 +39,8 @@ class MiniBroker:
         # 订阅表：socket -> set(topic)
         self.subscriptions: dict[socket.socket, set[str]] = {}
         self.lock = threading.Lock()
+        self.running = True  # 新增：运行标志
+        self.server_socket: socket.socket | None = None  # 新增：保存服务器socket引用
 
     # ---------- MQTT 编解码辅助 ----------
 
@@ -94,7 +98,7 @@ class MiniBroker:
         client_id = "?"
         log(f"ACCEPT addr={addr[0]}:{addr[1]}")
         try:
-            while True:
+            while self.running:  # 检查运行标志
                 packet = self.recv_packet(sock)
                 if packet is None:
                     break
@@ -203,6 +207,53 @@ class MiniBroker:
             if length == 0:
                 return out
 
+    def stop(self) -> None:
+        """停止broker"""
+        log("正在停止 MQTT broker...")
+        self.running = False
+        # 关闭服务器socket以解除accept阻塞
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+            except:
+                pass
+
+    def run(self) -> None:
+        """启动broker主循环"""
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(8)
+        log(f"MQTT mini broker 已启动 {self.host}:{self.port} "
+            f"(认证={'开启' if self.username else '关闭'})")
+        log("按 Ctrl+C 停止服务")
+
+        # 设置非阻塞模式以便检查运行标志
+        self.server_socket.settimeout(1.0)
+
+        while self.running:
+            try:
+                client, addr = self.server_socket.accept()
+                # 检查是否在停止过程中
+                if not self.running:
+                    client.close()
+                    break
+                threading.Thread(target=self.handle_client, args=(client, addr), daemon=True).start()
+            except socket.timeout:
+                # 超时是为了能够检查running标志
+                continue
+            except OSError:
+                # socket被关闭，跳出循环
+                break
+
+
+def signal_handler(broker: MiniBroker):
+    """信号处理函数，用于优雅地停止broker"""
+    def handler(signum, frame):
+        log(f"\n收到终止信号 (Signal {signum})")
+        broker.stop()
+    return handler
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="FieldLink MQTT 测试迷你 broker")
@@ -213,16 +264,29 @@ def main() -> int:
     args = parser.parse_args()
 
     broker = MiniBroker(args.host, args.port, args.user, args.password)
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((args.host, args.port))
-    server.listen(8)
-    log(f"MQTT mini broker 已启动 {args.host}:{args.port} "
-        f"(认证={'开启' if args.user else '关闭'})")
 
-    while True:
-        client, addr = server.accept()
-        threading.Thread(target=broker.handle_client, args=(client, addr), daemon=True).start()
+    # 注册信号处理器
+    signal.signal(signal.SIGINT, signal_handler(broker))
+    signal.signal(signal.SIGTERM, signal_handler(broker))
+
+    try:
+        broker.run()
+    except KeyboardInterrupt:
+        # 双重保险，处理可能的KeyboardInterrupt
+        log("\n收到 KeyboardInterrupt")
+        broker.stop()
+    finally:
+        log("MQTT broker 已停止")
+        # 关闭所有客户端连接
+        with broker.lock:
+            for sock in list(broker.subscriptions.keys()):
+                try:
+                    sock.close()
+                except:
+                    pass
+            broker.subscriptions.clear()
+
+    return 0
 
 
 if __name__ == "__main__":
