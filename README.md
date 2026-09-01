@@ -27,6 +27,7 @@
 - ✅ **智能报警系统**：8 种触发条件（大于/小于/等于/不等于/范围内/范围外/置位/清零）× 3 级严重度，支持去抖时间、报警确认、报警历史查询
 - ✅ **专业数据可视化**：实时曲线 + 仪表盘（Dashboard），支持点位与图表/仪表绑定，数据一目了然
 - ✅ **远程监控 API**：内置 HTTP JSON API 服务（状态查询/远程读/远程写），API Token 鉴权，远程写可独立开关，便于上位机/运维系统集成
+- ✅ **MQTT 数据上送**：内置零依赖 MQTT 3.1.1 发布端（QoS 0），采集数据/报警事件/连接状态实时上送 broker，自动重连 + 心跳保活，无缝对接 IoT 平台与组态软件
 - ✅ **完备安全体系**：用户/角色/权限三级模型，密码与 API Token 均哈希存储，敏感操作权限校验
 - ✅ **高可靠运行**：自动重连 + 心跳保活 + 连续失败告警（ReliabilityManager），全局崩溃捕获与日志记录（CrashLogger），适合无人值守长期运行
 - ✅ **脚本与插件扩展**：内置 QJSEngine 脚本控制台（可加载脚本文件、注册全局对象），标准 Qt 插件接口（数据回调 + 连接状态回调 + 读写设置），二次开发友好
@@ -143,6 +144,9 @@ FieldLink-Modbus-DataAcquisition/
 │   ├── crashlogger.h         # 全局崩溃捕获与日志
 │   ├── logviewer.h           # 运行日志查看器
 │   │
+│   ├── ── MQTT 上送 ──
+│   ├── mqttclient.h          # 零依赖 MQTT 3.1.1 发布端（QoS0/自动重连/心跳）
+│   │
 │   └── ── 工程化工具 ──
 │   ├── verificationmanager.h # 验证计划与报告导出
 │   ├── deliverymanager.h     # 交付清单/环境检查/手册生成/打包
@@ -156,8 +160,8 @@ FieldLink-Modbus-DataAcquisition/
 ├── style/                    # dark.qss / light.qss 主题样式
 ├── translations/             # 界面翻译（zh_CN，构建期嵌入资源）
 ├── images/                   # 界面图标资源
-├── deploy/package_windows.ps1  # Windows 发布打包脚本
-├── doc/                      # Modbus 文档
+├── deploy/                   # Windows 打包脚本 / MQTT 测试 broker / Modbus 模拟器
+├── doc/                      # MQTT 指南 / 测试指南 / AI 集成设计
 └── build/                    # 构建输出目录（Makefile 由 qmake 自动生成）
 ```
 

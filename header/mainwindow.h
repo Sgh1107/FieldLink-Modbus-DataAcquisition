@@ -44,6 +44,7 @@ class VerificationManager;
 class DeliveryManager;
 class McpServer;
 class AgentToolRegistry;
+class MqttClient;
 
 struct PollTask;
 struct BatchTask;
@@ -61,6 +62,8 @@ private:
     void initAdvancedFeatures();
     void initMenus();
     void initMcpAgent();                       // AI/MCP：构建共用工具注册表与 MCP 服务器
+    void initMqttSupport();                    // MQTT：初始化发布端客户端与遥测/报警挂钩
+    void attemptModbusConnection();            // 执行一次 Modbus 连接动作（手动/自动重连共用）
     QModbusDataUnit readRequest() const;
     QModbusDataUnit writeRequest() const;
 
@@ -96,6 +99,7 @@ private slots:
     void showScriptConsole();
     void toggleRemoteServer();
     void toggleMcpServer();
+    void showMqttSettings();
     void showPluginManager();
     void showPointManager();
     void showVerificationManager();
@@ -109,6 +113,8 @@ private slots:
     QJsonObject buildRemoteStatus() const;
     QJsonObject executeRemoteRead(int serverAddress, int registerType, int startAddress, int count);
     QJsonObject executeRemoteWrite(int serverAddress, int registerType, int startAddress, const QVector<quint16> &values);
+    void publishMqttTelemetry(int serverAddress, int registerType, int startAddress, const QVector<quint16> &values);
+    void publishMqttStatus(bool connected);
 
 private:
     Ui::MainWindow *ui;
@@ -140,6 +146,7 @@ private:
     DeliveryManager *m_deliveryManager;
     McpServer *m_mcpServer = nullptr;              // MCP 服务器（AI 能力出口之一）
     AgentToolRegistry *m_agentTools = nullptr;     // AI Agent / MCP 共用工具注册表
+    MqttClient *m_mqttClient = nullptr;            // MQTT 发布端客户端
     QMap<int, int> m_pointChartSeriesMap;
     QMap<int, int> m_pointDashboardGaugeMap;
 };

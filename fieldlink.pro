@@ -40,7 +40,8 @@ SOURCES += src/main.cpp\
         src/deliverymanager.cpp \
         src/crashlogger.cpp \
         src/agenttool.cpp \
-        src/mcpserver.cpp
+        src/mcpserver.cpp \
+        src/mqttclient.cpp
 
 HEADERS  += header/mainwindow.h \
          header/settingsdialog.h \
@@ -69,7 +70,8 @@ HEADERS  += header/mainwindow.h \
         header/crashlogger.h \
         header/thememanager.h \
         header/agenttool.h \
-        header/mcpserver.h
+        header/mcpserver.h \
+        header/mqttclient.h
 
 FORMS    += mainwindow.ui \
          settingsdialog.ui

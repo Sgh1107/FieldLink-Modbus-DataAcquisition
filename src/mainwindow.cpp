@@ -25,6 +25,7 @@
 #include "thememanager.h"  // 深色/浅色主题切换
 #include "mcpserver.h"     // AI/MCP：MCP 服务器
 #include "agenttool.h"     // AI/MCP：共用工具注册表
+#include "mqttclient.h"    // MQTT 发布端客户端
 
 #include <QModbusTcpClient>
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
@@ -232,37 +233,50 @@ void MainWindow::on_connectButton_clicked()
 
     statusBar()->clearMessage();
     if (modbusDevice->state() != QModbusDevice::ConnectedState) {
-        if (static_cast<ModbusConnection> (ui->connectType->currentIndex()) == Serial) {
-            modbusDevice->setConnectionParameter(QModbusDevice::SerialPortNameParameter,
-                ui->portEdit->currentText());
-            modbusDevice->setConnectionParameter(QModbusDevice::SerialParityParameter,
-                m_settingsDialog->settings().parity);
-            modbusDevice->setConnectionParameter(QModbusDevice::SerialBaudRateParameter,
-                m_settingsDialog->settings().baud);
-            modbusDevice->setConnectionParameter(QModbusDevice::SerialDataBitsParameter,
-                m_settingsDialog->settings().dataBits);
-            modbusDevice->setConnectionParameter(QModbusDevice::SerialStopBitsParameter,
-                m_settingsDialog->settings().stopBits);
-        } else {
-            const QUrl url = QUrl::fromUserInput(ui->portEdit->currentText());
-            modbusDevice->setConnectionParameter(QModbusDevice::NetworkPortParameter, url.port());
-            modbusDevice->setConnectionParameter(QModbusDevice::NetworkAddressParameter, url.host());
-        }
-        modbusDevice->setTimeout(m_settingsDialog->settings().responseTime);
-        modbusDevice->setNumberOfRetries(m_settingsDialog->settings().numberOfRetries);
-        if (!modbusDevice->connectDevice()) {
-            statusBar()->showMessage(tr("Connect failed: ") + modbusDevice->errorString(), 5000);
-        } else {
-            ui->actionConnect->setEnabled(false);
-            ui->actionDisconnect->setEnabled(true);
-            // 记录连接成功日志
-            logMessage(QStringLiteral("连接成功: %1").arg(ui->portEdit->currentText()));
-        }
+        // 用户明确要求连接：置位意图，意外断线时才会自动重连
+        m_reliabilityManager->setUserIntentConnected(true);
+        attemptModbusConnection();
     } else {
+        // 用户主动断开：清除意图，自动重连循环立即停止
+        m_reliabilityManager->setUserIntentConnected(false);
         modbusDevice->disconnectDevice();
         ui->actionConnect->setEnabled(true);
         ui->actionDisconnect->setEnabled(false);
         logMessage(QStringLiteral("已断开连接"));
+    }
+}
+
+// 执行一次连接动作（参数装配 + connectDevice）。由手动连接与自动重连共同复用，
+// 不包含用户意图切换，保证自动重连不会误改意图状态。
+void MainWindow::attemptModbusConnection()
+{
+    if (!modbusDevice)
+        return;
+    if (static_cast<ModbusConnection> (ui->connectType->currentIndex()) == Serial) {
+        modbusDevice->setConnectionParameter(QModbusDevice::SerialPortNameParameter,
+            ui->portEdit->currentText());
+        modbusDevice->setConnectionParameter(QModbusDevice::SerialParityParameter,
+            m_settingsDialog->settings().parity);
+        modbusDevice->setConnectionParameter(QModbusDevice::SerialBaudRateParameter,
+            m_settingsDialog->settings().baud);
+        modbusDevice->setConnectionParameter(QModbusDevice::SerialDataBitsParameter,
+            m_settingsDialog->settings().dataBits);
+        modbusDevice->setConnectionParameter(QModbusDevice::SerialStopBitsParameter,
+            m_settingsDialog->settings().stopBits);
+    } else {
+        const QUrl url = QUrl::fromUserInput(ui->portEdit->currentText());
+        modbusDevice->setConnectionParameter(QModbusDevice::NetworkPortParameter, url.port());
+        modbusDevice->setConnectionParameter(QModbusDevice::NetworkAddressParameter, url.host());
+    }
+    modbusDevice->setTimeout(m_settingsDialog->settings().responseTime);
+    modbusDevice->setNumberOfRetries(m_settingsDialog->settings().numberOfRetries);
+    if (!modbusDevice->connectDevice()) {
+        statusBar()->showMessage(tr("Connect failed: ") + modbusDevice->errorString(), 5000);
+    } else {
+        ui->actionConnect->setEnabled(false);
+        ui->actionDisconnect->setEnabled(true);
+        // 记录连接成功日志
+        logMessage(QStringLiteral("连接成功: %1").arg(ui->portEdit->currentText()));
     }
 }
 
@@ -278,6 +292,9 @@ void MainWindow::onStateChanged(int state)
         ui->connectButton->setText(tr("Disconnect"));
 
     updateConnectionChip(connected);
+
+    // MQTT：设备连接状态变化时发布保留消息（上位机/网关可据此判断现场在线）
+    publishMqttStatus(connected);
 
     if (m_dashboard) {
         m_dashboard->setConnectionStatus(connected,
@@ -694,8 +711,9 @@ void MainWindow::initAdvancedFeatures()
 
     connect(m_reliabilityManager, &ReliabilityManager::reconnectRequested, this, [this]() {
         if (modbusDevice && modbusDevice->state() == QModbusDevice::UnconnectedState) {
-            logMessage(QStringLiteral("自动重连请求"), 2);
-            on_connectButton_clicked();
+            logMessage(QStringLiteral("意外断线，正在自动重连..."), 2);
+            // 直接执行连接动作；用户意图已在自动重连门控中校验
+            attemptModbusConnection();
         }
     });
     connect(m_reliabilityManager, &ReliabilityManager::heartbeatRequested, this, [this]() {
@@ -712,6 +730,9 @@ void MainWindow::initAdvancedFeatures()
 
     // ---------- AI/MCP：初始化共用工具注册表与 MCP 服务器 ----------
     initMcpAgent();
+
+    // ---------- MQTT：初始化发布端客户端与遥测/报警挂钩 ----------
+    initMqttSupport();
 }
 
 void MainWindow::initMenus()
@@ -775,6 +796,7 @@ void MainWindow::initMenus()
     advMenu->addAction(tr("Script Console"), this, &MainWindow::showScriptConsole);
     advMenu->addAction(tr("Remote Service"), this, &MainWindow::toggleRemoteServer);
     advMenu->addAction(tr("MCP Service (AI)"), this, &MainWindow::toggleMcpServer);
+    advMenu->addAction(tr("MQTT Publishing"), this, &MainWindow::showMqttSettings);
     advMenu->addAction(tr("Plugin Manager"), this, &MainWindow::showPluginManager);
     advMenu->addAction(tr("Point Manager"), this, &MainWindow::showPointManager);
     advMenu->addAction(tr("Verification Tests"), this, &MainWindow::showVerificationManager);
