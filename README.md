@@ -28,6 +28,7 @@
 - ✅ **专业数据可视化**：实时曲线 + 仪表盘（Dashboard），支持点位与图表/仪表绑定，数据一目了然
 - ✅ **远程监控 API**：内置 HTTP JSON API 服务（状态查询/远程读/远程写），API Token 鉴权，远程写可独立开关，便于上位机/运维系统集成
 - ✅ **MQTT 数据上送**：内置零依赖 MQTT 3.1.1 发布端（QoS 0），采集数据/报警事件/连接状态实时上送 broker，自动重连 + 心跳保活，无缝对接 IoT 平台与组态软件
+- ✅ **内嵌 AI 助手**：聊天式 Agent（OpenAI 兼容 LLM + Function Calling），复用 11 个工业工具，自然语言查询/读写寄存器/查历史/配报警，危险操作弹窗人工确认
 - ✅ **完备安全体系**：用户/角色/权限三级模型，密码与 API Token 均哈希存储，敏感操作权限校验
 - ✅ **高可靠运行**：自动重连 + 心跳保活 + 连续失败告警（ReliabilityManager），全局崩溃捕获与日志记录（CrashLogger），适合无人值守长期运行
 - ✅ **脚本与插件扩展**：内置 QJSEngine 脚本控制台（可加载脚本文件、注册全局对象），标准 Qt 插件接口（数据回调 + 连接状态回调 + 读写设置），二次开发友好
@@ -146,6 +147,9 @@ FieldLink-Modbus-DataAcquisition/
 │   │
 │   ├── ── MQTT 上送 ──
 │   ├── mqttclient.h          # 零依赖 MQTT 3.1.1 发布端（QoS0/自动重连/心跳）
+│   ├── llmclient.h           # OpenAI 兼容 LLM 客户端（function calling）
+│   ├── agentservice.h        # AI Agent 循环编排（ReAct/确认闸门/会话）
+│   ├── agentchatpanel.h      # AI 助手聊天窗口
 │   │
 │   └── ── 工程化工具 ──
 │   ├── verificationmanager.h # 验证计划与报告导出
@@ -160,8 +164,8 @@ FieldLink-Modbus-DataAcquisition/
 ├── style/                    # dark.qss / light.qss 主题样式
 ├── translations/             # 界面翻译（zh_CN，构建期嵌入资源）
 ├── images/                   # 界面图标资源
-├── deploy/                   # Windows 打包脚本 / MQTT 测试 broker / Modbus 模拟器
-├── doc/                      # MQTT 指南 / 测试指南 / AI 集成设计
+├── deploy/                   # Windows 打包脚本 / MQTT 测试 broker / Modbus 模拟器 / Mock LLM
+├── doc/                      # MQTT 指南 / AI 助手指南 / 测试指南 / AI 集成设计
 └── build/                    # 构建输出目录（Makefile 由 qmake 自动生成）
 ```
 

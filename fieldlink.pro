@@ -41,7 +41,10 @@ SOURCES += src/main.cpp\
         src/crashlogger.cpp \
         src/agenttool.cpp \
         src/mcpserver.cpp \
-        src/mqttclient.cpp
+        src/mqttclient.cpp \
+        src/llmclient.cpp \
+        src/agentservice.cpp \
+        src/agentchatpanel.cpp
 
 HEADERS  += header/mainwindow.h \
          header/settingsdialog.h \
@@ -71,7 +74,10 @@ HEADERS  += header/mainwindow.h \
         header/thememanager.h \
         header/agenttool.h \
         header/mcpserver.h \
-        header/mqttclient.h
+        header/mqttclient.h \
+        header/llmclient.h \
+        header/agentservice.h \
+        header/agentchatpanel.h
 
 FORMS    += mainwindow.ui \
          settingsdialog.ui

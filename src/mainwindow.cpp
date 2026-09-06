@@ -25,6 +25,9 @@
 #include "thememanager.h"  // 深色/浅色主题切换
 #include "mcpserver.h"     // AI/MCP：MCP 服务器
 #include "agenttool.h"     // AI/MCP：共用工具注册表
+#include "agentservice.h"  // AI/Agent：内嵌助手编排核心
+#include "agentchatpanel.h"// AI/Agent：聊天窗口
+#include "llmclient.h"     // AI/Agent：LLM 客户端
 #include "mqttclient.h"    // MQTT 发布端客户端
 
 #include <QModbusTcpClient>
@@ -731,6 +734,9 @@ void MainWindow::initAdvancedFeatures()
     // ---------- AI/MCP：初始化共用工具注册表与 MCP 服务器 ----------
     initMcpAgent();
 
+    // ---------- AI/Agent：初始化内嵌助手（复用同一份工具注册表） ----------
+    initAgentService();
+
     // ---------- MQTT：初始化发布端客户端与遥测/报警挂钩 ----------
     initMqttSupport();
 }
@@ -796,6 +802,7 @@ void MainWindow::initMenus()
     advMenu->addAction(tr("Script Console"), this, &MainWindow::showScriptConsole);
     advMenu->addAction(tr("Remote Service"), this, &MainWindow::toggleRemoteServer);
     advMenu->addAction(tr("MCP Service (AI)"), this, &MainWindow::toggleMcpServer);
+    advMenu->addAction(tr("AI Assistant (Chat)"), this, &MainWindow::showAgentChat);
     advMenu->addAction(tr("MQTT Publishing"), this, &MainWindow::showMqttSettings);
     advMenu->addAction(tr("Plugin Manager"), this, &MainWindow::showPluginManager);
     advMenu->addAction(tr("Point Manager"), this, &MainWindow::showPointManager);

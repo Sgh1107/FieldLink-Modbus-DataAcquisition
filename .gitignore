@@ -4,3 +4,4 @@ deploy/*
 !deploy/mcp_stdio_bridge.py
 !deploy/modbus_tcp_simulator.py
 !deploy/mqtt_test_broker.py
+!deploy/mock_llm_server.py

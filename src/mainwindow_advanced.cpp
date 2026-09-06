@@ -22,6 +22,9 @@
 #include "settingsdialog.h"
 #include "mcpserver.h"     // AI/MCP：MCP 服务器（Streamable HTTP + tools/resources/prompts）
 #include "agenttool.h"     // AI/MCP：Agent/MCP 共用工具注册表
+#include "agentservice.h"  // AI/Agent：内嵌助手编排核心
+#include "agentchatpanel.h"// AI/Agent：聊天窗口
+#include "llmclient.h"     // AI/Agent：LLM 客户端
 #include "mqttclient.h"    // MQTT 发布端客户端
 
 #include <QFileDialog>
@@ -1552,6 +1555,59 @@ void MainWindow::toggleMcpServer()
     } else {
         statusBar()->showMessage(QStringLiteral("MCP 服务启动失败"), 5000);
     }
+}
+
+// ==================== 内嵌 AI 助手（Agent）支持 ====================
+// 设计文档：doc/AI_AGENT_MCP_DESIGN.md
+// AgentService 复用 initMcpAgent() 构建的 AgentToolRegistry（同一份 11 个工具），
+// 在其上叠加 LLM Function Calling 循环；危险工具与 MCP 共用同一确认策略（弹窗批准）。
+
+void MainWindow::initAgentService()
+{
+    m_agentService = new AgentService(this);
+    m_agentService->setToolRegistry(m_agentTools);
+
+    m_llmClient = new LlmClient(this);
+    m_llmClient->setEndpoint(m_appSettings.value(QStringLiteral("ai/baseUrl"),
+                                                QStringLiteral("https://api.deepseek.com/v1")).toString(),
+                             m_appSettings.value(QStringLiteral("ai/apiKey")).toString(),
+                             m_appSettings.value(QStringLiteral("ai/model"),
+                                                 QStringLiteral("deepseek-chat")).toString());
+    m_agentService->setLlmClient(m_llmClient);
+
+    // 危险工具人工确认（human-in-the-loop）：与 MCP 的确认框同一策略，
+    // 可通过 ai/writeConfirmation 配置项关闭（默认开启）。
+    m_agentService->setDangerousConfirmHandler(
+        [this](const QString &toolName, const QJsonObject &arguments) -> bool {
+            if (!m_appSettings.value(QStringLiteral("ai/writeConfirmation"), true).toBool())
+                return true;
+            const QString summary = QString::fromUtf8(
+                QJsonDocument(arguments).toJson(QJsonDocument::Compact));
+            const auto choice = QMessageBox::question(this,
+                QStringLiteral("AI 助手危险操作确认"),
+                QStringLiteral("AI 助手请求执行写操作：\n\n工具：%1\n参数：%2\n\n是否允许执行？")
+                    .arg(toolName, summary),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+            return choice == QMessageBox::Yes;
+        });
+
+    connect(m_agentService, &AgentService::errorOccurred, this, [this](const QString &message) {
+        logMessage(message, 3);
+    });
+
+    logMessage(QStringLiteral("内嵌 AI 助手已就绪：复用 %1 个工具（菜单 Advanced -> AI Assistant (Chat) 打开对话）")
+                   .arg(m_agentTools->count()));
+}
+
+void MainWindow::showAgentChat()
+{
+    if (!m_agentService || !m_llmClient)
+        return;
+    if (!m_agentChatPanel)
+        m_agentChatPanel = new AgentChatPanel(m_agentService, m_llmClient, this);
+    m_agentChatPanel->show();
+    m_agentChatPanel->raise();
+    m_agentChatPanel->activateWindow();
 }
 
 // ==================== MQTT 支持 ====================
