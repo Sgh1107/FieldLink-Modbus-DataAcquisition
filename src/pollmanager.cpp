@@ -71,6 +71,18 @@ void PollManager::setTaskEnabled(int taskId, bool enabled)
                 if (enabled) entry.timer->start();
                 else entry.timer->stop();
             }
+            if (!enabled)
+                entry.inFlight = false;   // 禁用时清掉在途标志，避免任务卡死
+            break;
+        }
+    }
+}
+
+void PollManager::notifyTaskFinished(int taskId)
+{
+    for (auto &entry : m_timers) {
+        if (entry.task.id == taskId) {
+            entry.inFlight = false;
             break;
         }
     }
@@ -100,6 +112,7 @@ void PollManager::stopAll()
     m_running = false;
     for (auto &entry : m_timers) {
         entry.timer->stop();
+        entry.inFlight = false;   // 停止时清空在途标志
     }
 }
 
@@ -114,8 +127,12 @@ void PollManager::onTimerTimeout()
     if (!timer) return;
 
     int taskId = timer->property("taskId").toInt();
-    for (const auto &entry : m_timers) {
+    for (auto &entry : m_timers) {
         if (entry.task.id == taskId) {
+            // P2：上一条请求仍在途时跳过本 tick，防止慢设备下请求堆积
+            if (entry.inFlight)
+                return;
+            entry.inFlight = true;
             emit pollRequest(entry.task);
             break;
         }

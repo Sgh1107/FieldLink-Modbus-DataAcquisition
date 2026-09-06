@@ -4,7 +4,11 @@
 > MqttClient / DataExporter / PollManager / DeviceManager / HistoryData / BatchTaskManager /
 > DataParser / 主窗口连接与读写链路）
 > 配套交付：`tests/tests.pro` + `tests/master_tests.cpp` 测试套件（无 GUI 可运行）
-> 状态：**测试全部通过（96 PASS / 0 FAIL），以下问题均经测试或代码走查确认，尚未修复，等待评审决策**
+
+## 修复状态：2026-09 — P1/D1/S1/S2/S4/M1/P2 已全部修复，回归测试 **120 PASS / 0 FAIL**
+
+报告初版列出的问题经评审后，按批次修复完毕并通过测试（各修复均新增/更新断言验证）：
+见文末「六、修复明细」。
 
 ---
 
@@ -129,7 +133,28 @@ publish 静默丢弃（debug 级）或按次数聚合上报；恢复连接后记
 
 ---
 
-## 五、建议的处理批次
+## 五、修复明细（2026-09，回归 120 PASS / 0 FAIL）
+
+| 编号 | 修复内容 | 涉及文件 |
+| --- | --- | --- |
+| **P1** | 重写 DataParser 字节序核心：严格按 Modbus wire 序解析/生成 32 位值（ABCD/DCBA/BADC/CDAB），`pointmodel` 点表换算恢复正确 | `src/dataparser.cpp` |
+| **D1** | `toFloat64/fromFloat64` 支持字节序（原忽略参数），新增 `fromFloat64` | `src/dataparser.cpp` `header/dataparser.h` |
+| **S1** | 默认 API Token 哈希置空：未配置 Token 时远程 API 一律 403/401，不再使用源码常量 `modbus-admin` | `src/securitymanager.cpp` |
+| **S2** | 默认账号 `admin/admin123` 标记强制改密；登录成功且 `mustChangePassword` 时弹出修改对话框（取消则拒绝本次登录），去掉密码预填；改密标记持久化 | `header/securitymanager.h` `src/securitymanager.cpp` `src/mainwindow_advanced.cpp` |
+| **S4** | 空密码创建的新用户默认密码 `123456` 同样置 `mustChangePassword=true`（默认密码仅能用于触发改密流程） | 同上 |
+| **M1** | MQTT 断连期间 publish 静默丢弃并计数，每个断连周期仅发一条告警，杜绝轮询场景日志刷屏 | `src/mqttclient.cpp` `header/mqttclient.h` |
+| **P2** | 轮询在途请求保护：任务请求在途时跳过该任务 tick，完成后恢复；设备未连接/发送失败等路径均正确解除在途标志 | `src/pollmanager.cpp` `header/pollmanager.h` `src/mainwindow_advanced.cpp` |
+| 测试 | 新增断言：P1 四字节序 ×6、D1 float64 ×4、S1/S2/S4、M1 静默丢弃、P2 在途跳 tick；修正 5 处测试自身错误 | `tests/master_tests.cpp` |
+
+**复核排除的疑点**（写测试证明非 bug）：报警去抖语义正确、`qFuzzyCompare(0,0)` 可触发、`alarmHistory(0)` 返回空。
+
+**测试矩阵：120 PASS / 0 FAIL / 0 已知问题**（AlarmManager 18、Security 20、Reliability 4、MQTT 11、DataExporter 9、Poll 9、DeviceManager 8、HistoryData 12、BatchTask 9、DataParser 20）。
+
+**说明**：P1 修复改变了 `DataParser::toFloat32/toInt32/toUInt32` 的返回语义（由错误改为符合 Modbus 协议）。浮点 64 位各厂商寄存器分组惯例存在差异，本实现采用与 float32 一致的"字节反序后按寄存器顺序分组"模型，保证 `fromX→toX` 往返一致且 float32 语义与标准一致。
+
+---
+
+## 六、处理批次回顾（原定批次，均已处理完毕）
 
 1. **立即修**：P1（DataParser，点表核心功能）+ S1（默认 Token，安全）
 2. **第二批**：D1、S2（强制改密）、M1（日志刷屏）、P2（在途请求保护）

@@ -37,6 +37,10 @@ public:
     void stopAll();
     bool isRunning() const;
 
+    // P2 在途请求保护：任务请求发出后置 inFlight，直到执行方回填完成标志；
+    // 在途期间该任务的周期 tick 会被跳过，避免慢设备下请求堆积。
+    void notifyTaskFinished(int taskId);
+
 signals:
     void pollRequest(const PollTask &task);
     void alarmTriggered(const PollTask &task, double value, const QString &message);
@@ -48,6 +52,7 @@ private:
     struct TimerEntry {
         QTimer *timer;
         PollTask task;
+        bool inFlight = false;   // 该任务的上一条请求是否仍在途
     };
     QVector<TimerEntry> m_timers;
     bool m_running;

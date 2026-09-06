@@ -215,8 +215,11 @@ static QVector<QStringList> parseCsvRows(const QString &filePath)
 
 void MainWindow::onPollRequest(const PollTask &task)
 {
-    if (!modbusDevice || modbusDevice->state() != QModbusDevice::ConnectedState)
+    if (!modbusDevice || modbusDevice->state() != QModbusDevice::ConnectedState) {
+        // 设备未连接：本次请求不会发出，必须立即解除在途标志，避免任务被永久跳过
+        m_pollManager->notifyTaskFinished(task.id);
         return;
+    }
 
     QModbusDataUnit unit(task.registerType, task.startAddress, task.quantity);
     if (auto *reply = modbusDevice->sendReadRequest(unit, task.serverAddress)) {
@@ -280,11 +283,20 @@ void MainWindow::onPollRequest(const PollTask &task)
                     logMessage(QStringLiteral("POLL-ERR [%1] %2")
                                .arg(task.name).arg(reply->errorString()), 3);
                 }
+
+                // P2：本条请求已完成，解除在途标志（无论成败）
+                m_pollManager->notifyTaskFinished(task.id);
                 reply->deleteLater();
             });
         } else {
+            // 立即完成的回复（如广播）：同样解除在途标志
             delete reply;
+            m_pollManager->notifyTaskFinished(task.id);
         }
+    } else {
+        // 发送失败：立即解除在途标志，否则任务会被永久跳过
+        logMessage(QStringLiteral("POLL-SEND-ERR [%1] %2").arg(task.name).arg(modbusDevice->errorString()), 3);
+        m_pollManager->notifyTaskFinished(task.id);
     }
 }
 
@@ -1621,7 +1633,7 @@ bool MainWindow::loginCurrentUser()
     auto *user = new QLineEdit("admin", &dialog);
     auto *password = new QLineEdit(&dialog);
     password->setEchoMode(QLineEdit::Password);
-    password->setText("admin123");
+    // S2：不再预填默认密码
     form->addRow("用户名", user);
     form->addRow("密码", password);
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
@@ -1634,6 +1646,43 @@ bool MainWindow::loginCurrentUser()
         QMessageBox::warning(this, "登录失败", "用户名或密码错误，敏感操作将被拒绝");
         return false;
     }
+
+    // S2/S4：默认或初始密码登录后强制修改，取消则本次登录作废
+    if (m_securityManager->mustChangePassword(m_securityManager->currentUser())) {
+        QString newPassword;
+        bool changed = false;
+        while (!changed) {
+            bool ok = false;
+            const QString first = QInputDialog::getText(this, QStringLiteral("修改密码"),
+                QStringLiteral("当前账号使用默认/初始密码，请设置新密码（至少 6 位）："),
+                QLineEdit::Password, QString(), &ok);
+            if (!ok)
+                break;
+            if (first.size() < 6) {
+                QMessageBox::warning(this, QStringLiteral("密码过短"), QStringLiteral("密码至少需要 6 个字符"));
+                continue;
+            }
+            const QString second = QInputDialog::getText(this, QStringLiteral("确认新密码"),
+                QStringLiteral("请再次输入新密码："), QLineEdit::Password, QString(), &ok);
+            if (!ok)
+                break;
+            if (first != second) {
+                QMessageBox::warning(this, QStringLiteral("不一致"), QStringLiteral("两次输入的密码不一致，请重试"));
+                continue;
+            }
+            newPassword = first;
+            changed = true;
+        }
+        if (!changed) {
+            m_securityManager->logout();
+            QMessageBox::warning(this, QStringLiteral("未修改密码"),
+                QStringLiteral("出于安全考虑，使用默认/初始密码必须先完成修改，本次登录已被拒绝"));
+            return false;
+        }
+        m_securityManager->changePassword(m_securityManager->currentUser(), newPassword);
+        QMessageBox::information(this, QStringLiteral("密码已修改"), QStringLiteral("请牢记新密码，下次登录使用"));
+    }
+
     statusBar()->showMessage(QString("当前用户: %1 / %2").arg(m_securityManager->currentUser(), m_securityManager->currentRole()), 5000);
     return true;
 }

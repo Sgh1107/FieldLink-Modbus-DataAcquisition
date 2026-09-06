@@ -15,6 +15,7 @@ struct SecurityUser {
     QString passwordHash;
     QString role;
     bool enabled = true;
+    bool mustChangePassword = false;   // true = 使用默认/初始密码，登录后强制修改
 };
 
 struct SecurityRole {
@@ -35,6 +36,10 @@ public:
     void setApiToken(const QString &token);
     QString apiTokenHash() const;
     bool verifyApiToken(const QString &token) const;
+
+    // 强制改密（S2/S4）：账号标记 mustChangePassword 时，登录后必须先修改密码
+    bool mustChangePassword(const QString &username) const;
+    void changePassword(const QString &username, const QString &newPassword);
 
     void setRemoteWriteEnabled(bool enabled);
     bool remoteWriteEnabled() const;

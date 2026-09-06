@@ -32,6 +32,8 @@ MqttClient::MqttClient(QObject *parent)
     , m_autoReconnect(true)
     , m_brokerConnected(false)
     , m_userRequestedDisconnect(false)
+    , m_droppedCount(0)
+    , m_dropWarningEmitted(false)
 {
     connect(m_socket, &QTcpSocket::connected, this, &MqttClient::onSocketConnected);
     connect(m_socket, &QTcpSocket::disconnected, this, &MqttClient::onSocketDisconnected);
@@ -165,6 +167,7 @@ void MqttClient::resetSessionState()
     m_brokerConnected = false;
     m_pingTimer.stop();
     m_buffer.clear();
+    m_dropWarningEmitted = false;   // 新的断连周期允许再次告警
 }
 
 // ---------------- 编码辅助 ----------------
@@ -255,7 +258,13 @@ void MqttClient::sendDisconnect()
 bool MqttClient::publish(const QString &topic, const QByteArray &payload, bool retain)
 {
     if (!m_brokerConnected) {
-        emit errorOccurred(QStringLiteral("MQTT 未连接，放弃发布: %1").arg(topic));
+        // M1：断连期间静默丢弃，只在每个断连周期发一次告警，避免轮询场景日志刷屏
+        ++m_droppedCount;
+        if (!m_dropWarningEmitted) {
+            m_dropWarningEmitted = true;
+            emit errorOccurred(QStringLiteral("MQTT 未连接，开始丢弃上送消息（已丢弃 %1 条，恢复连接后自动继续）")
+                                   .arg(m_droppedCount));
+        }
         return false;
     }
 

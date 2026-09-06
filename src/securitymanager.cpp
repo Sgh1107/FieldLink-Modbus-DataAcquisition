@@ -14,7 +14,9 @@ SecurityManager::SecurityManager(QObject *parent)
 
 void SecurityManager::load(QSettings &settings)
 {
-    m_apiTokenHash = settings.value("security/apiTokenHash", hashToken(QStringLiteral("modbus-admin"))).toString();
+    // S1 修复：默认 Token 哈希置空。未配置 Token 时 verifyApiToken 一律拒绝，
+    // 远程 API 在操作员显式设置 Token 前处于锁定状态（不再使用源码常量默认值）。
+    m_apiTokenHash = settings.value("security/apiTokenHash").toString();
     m_remoteWriteEnabled = settings.value("security/remoteWriteEnabled", false).toBool();
     const QStringList ops = settings.value("security/writeOperators", QStringList() << "admin").toStringList();
     setWriteOperators(ops);
@@ -37,6 +39,7 @@ void SecurityManager::load(QSettings &settings)
         user.passwordHash = settings.value(QString("security/user/%1/passwordHash").arg(username)).toString();
         user.role = settings.value(QString("security/user/%1/role").arg(username), "operator").toString();
         user.enabled = settings.value(QString("security/user/%1/enabled").arg(username), true).toBool();
+        user.mustChangePassword = settings.value(QString("security/user/%1/mustChangePassword").arg(username), false).toBool();
         if (!user.username.trimmed().isEmpty())
             m_users.insert(user.username, user);
     }
@@ -57,6 +60,7 @@ void SecurityManager::save(QSettings &settings) const
         settings.setValue(QString("security/user/%1/passwordHash").arg(user.username), user.passwordHash);
         settings.setValue(QString("security/user/%1/role").arg(user.username), user.role);
         settings.setValue(QString("security/user/%1/enabled").arg(user.username), user.enabled);
+        settings.setValue(QString("security/user/%1/mustChangePassword").arg(user.username), user.mustChangePassword);
     }
 }
 
@@ -72,7 +76,23 @@ QString SecurityManager::apiTokenHash() const
 
 bool SecurityManager::verifyApiToken(const QString &token) const
 {
-    return !token.isEmpty() && hashToken(token) == m_apiTokenHash;
+    return !token.isEmpty() && !m_apiTokenHash.isEmpty() && hashToken(token) == m_apiTokenHash;
+}
+
+bool SecurityManager::mustChangePassword(const QString &username) const
+{
+    return m_users.value(username).mustChangePassword;
+}
+
+void SecurityManager::changePassword(const QString &username, const QString &newPassword)
+{
+    if (newPassword.isEmpty() || !m_users.contains(username))
+        return;
+    auto user = m_users.value(username);
+    user.passwordHash = hashPassword(newPassword);
+    user.mustChangePassword = false;
+    m_users.insert(username, user);
+    audit(username, QStringLiteral("PASSWORD_CHANGE"), QStringLiteral("success"));
 }
 
 void SecurityManager::setRemoteWriteEnabled(bool enabled)
@@ -183,15 +203,23 @@ void SecurityManager::addOrUpdateUser(const QString &username, const QString &pa
 {
     if (username.trimmed().isEmpty())
         return;
+    const bool isNew = !m_users.contains(username.trimmed());
     SecurityUser user = m_users.value(username.trimmed());
     user.username = username.trimmed();
-    if (!password.isEmpty())
+    if (!password.isEmpty()) {
+        // 显式设置密码：视为密码已变更，清除强制改密标记
         user.passwordHash = hashPassword(password);
-    if (user.passwordHash.isEmpty())
+        user.mustChangePassword = false;
+    } else if (user.passwordHash.isEmpty()) {
+        // S4：新建用户未提供密码 → 默认密码 123456 + 强制改密标记，
+        // 默认密码仅能用于登录并触发修改流程，无法长期使用
         user.passwordHash = hashPassword(QStringLiteral("123456"));
+        user.mustChangePassword = true;
+    }
     user.role = role.trimmed().isEmpty() ? QStringLiteral("operator") : role.trimmed();
     user.enabled = enabled;
     m_users.insert(user.username, user);
+    Q_UNUSED(isNew)
 }
 
 void SecurityManager::removeUser(const QString &username)
@@ -262,8 +290,12 @@ void SecurityManager::ensureDefaults()
         m_roles.insert(operatorRole.name, operatorRole);
         m_roles.insert(viewerRole.name, viewerRole);
     }
-    if (m_users.isEmpty())
+    if (m_users.isEmpty()) {
         addOrUpdateUser(QStringLiteral("admin"), QStringLiteral("admin123"), QStringLiteral("admin"), true);
+        // S2：种子管理员使用公开默认密码，标记强制改密（登录后必须先修改）
+        if (m_users.contains(QStringLiteral("admin")))
+            m_users[QStringLiteral("admin")].mustChangePassword = true;
+    }
 }
 
 QString SecurityManager::hashPassword(const QString &password) const

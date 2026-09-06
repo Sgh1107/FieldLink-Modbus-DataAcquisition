@@ -28,6 +28,7 @@ public:
     static QString toAsciiString(const QVector<quint16> &registers, ByteOrder order = ByteOrder::BigEndian_ABCD);
 
     static QVector<quint16> fromFloat32(float value, ByteOrder order = ByteOrder::BigEndian_ABCD);
+    static QVector<quint16> fromFloat64(double value, ByteOrder order = ByteOrder::BigEndian_ABCD);
     static QVector<quint16> fromInt32(qint32 value, ByteOrder order = ByteOrder::BigEndian_ABCD);
     static QVector<quint16> fromAsciiString(const QString &str, ByteOrder order = ByteOrder::BigEndian_ABCD);
 

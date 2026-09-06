@@ -93,6 +93,8 @@ private:
     bool m_autoReconnect;
     bool m_brokerConnected;       // CONNACK 已确认
     bool m_userRequestedDisconnect;
+    int m_droppedCount;           // 断连期间丢弃的上送消息数（M1：避免日志刷屏）
+    bool m_dropWarningEmitted;    // 本次断连周期内是否已发过丢弃告警
     QTimer m_pingTimer;           // keepalive/2 发送 PINGREQ
     QTimer m_reconnectTimer;      // 断线后 5 秒重连
 };

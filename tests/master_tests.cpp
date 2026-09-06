@@ -265,13 +265,13 @@ static void testSecurityManager()
     QTemporaryDir dir;
     const QString iniPath = dir.path() + "/security.ini";
 
-    // 已知问题 S1：load() 未保存过 token 时，默认哈希来自源码常量 "modbus-admin"
+    // 已知问题 S1 修复：未配置 Token 时默认口令失效，API 锁定
     {
         SecurityManager sm;
         QSettings settings(iniPath, QSettings::IniFormat);
         sm.load(settings);
         CHECK("verifyApiToken 拒绝空 token", !sm.verifyApiToken(QString()));
-        CHECK_ISSUE("S1: 默认 API Token 为源码常量 modbus-admin", sm.verifyApiToken(QStringLiteral("modbus-admin")));
+        CHECK("S1 修复：未配置 Token 时拒绝源码常量默认口令", !sm.verifyApiToken(QStringLiteral("modbus-admin")));
     }
 
     SecurityManager sm;
@@ -282,9 +282,14 @@ static void testSecurityManager()
     CHECK("旧默认 token 失效", !sm.verifyApiToken(QStringLiteral("modbus-admin")));
     CHECK("错误 token 拒绝", !sm.verifyApiToken(QStringLiteral("wrong")));
 
-    // 默认用户 admin/admin123（已知问题 S2）
-    CHECK_ISSUE("S2: 默认账号 admin/admin123 可登录", sm.login(QStringLiteral("admin"), QStringLiteral("admin123")));
+    // 默认用户 admin/admin123（保留可用，但 S2 修复后必须先改密）
+    CHECK("S2: 默认账号 admin/admin123 可登录", sm.login(QStringLiteral("admin"), QStringLiteral("admin123")));
+    CHECK("S2 修复：默认账号标记强制改密", sm.mustChangePassword(QStringLiteral("admin")));
     CHECK("admin 拥有通配权限", sm.hasPermission(QStringLiteral("local.write")));
+    sm.changePassword(QStringLiteral("admin"), QStringLiteral("Str0ng!Pass"));
+    CHECK("S2 修复：改密后清除强制改密标记", !sm.mustChangePassword(QStringLiteral("admin")));
+    sm.logout();
+    CHECK("S2 修复：改密后新密码可登录", sm.login(QStringLiteral("admin"), QStringLiteral("Str0ng!Pass")));
     sm.logout();
     CHECK("登出后无权限", !sm.hasPermission(QStringLiteral("local.write")));
 
@@ -294,9 +299,11 @@ static void testSecurityManager()
     CHECK("viewer 无 local.write 权限", !sm.hasPermission(QStringLiteral("local.write")));
     sm.logout();
 
-    // 已知问题 S4：空密码创建用户默认密码 123456
+    // 已知问题 S4 修复：空密码创建的用户默认密码 123456 + 强制改密标记
     sm.addOrUpdateUser(QStringLiteral("op1"), QString(), QStringLiteral("operator"), true);
-    CHECK_ISSUE("S4: 空密码新用户默认密码 123456", sm.login(QStringLiteral("op1"), QStringLiteral("123456")));
+    CHECK("S4 修复：空密码创建的用户可登录", sm.login(QStringLiteral("op1"), QStringLiteral("123456")));
+    CHECK("S4 修复：空密码用户标记强制改密", sm.mustChangePassword(QStringLiteral("op1")));
+    sm.logout();
 
     // admin 保护
     sm.addOrUpdateUser(QStringLiteral("admin"), QStringLiteral("newpass"), QStringLiteral("admin"), true);
@@ -375,6 +382,14 @@ static void testMqttClient()
         ++errors;
         printf("  [client-error] %s\n", qPrintable(message));
     });
+
+    // M1 修复：未连接时 publish 静默丢弃（返回 false），两次丢弃仅发一条告警
+    const bool pubOk1 = client.publish(QStringLiteral("fieldlink/test/drop"), QByteArray("1"));
+    const bool pubOk2 = client.publish(QStringLiteral("fieldlink/test/drop"), QByteArray("2"));
+    waitMs(50);
+    CHECK("M1 未连接 publish 返回 false", !pubOk1 && !pubOk2);
+    CHECK("M1 两次丢弃仅一条告警", errors == 1);
+    errors = 0;   // 后续连接阶段不应再有丢弃告警
 
     client.setBroker(QStringLiteral("127.0.0.1"), broker.port());
     client.setCredentials(QStringLiteral("test-client"));
@@ -483,6 +498,8 @@ static void testPollManager()
     QObject::connect(&pm, &PollManager::pollRequest, [&](const PollTask &task) {
         if (task.id == 1) ++count1;
         if (task.id == 2) ++count2;
+        // 模拟请求即刻完成（否则 P2 在途保护会跳过后续 tick）
+        pm.notifyTaskFinished(task.id);
     });
 
     pm.addTask(t1);
@@ -510,6 +527,23 @@ static void testPollManager()
     // removeTask
     pm.removeTask(1);
     CHECK("removeTask 生效", pm.tasks().size() == 1);
+
+    // P2 在途请求保护：请求发出后未回填完成前，同任务 tick 被跳过
+    PollManager pm2;
+    PollTask t10;
+    t10.id = 10; t10.name = QStringLiteral("在途测试"); t10.serverAddress = 1;
+    t10.registerType = QModbusDataUnit::HoldingRegisters;
+    t10.startAddress = 0; t10.quantity = 1; t10.intervalMs = 100; t10.enabled = true;
+    int req10 = 0;
+    QObject::connect(&pm2, &PollManager::pollRequest, [&](const PollTask &) { ++req10; });
+    pm2.addTask(t10);
+    pm2.startAll();
+    waitMs(150);   // 第 1 个 tick 发出请求并置在途；第 2 个 tick 应被跳过
+    CHECK("P2 在途期间跳过 tick", req10 == 1);
+    pm2.notifyTaskFinished(10);
+    waitMs(250);   // 完成后周期触发恢复
+    CHECK("P2 完成后恢复触发", req10 >= 2);
+    pm2.stopAll();
 }
 
 static void testDeviceManager()
@@ -657,26 +691,37 @@ static void testDataParser()
     printf("\n=== DataParser ===\n");
     using BO = ByteOrder;   // 全局作用域枚举
 
-    // ---- 按协议语义断言：ABCD = 100.0f 应拆为 regHi=0x42C8, regLo=0x0000 ----
-    // 已知问题 P1（高）：实现把"主机内存字节序"与"Modbus 寄存器字节序"混用，
-    // 标准编码的解析/生成是错的（真实设备点表按 ABCD 配置时数值解释错误）。
+    // ---- P1 修复验证：ABCD = 100.0f 标准编码 {0x42C8, 0x0000} ----
     const auto f32 = DataParser::fromFloat32(100.0f, BO::BigEndian_ABCD);
-    CHECK_ISSUE("P1-high: fromFloat32(ABCD) 未生成标准 ABCD 寄存器序（期望 0x42C8,0x0000）",
-                !(f32[0] == 0x42C8 && f32[1] == 0x0000));
-    CHECK_ISSUE("P1-high: toFloat32(0x42C8,0x0000,ABCD) 未还原 100.0f",
-                !(qFuzzyCompare(DataParser::toFloat32(0x42C8, 0x0000, BO::BigEndian_ABCD), 100.0f)));
-    CHECK_ISSUE("P1-high: toUInt32(0x1234,0x5678,ABCD) != 0x12345678",
-                DataParser::toUInt32(0x1234, 0x5678, BO::BigEndian_ABCD) != 0x12345678u);
-    CHECK_ISSUE("D1: toFloat64 忽略 ByteOrder 参数（恒按大端拼装）",
-                DataParser::toFloat64(0x0000, 0x0000, 0x0000, 0x0000, BO::BigEndian_ABCD) == 0.0);
+    CHECK("P1 fromFloat32(ABCD) 生成标准寄存器序", f32[0] == 0x42C8 && f32[1] == 0x0000);
+    CHECK("P1 toFloat32(ABCD) 还原 100.0f", qFuzzyCompare(DataParser::toFloat32(0x42C8, 0x0000, BO::BigEndian_ABCD), 100.0f));
+    CHECK("P1 toUInt32(ABCD) 按大端还原", DataParser::toUInt32(0x1234, 0x5678, BO::BigEndian_ABCD) == 0x12345678u);
 
-    // ---- 自往返一致性（fromX → toX 同字节序应还原）----
+    // ---- 四种字节序全量验证（100.0f 的各设备编码）----
+    CHECK("toFloat32(DCBA) 还原", qFuzzyCompare(DataParser::toFloat32(0x0000, 0xC842, BO::LittleEndian_DCBA), 100.0f));
+    CHECK("toFloat32(BADC) 还原", qFuzzyCompare(DataParser::toFloat32(0xC842, 0x0000, BO::MidBigEndian_BADC), 100.0f));
+    CHECK("toFloat32(CDAB) 还原", qFuzzyCompare(DataParser::toFloat32(0x0000, 0x42C8, BO::MidLittleEndian_CDAB), 100.0f));
     const auto f32d = DataParser::fromFloat32(100.0f, BO::LittleEndian_DCBA);
-    CHECK("float32 DCBA 自往返", qFuzzyCompare(DataParser::toFloat32(f32d[0], f32d[1], BO::LittleEndian_DCBA), 100.0f));
-    const auto i32 = DataParser::fromInt32(-2, BO::BigEndian_ABCD);
-    CHECK("int32 自往返", DataParser::toInt32(i32[0], i32[1], BO::BigEndian_ABCD) == -2);
+    CHECK("fromFloat32(DCBA) 生成", f32d[0] == 0x0000 && f32d[1] == 0xC842);
+    const auto f32badc = DataParser::fromFloat32(100.0f, BO::MidBigEndian_BADC);
+    CHECK("fromFloat32(BADC) 生成", f32badc[0] == 0xC842 && f32badc[1] == 0x0000);
+    const auto f32cdab = DataParser::fromFloat32(100.0f, BO::MidLittleEndian_CDAB);
+    CHECK("fromFloat32(CDAB) 生成", f32cdab[0] == 0x0000 && f32cdab[1] == 0x42C8);
 
-    // ASCII（按实现语义验证：寄存器高/低字节按大端取值）
+    // int32 负数（ABCD）
+    const auto i32 = DataParser::fromInt32(-2, BO::BigEndian_ABCD);
+    CHECK("int32 ABCD 拆寄存器", i32[0] == 0xFFFF && i32[1] == 0xFFFE);
+    CHECK("int32 ABCD 组装", DataParser::toInt32(i32[0], i32[1], BO::BigEndian_ABCD) == -2);
+
+    // ---- D1 修复验证：toFloat64 尊重字节序 ----
+    CHECK("D1 toFloat64(ABCD) 还原 1.0", DataParser::toFloat64(0x3FF0, 0x0000, 0x0000, 0x0000, BO::BigEndian_ABCD) == 1.0);
+    CHECK("D1 toFloat64(DCBA) 还原 1.0", DataParser::toFloat64(0x0000, 0x0000, 0x0000, 0xF03F, BO::LittleEndian_DCBA) == 1.0);
+    const auto f64 = DataParser::fromFloat64(1.0, BO::BigEndian_ABCD);
+    CHECK("D1 fromFloat64(ABCD) 生成", f64[0] == 0x3FF0 && f64[1] == 0x0000 && f64[2] == 0x0000 && f64[3] == 0x0000);
+    const auto f64d = DataParser::fromFloat64(1.0, BO::LittleEndian_DCBA);
+    CHECK("D1 fromFloat64(DCBA) 生成", f64d[0] == 0x0000 && f64d[1] == 0x0000 && f64d[2] == 0x0000 && f64d[3] == 0xF03F);
+
+    // ---- ASCII（按实现语义验证：寄存器高/低字节按大端取值）----
     CHECK("ASCII ABCD", DataParser::toAsciiString({0x4142}, BO::BigEndian_ABCD) == QStringLiteral("AB"));
     CHECK("ASCII DCBA 交换", DataParser::toAsciiString({0x4142}, BO::LittleEndian_DCBA) == QStringLiteral("BA"));
     const auto asciiRegs = DataParser::fromAsciiString(QStringLiteral("ABCD"), BO::BigEndian_ABCD);
