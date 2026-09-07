@@ -39,7 +39,8 @@ SOURCES += src/main.cpp\
         src/verificationmanager.cpp \
         src/deliverymanager.cpp \
         src/crashlogger.cpp \
-        src/mqttclient.cpp
+        src/mqttclient.cpp \
+        src/devicesimulator.cpp
 
 HEADERS  += header/mainwindow.h \
          header/settingsdialog.h \
@@ -67,7 +68,8 @@ HEADERS  += header/mainwindow.h \
         header/deliverymanager.h \
         header/crashlogger.h \
         header/thememanager.h \
-        header/mqttclient.h
+        header/mqttclient.h \
+        header/devicesimulator.h
 
 FORMS    += mainwindow.ui \
          settingsdialog.ui

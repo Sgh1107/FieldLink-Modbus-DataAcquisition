@@ -43,6 +43,7 @@ class PointModel;
 class VerificationManager;
 class DeliveryManager;
 class MqttClient;
+class DeviceSimulatorPanel;
 
 struct PollTask;
 struct BatchTask;
@@ -96,6 +97,7 @@ private slots:
     void showScriptConsole();
     void toggleRemoteServer();
     void showMqttSettings();
+    void showDeviceSimulator();
     void showPluginManager();
     void showPointManager();
     void showVerificationManager();
@@ -141,6 +143,7 @@ private:
     VerificationManager *m_verificationManager;
     DeliveryManager *m_deliveryManager;
     MqttClient *m_mqttClient = nullptr;            // MQTT 发布端客户端
+    DeviceSimulatorPanel *m_deviceSimulatorPanel = nullptr;   // 模拟设备面板
     QMap<int, int> m_pointChartSeriesMap;
     QMap<int, int> m_pointDashboardGaugeMap;
 };

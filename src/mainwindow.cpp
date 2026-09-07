@@ -791,6 +791,7 @@ void MainWindow::initMenus()
     advMenu->addAction(tr("Script Console"), this, &MainWindow::showScriptConsole);
     advMenu->addAction(tr("Remote Service"), this, &MainWindow::toggleRemoteServer);
     advMenu->addAction(tr("MQTT Publishing"), this, &MainWindow::showMqttSettings);
+    advMenu->addAction(tr("Simulator (Modbus Slave)"), this, &MainWindow::showDeviceSimulator);
     advMenu->addAction(tr("Plugin Manager"), this, &MainWindow::showPluginManager);
     advMenu->addAction(tr("Point Manager"), this, &MainWindow::showPointManager);
     advMenu->addAction(tr("Verification Tests"), this, &MainWindow::showVerificationManager);

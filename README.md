@@ -28,6 +28,7 @@
 - ✅ **专业数据可视化**：实时曲线 + 仪表盘（Dashboard），支持点位与图表/仪表绑定，数据一目了然
 - ✅ **远程监控 API**：内置 HTTP JSON API 服务（状态查询/远程读/远程写），API Token 鉴权，远程写可独立开关，便于上位机/运维系统集成
 - ✅ **MQTT 数据上送**：内置零依赖 MQTT 3.1.1 发布端（QoS 0），采集数据/报警事件/连接状态实时上送 broker，自动重连 + 心跳保活，无缝对接 IoT 平台与组态软件
+- ✅ **内置模拟从站**：一键起停 Modbus TCP 模拟设备（独立 Python 进程，互验协议），配合正弦温度/随机游走数据源，联调测试无需任何外部工具
 - ✅ **完备安全体系**：用户/角色/权限三级模型，密码与 API Token 均哈希存储，敏感操作权限校验
 - ✅ **高可靠运行**：自动重连 + 心跳保活 + 连续失败告警（ReliabilityManager），全局崩溃捕获与日志记录（CrashLogger），适合无人值守长期运行
 - ✅ **脚本与插件扩展**：内置 QJSEngine 脚本控制台（可加载脚本文件、注册全局对象），标准 Qt 插件接口（数据回调 + 连接状态回调 + 读写设置），二次开发友好
@@ -78,6 +79,20 @@ mingw32-make -j8        # Linux 下使用 make -j8
 - 编译产物位于构建目录（如 `build/Desktop_Qt_5_15_2_MinGW_64_bit-Debug/debug/fieldlink.exe`）
 - 首次运行后按需在「设置」中配置串口/网络参数、采集任务与报警规则，即可正常使用
 - 历史数据库为 SQLite 文件，无需额外安装数据库服务
+
+### 5. 本地联调（内置模拟从站，无需外部工具）
+
+菜单 **Advanced → Simulator (Modbus Slave)** 可一键启动/停止内置的 Modbus TCP 从站模拟器
+（独立 Python 子进程，需系统安装 Python）：
+
+1. 面板中确认端口（默认 1502）与从站地址（默认 1）→ 点「启动模拟从站」
+2. 主界面连接类型选 **TCP**，地址 `127.0.0.1:1502` → 连接即可读取模拟数据
+   （reg0 = 正弦变化温度，reg1 = 随机游走，reg2 = 恒 42）
+3. 面板日志实时显示从站收到的请求；配合轮询/报警/MQTT 可走通全链路
+
+单元/集成测试套件位于 `tests/`（`qmake tests.pro && mingw32-make` 构建，运行
+`fieldlink_tests.exe`，退出码 0 = 全部通过），覆盖报警条件、权限模型、MQTT 协议、
+字节序换算等核心逻辑。
 
 ### 快速上手流程
 
@@ -146,6 +161,7 @@ FieldLink-Modbus-DataAcquisition/
 │   │
 │   ├── ── MQTT 上送 ──
 │   ├── mqttclient.h          # 零依赖 MQTT 3.1.1 发布端（QoS0/自动重连/心跳）
+│   ├── devicesimulator.h     # 模拟设备面板（一键起停 Modbus TCP 从站）
 │   │
 │   └── ── 工程化工具 ──
 │   ├── verificationmanager.h # 验证计划与报告导出
@@ -161,7 +177,8 @@ FieldLink-Modbus-DataAcquisition/
 ├── translations/             # 界面翻译（zh_CN，构建期嵌入资源）
 ├── images/                   # 界面图标资源
 ├── deploy/                   # Windows 打包脚本 / MQTT 测试 broker / Modbus 模拟器
-├── doc/                      # MQTT 指南 / 测试指南 / AI 集成设计
+├── tests/                    # 单元/集成测试套件（无 GUI，120 项断言）
+├── doc/                      # MQTT 指南 / Code Review 报告 / AI 集成设计
 └── build/                    # 构建输出目录（Makefile 由 qmake 自动生成）
 ```
 

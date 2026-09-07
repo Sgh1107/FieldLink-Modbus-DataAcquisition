@@ -21,6 +21,7 @@
 #include "logviewer.h"
 #include "settingsdialog.h"
 #include "mqttclient.h"    // MQTT 发布端客户端
+#include "devicesimulator.h"   // 模拟设备（Modbus 从站）测试面板
 
 #include <QFileDialog>
 #include <QMessageBox>
@@ -1129,6 +1130,16 @@ void MainWindow::initMqttSupport()
     // 曾经启用过 MQTT：启动时自动重连 broker
     if (m_appSettings.value(QStringLiteral("mqtt/enabled"), false).toBool())
         m_mqttClient->connectToBroker();
+}
+
+// 打开「模拟设备」测试面板（可跨开关复用，进程与面板同生命周期）
+void MainWindow::showDeviceSimulator()
+{
+    if (!m_deviceSimulatorPanel)
+        m_deviceSimulatorPanel = new DeviceSimulatorPanel(this);
+    m_deviceSimulatorPanel->show();
+    m_deviceSimulatorPanel->raise();
+    m_deviceSimulatorPanel->activateWindow();
 }
 
 void MainWindow::showMqttSettings()
