@@ -59,9 +59,9 @@ QVariant WriteRegisterModel::headerData(int section, Qt::Orientation orientation
         case NumColumn:
             return QStringLiteral("#");
         case CoilsColumn:
-            return QStringLiteral("Coils  ");
+            return tr("Coil (check = ON)");
         case HoldingColumn:
-            return QStringLiteral("Holding Registers");
+            return tr("Holding register (hex)");
         default:
             break;
         }

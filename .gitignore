@@ -2,5 +2,7 @@
 build/
 deploy/*
 !deploy/mcp_stdio_bridge.py
-!deploy/modbus_tcp_simulator.py
-!deploy/mqtt_test_broker.py
+# !slave/modbus_tcp_simulator.py
+# !slave/mqtt_test_broker.py
+__pycache__/
+

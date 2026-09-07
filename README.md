@@ -15,6 +15,7 @@
 | Qt 模块 | SerialBus（Modbus 主站）、SerialPort（串口）、Sql（SQLite 历史/报警存储）、Network（远程 API）、Widgets、Qml（脚本引擎） |
 | MinGW 8.1 64-bit | 编译工具链 |
 | SQLite | 历史数据与报警事件持久化（QtSql 驱动，免安装） |
+| Python 3.x（可选） | 运行内置 Modbus 从站模拟器 / MQTT 测试 broker（联调用，标准库零依赖） |
 
 ---
 
@@ -22,6 +23,7 @@
 
 - ✅ **双通道工业通信**：Modbus TCP（网络）+ Modbus RTU（串口）双模式主站，多设备统一管理，连接参数（端口/波特率/校验位/超时/重试次数）全部可配置并持久化
 - ✅ **自动轮询采集**：多轮询任务独立定时器驱动，可按任务配置从站地址、寄存器类型、起始地址、数量与周期，互不干扰
+- ✅ **实时读取定时轮询 + 写后自动回读**：主界面「Auto read」勾选即按间隔自动读取；每次写入成功后自动回读刷新结果，读写闭环零等待
 - ✅ **批量读写任务引擎**：批量读/写任务按顺序执行，支持任务上下移动排序、任务间延时，满足一拖多设备的批量操作场景
 - ✅ **历史数据落库**：SQLite 按记录存储采集数据，支持按时间区间/从站/寄存器组合查询、最近 N 条快查、过期数据自动清理
 - ✅ **智能报警系统**：8 种触发条件（大于/小于/等于/不等于/范围内/范围外/置位/清零）× 3 级严重度，支持去抖时间、报警确认、报警历史查询
@@ -29,11 +31,12 @@
 - ✅ **远程监控 API**：内置 HTTP JSON API 服务（状态查询/远程读/远程写），API Token 鉴权，远程写可独立开关，便于上位机/运维系统集成
 - ✅ **MQTT 数据上送**：内置零依赖 MQTT 3.1.1 发布端（QoS 0），采集数据/报警事件/连接状态实时上送 broker，自动重连 + 心跳保活，无缝对接 IoT 平台与组态软件
 - ✅ **内置模拟从站**：一键起停 Modbus TCP 模拟设备（独立 Python 进程，互验协议），配合正弦温度/随机游走数据源，联调测试无需任何外部工具
-- ✅ **完备安全体系**：用户/角色/权限三级模型，密码与 API Token 均哈希存储，敏感操作权限校验
+- ✅ **完备安全体系**：用户/角色/权限三级模型，密码与 API Token 均哈希存储，敏感操作权限校验；安全默认——远程 API 未配置 Token 时锁定、默认账号首次登录强制改密、写操作审计留痕
 - ✅ **高可靠运行**：自动重连 + 心跳保活 + 连续失败告警（ReliabilityManager），全局崩溃捕获与日志记录（CrashLogger），适合无人值守长期运行
 - ✅ **脚本与插件扩展**：内置 QJSEngine 脚本控制台（可加载脚本文件、注册全局对象），标准 Qt 插件接口（数据回调 + 连接状态回调 + 读写设置），二次开发友好
 - ✅ **设备模板/点表管理**：寄存器点表支持数据类型（uint16/int16/uint32/int32/float32/ascii）、字节序（ABCD/DCBA/BADC/CDAB）、缩放/偏移/工程单位换算
 - ✅ **主题与本地化**：深色/浅色工业风主题一键切换（Fusion + QSS），配置自动记忆；内置 i18n 框架（lrelease 构建期编译翻译并嵌入资源）
+- ✅ **内置测试套件**：`tests/` 下 120 项无 GUI 断言（报警条件/权限模型/MQTT 协议/字节序换算/任务调度），`qmake + make` 一键回归
 - ✅ **交付工具链内置**：交付清单、运行环境检查、日志打包、发布说明/用户手册/维护手册自动生成、Windows 打包脚本一键产出
 
 ---
@@ -97,9 +100,10 @@ mingw32-make -j8        # Linux 下使用 make -j8
 ### 快速上手流程
 
 ```
-添加设备（TCP/RTU）→ 配置轮询任务 → 启动采集
-     → 实时曲线/仪表盘监控 → 历史查询与 CSV 导出
-     → 配置报警规则 → （可选）开启远程 API / 脚本控制台 / 插件
+启动内置模拟从站（Simulator 面板）→ 连接 TCP 127.0.0.1:1502
+     → 配置轮询任务 / 勾选「Auto read」→ 实时曲线/仪表盘监控
+     → 历史查询与 CSV 导出 → 配置报警规则
+     → （可选）MQTT 上送 / 远程 API / 脚本控制台 / 插件
 ```
 
 ---
@@ -134,7 +138,7 @@ FieldLink-Modbus-DataAcquisition/
 │   ├── pollmanager.h         # 轮询采集：多任务独立定时器
 │   ├── batchtaskmanager.h    # 批量读写任务：顺序执行、排序、延时
 │   ├── writeregistermodel.h  # 写寄存器数据模型
-│   ├── dataparser.h          # 数据解析
+│   ├── dataparser.h          # 数据解析：寄存器值 ↔ float32/int32/ascii（多字节序）
 │   │
 │   ├── ── 数据层 ──
 │   ├── historydata.h         # 历史数据：SQLite 存储与查询
@@ -161,6 +165,8 @@ FieldLink-Modbus-DataAcquisition/
 │   │
 │   ├── ── MQTT 上送 ──
 │   ├── mqttclient.h          # 零依赖 MQTT 3.1.1 发布端（QoS0/自动重连/心跳）
+│   │
+│   ├── ── 测试与模拟 ──
 │   ├── devicesimulator.h     # 模拟设备面板（一键起停 Modbus TCP 从站）
 │   │
 │   └── ── 工程化工具 ──
@@ -176,7 +182,8 @@ FieldLink-Modbus-DataAcquisition/
 ├── style/                    # dark.qss / light.qss 主题样式
 ├── translations/             # 界面翻译（zh_CN，构建期嵌入资源）
 ├── images/                   # 界面图标资源
-├── deploy/                   # Windows 打包脚本 / MQTT 测试 broker / Modbus 模拟器
+├── deploy/                   # Windows 发布打包脚本（package_windows.ps1）
+├── slave/                    # 测试用模拟服务端：Modbus 从站模拟器 / MQTT 测试 broker
 ├── tests/                    # 单元/集成测试套件（无 GUI，120 项断言）
 ├── doc/                      # MQTT 指南 / Code Review 报告 / AI 集成设计
 └── build/                    # 构建输出目录（Makefile 由 qmake 自动生成）

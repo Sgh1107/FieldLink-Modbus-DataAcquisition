@@ -61,7 +61,7 @@ private:
     void initAdvancedFeatures();
     void initMenus();
     void initMqttSupport();                    // MQTT：初始化发布端客户端与遥测/报警挂钩
-    void attemptModbusConnection();            // 执行一次 Modbus 连接动作（手动/自动重连共用）
+    void attemptModbusConnection(bool manual); // 执行一次 Modbus 连接动作（手动/自动重连共用；手动失败弹窗）
     QModbusDataUnit readRequest() const;
     QModbusDataUnit writeRequest() const;
 
@@ -81,6 +81,8 @@ private slots:
     void on_readWriteButton_clicked();
     void on_connectType_currentIndexChanged(int);
     void on_writeTable_currentIndexChanged(int);
+    void onAutoReadToggled(bool checked);      // 实时读取：定时轮询开关
+    void onAutoReadTimeout();                  // 实时读取：定时到点执行一次读取
 
     void onPollRequest(const PollTask &task);
     void onBatchReadTask(const BatchTask &task);
@@ -144,6 +146,7 @@ private:
     DeliveryManager *m_deliveryManager;
     MqttClient *m_mqttClient = nullptr;            // MQTT 发布端客户端
     DeviceSimulatorPanel *m_deviceSimulatorPanel = nullptr;   // 模拟设备面板
+    class QTimer *m_autoReadTimer = nullptr;       // 实时读取定时轮询
     QMap<int, int> m_pointChartSeriesMap;
     QMap<int, int> m_pointDashboardGaugeMap;
 };

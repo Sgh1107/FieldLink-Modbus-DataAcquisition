@@ -62,6 +62,9 @@ using QModbusRtuSerialClient = QModbusRtuSerialMaster;
 #include <QHeaderView>
 #include <QStyle>
 #include <QLocale>
+#include <QTimer>
+#include <QCheckBox>
+#include <QSpinBox>
 
 enum ModbusConnection {
     Serial,
@@ -78,6 +81,16 @@ MainWindow::MainWindow(QWidget *parent)
     ui->portEdit->setMinimumWidth(240);
     ui->portEdit->setMinimumContentsLength(22);
     ui->portEdit->setSizePolicy(QSizePolicy::MinimumExpanding, QSizePolicy::Fixed);
+
+    // 实时读取：定时轮询（勾选「Auto read」后按间隔自动执行读取）
+    m_autoReadTimer = new QTimer(this);
+    m_autoReadTimer->setInterval(ui->autoReadInterval->value());
+    connect(m_autoReadTimer, &QTimer::timeout, this, &MainWindow::onAutoReadTimeout);
+    connect(ui->autoReadCheck, &QCheckBox::toggled, this, &MainWindow::onAutoReadToggled);
+    connect(ui->autoReadInterval, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        if (m_autoReadTimer->isActive())
+            m_autoReadTimer->setInterval(value);
+    });
 
     ui->readValue->setAlternatingRowColors(true);
     ui->writeValueTable->setAlternatingRowColors(true);
@@ -231,9 +244,16 @@ void MainWindow::on_connectButton_clicked()
 
     statusBar()->clearMessage();
     if (modbusDevice->state() != QModbusDevice::ConnectedState) {
+        // 已处于自动重试循环时再点一次 = 取消自动重连（给操作员停止手段）
+        if (m_reliabilityManager->userIntentConnected()) {
+            m_reliabilityManager->setUserIntentConnected(false);
+            statusBar()->showMessage(tr("Auto-reconnect stopped"), 3000);
+            logMessage(QStringLiteral("已取消自动重连"), 2);
+            return;
+        }
         // 用户明确要求连接：置位意图，意外断线时才会自动重连
         m_reliabilityManager->setUserIntentConnected(true);
-        attemptModbusConnection();
+        attemptModbusConnection(true);
     } else {
         // 用户主动断开：清除意图，自动重连循环立即停止
         m_reliabilityManager->setUserIntentConnected(false);
@@ -244,9 +264,10 @@ void MainWindow::on_connectButton_clicked()
     }
 }
 
-// 执行一次连接动作（参数装配 + connectDevice）。由手动连接与自动重连共同复用，
-// 不包含用户意图切换，保证自动重连不会误改意图状态。
-void MainWindow::attemptModbusConnection()
+// 执行一次连接动作（参数装配 + connectDevice）。
+//   manual=true  : 操作员点击触发；失败弹窗提示
+//   manual=false : 自动重连触发；失败仅状态栏提示（避免弹窗刷屏）
+void MainWindow::attemptModbusConnection(bool manual)
 {
     if (!modbusDevice)
         return;
@@ -269,10 +290,17 @@ void MainWindow::attemptModbusConnection()
     modbusDevice->setTimeout(m_settingsDialog->settings().responseTime);
     modbusDevice->setNumberOfRetries(m_settingsDialog->settings().numberOfRetries);
     if (!modbusDevice->connectDevice()) {
+        // 按钮文字回滚 + 失败提示（手动连接失败弹窗，自动重连仅状态栏）
+        ui->connectButton->setText(tr("Connect"));
+        if (manual) {
+            QMessageBox::warning(this, tr("Connect Failed"),
+                                 tr("Connect failed: %1").arg(modbusDevice->errorString()));
+        }
         statusBar()->showMessage(tr("Connect failed: ") + modbusDevice->errorString(), 5000);
     } else {
         ui->actionConnect->setEnabled(false);
         ui->actionDisconnect->setEnabled(true);
+        ui->connectButton->setText(tr("Disconnect"));
         // 记录连接成功日志
         logMessage(QStringLiteral("连接成功: %1").arg(ui->portEdit->currentText()));
     }
@@ -283,6 +311,10 @@ void MainWindow::onStateChanged(int state)
     bool connected = (state != QModbusDevice::UnconnectedState);
     ui->actionConnect->setEnabled(!connected);
     ui->actionDisconnect->setEnabled(connected);
+
+    // 设备断开时自动取消「定时读取」，避免空转报错
+    if (!connected && ui->autoReadCheck->isChecked())
+        ui->autoReadCheck->setChecked(false);
 
     if (state == QModbusDevice::UnconnectedState)
         ui->connectButton->setText(tr("Connect"));
@@ -387,6 +419,34 @@ void MainWindow::readReady()
     reply->deleteLater();
 }
 
+// 实时读取：定时轮询开关。设备未连接时不允许开启。
+void MainWindow::onAutoReadToggled(bool checked)
+{
+    if (checked) {
+        if (!modbusDevice || modbusDevice->state() != QModbusDevice::ConnectedState) {
+            ui->autoReadCheck->setChecked(false);
+            statusBar()->showMessage(tr("Connect first before enabling auto read"), 3000);
+            return;
+        }
+        m_autoReadTimer->setInterval(ui->autoReadInterval->value());
+        m_autoReadTimer->start();
+        logMessage(QStringLiteral("定时读取已开启：每 %1 ms").arg(ui->autoReadInterval->value()));
+    } else {
+        m_autoReadTimer->stop();
+        logMessage(QStringLiteral("定时读取已关闭"));
+    }
+}
+
+// 定时到点：复用手动读取的分段读取逻辑（结果仍进入「读取结果」列表）
+void MainWindow::onAutoReadTimeout()
+{
+    if (!modbusDevice || modbusDevice->state() != QModbusDevice::ConnectedState) {
+        ui->autoReadCheck->setChecked(false);
+        return;
+    }
+    on_readButton_clicked();
+}
+
 void MainWindow::on_writeButton_clicked()
 {
     if (!modbusDevice)
@@ -449,6 +509,9 @@ void MainWindow::on_writeButton_clicked()
                                    .arg(reply->errorString()).arg(reply->error(), -1, 16));
                     } else {
                         logMessage(QStringLiteral("WRITE-OK"));
+                        // 写入成功后自动回读一次：让「读取结果」立即反映新值，
+                        // 无需等待定时轮询 tick 或手动点「读取」
+                        on_readButton_clicked();
                     }
                     reply->deleteLater();
                 });
@@ -567,6 +630,14 @@ void MainWindow::on_writeTable_currentIndexChanged(int index)
         ui->writeValueTable->setColumnHidden(2, index != 3);
         ui->writeValueTable->resizeColumnToContents(0);
     }
+
+    // 写入区小字提示：随寄存器类型切换，说明怎么填值
+    if (index == 3)
+        ui->writeHintLabel->setText(tr("Holding register: double-click a cell to enter a hex value, then press Write."));
+    else if (index == 0)
+        ui->writeHintLabel->setText(tr("Coil: check = write 1 (ON), uncheck = write 0 (OFF), then press Write."));
+    else
+        ui->writeHintLabel->setText(tr("This register type is read-only and cannot be written."));
 
     ui->readWriteButton->setEnabled(index == 3);
     ui->writeButton->setEnabled(coilsOrHolding);
@@ -710,8 +781,8 @@ void MainWindow::initAdvancedFeatures()
     connect(m_reliabilityManager, &ReliabilityManager::reconnectRequested, this, [this]() {
         if (modbusDevice && modbusDevice->state() == QModbusDevice::UnconnectedState) {
             logMessage(QStringLiteral("意外断线，正在自动重连..."), 2);
-            // 直接执行连接动作；用户意图已在自动重连门控中校验
-            attemptModbusConnection();
+            // 直接执行连接动作（非手动：失败不弹窗）；用户意图已在重连门控中校验
+            attemptModbusConnection(false);
         }
     });
     connect(m_reliabilityManager, &ReliabilityManager::heartbeatRequested, this, [this]() {

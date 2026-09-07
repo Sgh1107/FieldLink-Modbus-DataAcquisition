@@ -1145,7 +1145,7 @@ void MainWindow::showDeviceSimulator()
 void MainWindow::showMqttSettings()
 {
     QDialog dialog(this);
-    dialog.setWindowTitle(QStringLiteral("MQTT 发布设置"));
+    dialog.setWindowTitle(tr("MQTT Publish Settings"));
     dialog.resize(430, 320);
     auto *form = new QFormLayout(&dialog);
 
@@ -1155,7 +1155,7 @@ void MainWindow::showMqttSettings()
     portSpin->setRange(1, 65535);
     portSpin->setValue(m_appSettings.value(QStringLiteral("mqtt/port"), 1883).toInt());
     auto *clientEdit = new QLineEdit(m_appSettings.value(QStringLiteral("mqtt/clientId")).toString(), &dialog);
-    clientEdit->setPlaceholderText(QStringLiteral("留空自动生成"));
+    clientEdit->setPlaceholderText(tr("Leave empty to auto-generate"));
     auto *userEdit = new QLineEdit(m_appSettings.value(QStringLiteral("mqtt/username")).toString(), &dialog);
     auto *passEdit = new QLineEdit(m_appSettings.value(QStringLiteral("mqtt/password")).toString(), &dialog);
     passEdit->setEchoMode(QLineEdit::Password);
@@ -1164,27 +1164,27 @@ void MainWindow::showMqttSettings()
     auto *keepaliveSpin = new QSpinBox(&dialog);
     keepaliveSpin->setRange(10, 3600);
     keepaliveSpin->setValue(m_appSettings.value(QStringLiteral("mqtt/keepalive"), 60).toInt());
-    keepaliveSpin->setSuffix(QStringLiteral(" 秒"));
+    keepaliveSpin->setSuffix(tr(" s"));
 
-    form->addRow(QStringLiteral("Broker 地址"), hostEdit);
-    form->addRow(QStringLiteral("端口"), portSpin);
-    form->addRow(QStringLiteral("ClientID"), clientEdit);
-    form->addRow(QStringLiteral("用户名(可选)"), userEdit);
-    form->addRow(QStringLiteral("密码(可选)"), passEdit);
-    form->addRow(QStringLiteral("主题前缀"), prefixEdit);
-    form->addRow(QStringLiteral("KeepAlive"), keepaliveSpin);
+    form->addRow(tr("Broker address"), hostEdit);
+    form->addRow(tr("Port"), portSpin);
+    form->addRow(tr("ClientID"), clientEdit);
+    form->addRow(tr("Username (optional)"), userEdit);
+    form->addRow(tr("Password (optional)"), passEdit);
+    form->addRow(tr("Topic prefix"), prefixEdit);
+    form->addRow(tr("KeepAlive"), keepaliveSpin);
 
     auto *statusLabel = new QLabel(
         m_mqttClient->isConnectedToBroker()
-            ? QStringLiteral("已连接 %1").arg(m_mqttClient->brokerInfo())
-            : QStringLiteral("未连接"),
+            ? tr("Connected to %1").arg(m_mqttClient->brokerInfo())
+            : tr("Not connected"),
         &dialog);
-    form->addRow(QStringLiteral("状态"), statusLabel);
+    form->addRow(tr("Status"), statusLabel);
 
     auto *buttonBox = new QDialogButtonBox(QDialogButtonBox::Save, &dialog);
     connect(buttonBox, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-    auto *connectBtn = new QPushButton(QStringLiteral("保存并连接"), &dialog);
-    auto *disconnectBtn = new QPushButton(QStringLiteral("断开"), &dialog);
+    auto *connectBtn = new QPushButton(tr("Save and connect"), &dialog);
+    auto *disconnectBtn = new QPushButton(tr("Disconnect"), &dialog);
     buttonBox->addButton(connectBtn, QDialogButtonBox::ActionRole);
     buttonBox->addButton(disconnectBtn, QDialogButtonBox::ActionRole);
     form->addRow(buttonBox);
@@ -1215,20 +1215,20 @@ void MainWindow::showMqttSettings()
         m_mqttClient->setKeepAlive(m_appSettings.value(QStringLiteral("mqtt/keepalive"), 60).toInt());
         m_appSettings.setValue(QStringLiteral("mqtt/enabled"), true);
         m_mqttClient->connectToBroker();
-        statusLabel->setText(QStringLiteral("正在连接..."));
+        statusLabel->setText(tr("Connecting..."));
     });
 
     connect(disconnectBtn, &QPushButton::clicked, &dialog, [this, statusLabel]() {
         m_appSettings.setValue(QStringLiteral("mqtt/enabled"), false);
         m_mqttClient->disconnectFromBroker();
-        statusLabel->setText(QStringLiteral("已断开"));
+        statusLabel->setText(tr("Disconnected"));
     });
 
     connect(m_mqttClient, &MqttClient::connected, statusLabel, [statusLabel, this]() {
-        statusLabel->setText(QStringLiteral("已连接 %1").arg(m_mqttClient->brokerInfo()));
+        statusLabel->setText(tr("Connected to %1").arg(m_mqttClient->brokerInfo()));
     });
     connect(m_mqttClient, &MqttClient::disconnected, statusLabel, [statusLabel]() {
-        statusLabel->setText(QStringLiteral("未连接"));
+        statusLabel->setText(tr("Not connected"));
     });
     connect(m_mqttClient, &MqttClient::errorOccurred, statusLabel, [statusLabel](const QString &message) {
         statusLabel->setText(message);
@@ -1639,14 +1639,14 @@ void MainWindow::showVerificationManager()
 bool MainWindow::loginCurrentUser()
 {
     QDialog dialog(this);
-    dialog.setWindowTitle("用户登录");
+    dialog.setWindowTitle(tr("User Login"));
     auto *form = new QFormLayout(&dialog);
     auto *user = new QLineEdit("admin", &dialog);
     auto *password = new QLineEdit(&dialog);
     password->setEchoMode(QLineEdit::Password);
     // S2：不再预填默认密码
-    form->addRow("用户名", user);
-    form->addRow("密码", password);
+    form->addRow(tr("Username"), user);
+    form->addRow(tr("Password"), password);
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
     form->addRow(buttons);
     connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
@@ -1654,7 +1654,8 @@ bool MainWindow::loginCurrentUser()
     if (dialog.exec() != QDialog::Accepted)
         return false;
     if (!m_securityManager->login(user->text(), password->text())) {
-        QMessageBox::warning(this, "登录失败", "用户名或密码错误，敏感操作将被拒绝");
+        QMessageBox::warning(this, tr("Login Failed"),
+                             tr("Wrong username or password. Sensitive operations will be denied."));
         return false;
     }
 
@@ -1664,21 +1665,23 @@ bool MainWindow::loginCurrentUser()
         bool changed = false;
         while (!changed) {
             bool ok = false;
-            const QString first = QInputDialog::getText(this, QStringLiteral("修改密码"),
-                QStringLiteral("当前账号使用默认/初始密码，请设置新密码（至少 6 位）："),
+            const QString first = QInputDialog::getText(this, tr("Change Password"),
+                tr("This account uses the default/initial password. Set a new one (min 6 chars):"),
                 QLineEdit::Password, QString(), &ok);
             if (!ok)
                 break;
             if (first.size() < 6) {
-                QMessageBox::warning(this, QStringLiteral("密码过短"), QStringLiteral("密码至少需要 6 个字符"));
+                QMessageBox::warning(this, tr("Password Too Short"),
+                                     tr("Password must be at least 6 characters"));
                 continue;
             }
-            const QString second = QInputDialog::getText(this, QStringLiteral("确认新密码"),
-                QStringLiteral("请再次输入新密码："), QLineEdit::Password, QString(), &ok);
+            const QString second = QInputDialog::getText(this, tr("Confirm New Password"),
+                tr("Please re-enter the new password:"), QLineEdit::Password, QString(), &ok);
             if (!ok)
                 break;
             if (first != second) {
-                QMessageBox::warning(this, QStringLiteral("不一致"), QStringLiteral("两次输入的密码不一致，请重试"));
+                QMessageBox::warning(this, tr("Mismatch"),
+                                     tr("Passwords do not match. Please try again."));
                 continue;
             }
             newPassword = first;
@@ -1686,12 +1689,13 @@ bool MainWindow::loginCurrentUser()
         }
         if (!changed) {
             m_securityManager->logout();
-            QMessageBox::warning(this, QStringLiteral("未修改密码"),
-                QStringLiteral("出于安全考虑，使用默认/初始密码必须先完成修改，本次登录已被拒绝"));
+            QMessageBox::warning(this, tr("Password Not Changed"),
+                tr("For security, the default/initial password must be changed before use. This login was denied."));
             return false;
         }
         m_securityManager->changePassword(m_securityManager->currentUser(), newPassword);
-        QMessageBox::information(this, QStringLiteral("密码已修改"), QStringLiteral("请牢记新密码，下次登录使用"));
+        QMessageBox::information(this, tr("Password Changed"),
+                                 tr("Remember your new password for the next login."));
     }
 
     statusBar()->showMessage(QString("当前用户: %1 / %2").arg(m_securityManager->currentUser(), m_securityManager->currentRole()), 5000);

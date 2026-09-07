@@ -3,7 +3,7 @@
 
 // devicesimulator.h
 // 「模拟设备」测试面板：在 FieldLink 内一键启动/停止仓库自带的 Modbus 从站模拟器
-// （deploy/modbus_tcp_simulator.py，独立 Python 实现，作为交叉验证参照物）。
+// （slave/modbus_tcp_simulator.py，独立 Python 实现，作为交叉验证参照物）。
 //
 // 用途：日常联调不再需要手动另开终端跑 Python；点一下即可得到一个真实 TCP 从站，
 //       主界面按 TCP 连接 127.0.0.1:<port> 即可走完采集/轮询/报警/MQTT 全链路。

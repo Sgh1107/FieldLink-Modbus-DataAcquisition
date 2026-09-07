@@ -3,17 +3,22 @@
 """
 FieldLink MQTT 测试用迷你 broker（纯 Python 标准库，零依赖）
 
+【使用方式】
+  python slave/mqtt_test_broker.py                       # 监听 0.0.0.0:1883
+  python slave/mqtt_test_broker.py --port 11883          # 指定端口
+  python slave/mqtt_test_broker.py --user test --pass secret   # 开启认证校验
+
+【连接方法】
+  FieldLink 菜单 Advanced → MQTT Publishing，Broker 地址填 127.0.0.1:<端口>，
+  若 broker 开启了认证则填同样的用户名/密码 → 保存并连接。
+  本脚本会把收到的每条 PUBLISH 打印到控制台，便于核对上送数据。
+
 用途：没有 mosquitto/EMQX 等真实 broker 时，验证 FieldLink MQTT 发布端
       的协议行为（CONNECT / CONNACK / PUBLISH / PINGREQ / DISCONNECT）。
       支持订阅回环（SUBSCRIBE 后把匹配主题的 PUBLISH 转发回来）。
 
 日志走 stdout，每收到一条 PUBLISH 打一行：
   PUBLISH topic=fieldlink/data/1/HoldingRegisters/0 retain=0 qos=0 bytes=123 payload={"timestamp":...}
-
-用法：
-  python deploy/mqtt_test_broker.py                       # 监听 0.0.0.0:1883
-  python deploy/mqtt_test_broker.py --port 11883          # 指定端口
-  python deploy/mqtt_test_broker.py --user test --pass secret   # 开启认证校验
 """
 
 from __future__ import annotations

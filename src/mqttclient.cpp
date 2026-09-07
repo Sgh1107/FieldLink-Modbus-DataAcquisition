@@ -96,7 +96,7 @@ QString MqttClient::brokerInfo() const
 void MqttClient::connectToBroker()
 {
     if (m_host.isEmpty()) {
-        emit errorOccurred(QStringLiteral("MQTT broker 地址未配置"));
+        emit errorOccurred(tr("MQTT broker address is not configured"));
         return;
     }
     if (m_socket->state() != QAbstractSocket::UnconnectedState)
@@ -145,14 +145,14 @@ void MqttClient::onSocketError(QAbstractSocket::SocketError error)
 {
     Q_UNUSED(error);
     if (m_socket->error() != QAbstractSocket::RemoteHostClosedError)
-        emit errorOccurred(QStringLiteral("MQTT 连接错误: %1").arg(m_socket->errorString()));
+        emit errorOccurred(tr("MQTT connection error: %1").arg(m_socket->errorString()));
 }
 
 void MqttClient::onReconnectTimer()
 {
     if (m_userRequestedDisconnect || m_socket->state() != QAbstractSocket::UnconnectedState)
         return;
-    emit errorOccurred(QStringLiteral("MQTT 正在重连 %1 ...").arg(brokerInfo()));
+    emit errorOccurred(tr("MQTT reconnecting to %1 ...").arg(brokerInfo()));
     m_socket->connectToHost(m_host, m_port);
 }
 
@@ -199,13 +199,13 @@ QByteArray MqttClient::encodeString(const QString &text)
 QString MqttClient::connackCodeText(int code)
 {
     switch (code) {
-    case CONNACK_ACCEPTED:           return QStringLiteral("连接被接受");
-    case CONNACK_BAD_PROTOCOL:       return QStringLiteral("不支持的协议版本");
-    case CONNACK_CLIENT_REJECTED:    return QStringLiteral("客户端标识符被拒绝");
-    case CONNACK_SERVER_UNAVAILABLE: return QStringLiteral("服务端不可用");
-    case CONNACK_BAD_CREDENTIALS:    return QStringLiteral("用户名或密码错误");
-    case CONNACK_NOT_AUTHORIZED:     return QStringLiteral("未授权");
-    default:                         return QStringLiteral("未知返回码 %1").arg(code);
+    case CONNACK_ACCEPTED:           return tr("Connection accepted");
+    case CONNACK_BAD_PROTOCOL:       return tr("Unsupported protocol version");
+    case CONNACK_CLIENT_REJECTED:    return tr("Client identifier rejected");
+    case CONNACK_SERVER_UNAVAILABLE: return tr("Server unavailable");
+    case CONNACK_BAD_CREDENTIALS:    return tr("Bad username or password");
+    case CONNACK_NOT_AUTHORIZED:     return tr("Not authorized");
+    default:                         return tr("Unknown return code %1").arg(code);
     }
 }
 
@@ -262,7 +262,7 @@ bool MqttClient::publish(const QString &topic, const QByteArray &payload, bool r
         ++m_droppedCount;
         if (!m_dropWarningEmitted) {
             m_dropWarningEmitted = true;
-            emit errorOccurred(QStringLiteral("MQTT 未连接，开始丢弃上送消息（已丢弃 %1 条，恢复连接后自动继续）")
+            emit errorOccurred(tr("MQTT not connected: dropping published messages (%1 dropped, resumes when connected)")
                                    .arg(m_droppedCount));
         }
         return false;
@@ -364,7 +364,7 @@ void MqttClient::handleConnack(const QByteArray &body)
         // 认证/协议问题重试无意义：停止重连
         m_userRequestedDisconnect = true;
         m_reconnectTimer.stop();
-        emit errorOccurred(QStringLiteral("MQTT broker 拒绝连接: %1").arg(connackCodeText(code)));
+        emit errorOccurred(tr("MQTT broker refused connection: %1").arg(connackCodeText(code)));
         m_socket->disconnectFromHost();
         return;
     }

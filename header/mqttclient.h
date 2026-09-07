@@ -11,7 +11,7 @@
 //   - 自动重连（broker 断开后每 5 秒重试；认证被拒时不重试）
 //   - MQTT 3.1.1（协议级别 4），兼容 mosquitto / EMQX / Mosca 等主流 broker
 //
-// 测试：deploy/mqtt_test_broker.py 提供标准库实现的迷你 broker，
+// 测试：slave/mqtt_test_broker.py 提供标准库实现的迷你 broker，
 //       可对 CONNECT/PUBLISH 字节流做离线验证（见 doc/MQTT_GUIDE.md）。
 
 #include <QObject>

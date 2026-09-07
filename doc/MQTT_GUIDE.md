@@ -40,12 +40,12 @@ FieldLink 内置了一个**极简 MQTT 3.1.1 发布端客户端**（QoS 0），�
 
 ## 四、测试（无需真实 broker）
 
-仓库附带标准库实现的迷你 broker `deploy/mqtt_test_broker.py`，会打印收到的每条消息：
+仓库附带标准库实现的迷你 broker `slave/mqtt_test_broker.py`，会打印收到的每条消息：
 
 ```powershell
 # 终端 1：启动测试 broker（可选开启认证）
-python deploy\mqtt_test_broker.py --port 1883
-python deploy\mqtt_test_broker.py --port 1883 --user test --pass secret
+python slave\mqtt_test_broker.py --port 1883
+python slave\mqtt_test_broker.py --port 1883 --user test --pass secret
 
 # 终端 2：FieldLink MQTT 设置里指向 127.0.0.1:1883 连接，启动轮询任务
 # broker 终端将实时打印：

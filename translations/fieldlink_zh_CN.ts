@@ -1,6 +1,108 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!DOCTYPE TS>
+<?xml version='1.0' encoding='utf-8'?>
 <TS version="2.1" language="zh_CN" sourcelanguage="en">
+<context>
+    <name>DeviceSimulatorPanel</name>
+    <message>
+        <source>Device Simulator (Modbus Slave)</source>
+        <translation>模拟设备（Modbus 从站）</translation>
+    </message>
+    <message>
+        <source>python or absolute path</source>
+        <translation>python 或绝对路径</translation>
+    </message>
+    <message>
+        <source>Path to modbus_tcp_simulator.py</source>
+        <translation>modbus_tcp_simulator.py 路径</translation>
+    </message>
+    <message>
+        <source>Python</source>
+        <translation>Python</translation>
+    </message>
+    <message>
+        <source>Simulator script</source>
+        <translation>模拟器脚本</translation>
+    </message>
+    <message>
+        <source>Port</source>
+        <translation>端口</translation>
+    </message>
+    <message>
+        <source>Slave address</source>
+        <translation>从站地址</translation>
+    </message>
+    <message>
+        <source>Start slave simulator</source>
+        <translation>启动模拟从站</translation>
+    </message>
+    <message>
+        <source>Stop</source>
+        <translation>停止</translation>
+    </message>
+    <message>
+        <source>Not running</source>
+        <translation>未运行</translation>
+    </message>
+    <message>
+        <source>Running (PID %1)</source>
+        <translation>运行中（PID %1）</translation>
+    </message>
+    <message>
+        <source>Tip: after starting, connect the main window via TCP to 127.0.0.1:%1 with slave address %2.</source>
+        <translation>提示：启动后主界面连接类型选 TCP，地址填 127.0.0.1:%1，从站地址填 %2。</translation>
+    </message>
+    <message>
+        <source>Select simulator script</source>
+        <translation>选择模拟器脚本</translation>
+    </message>
+    <message>
+        <source>Python (*.py)</source>
+        <translation>Python (*.py)</translation>
+    </message>
+    <message>
+        <source>Error: invalid simulator script path. Please select modbus_tcp_simulator.py.</source>
+        <translation>错误：模拟器脚本路径无效，请选择正确的 modbus_tcp_simulator.py</translation>
+    </message>
+    <message>
+        <source>Stopped</source>
+        <translation>已停止</translation>
+    </message>
+    <message>
+        <source>Simulator process exited (exit code %1).</source>
+        <translation>模拟从站进程已退出（exit code %1）。</translation>
+    </message>
+    <message>
+        <source>Hint: if the port is occupied, another service is already listening — try a different port.</source>
+        <translation>提示：若端口被占用，说明已有服务监听该端口，请更换端口。</translation>
+    </message>
+    <message>
+        <source>Error: cannot start the simulator. Please check the Python/script path.</source>
+        <translation>错误：无法启动模拟器，请检查 Python/脚本路径。</translation>
+    </message>
+    <message>
+        <source>Failed to start</source>
+        <translation>启动失败</translation>
+    </message>
+    <message>
+        <source>Browse...</source>
+        <translation>浏览...</translation>
+    </message>
+    <message>
+        <source>=== Slave simulator running ===</source>
+        <translation>=== 模拟从站已启动 ===</translation>
+    </message>
+    <message>
+        <source>Listen: 127.0.0.1:%1   Slave unit: %2</source>
+        <translation>监听: 127.0.0.1:%1   从站地址: %2</translation>
+    </message>
+    <message>
+        <source>Simulated data: reg0 = temperature sine (15.0~35.0°C x10), reg1 = random walk, reg2 = 42, reg3-99 = pattern</source>
+        <translation>模拟数据：reg0=正弦温度(15.0~35.0°C×10) reg1=随机游走 reg2=42 reg3+=规律变化</translation>
+    </message>
+    <message>
+        <source>Main window connect: TCP 127.0.0.1:%1, slave address %2</source>
+        <translation>主界面连接：TCP 127.0.0.1:%1，从站地址 %2</translation>
+    </message>
+</context>
 <context>
     <name>MainWindow</name>
     <message>
@@ -41,7 +143,7 @@
     </message>
     <message>
         <source>Disconnect</source>
-        <translation>断 开</translation>
+        <translation>断开</translation>
     </message>
     <message>
         <source>Read Area</source>
@@ -266,6 +368,419 @@
     <message>
         <source>Write response error: %1 (code: 0x%2)</source>
         <translation>写入响应错误: %1 (代码: 0x%2)</translation>
+    </message>
+    <message>
+        <source>FieldLink 采集平台</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>TCP</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>1</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>2</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>3</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>4</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>5</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>6</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>7</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>8</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>9</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>10</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>MQTT Publishing</source>
+        <translation>MQTT 发布</translation>
+    </message>
+    <message>
+        <source>Simulator (Modbus Slave)</source>
+        <translation>模拟设备（Modbus 从站）</translation>
+    </message>
+    <message>
+        <source>MQTT Publish Settings</source>
+        <translation>MQTT 发布设置</translation>
+    </message>
+    <message>
+        <source>Leave empty to auto-generate</source>
+        <translation>留空自动生成</translation>
+    </message>
+    <message>
+        <source> s</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>Broker address</source>
+        <translation>Broker 地址</translation>
+    </message>
+    <message>
+        <source>Port</source>
+        <translation>端口</translation>
+    </message>
+    <message>
+        <source>ClientID</source>
+        <translation>ClientID</translation>
+    </message>
+    <message>
+        <source>Username (optional)</source>
+        <translation>用户名（可选）</translation>
+    </message>
+    <message>
+        <source>Password (optional)</source>
+        <translation>密码（可选）</translation>
+    </message>
+    <message>
+        <source>Topic prefix</source>
+        <translation>主题前缀</translation>
+    </message>
+    <message>
+        <source>KeepAlive</source>
+        <translation>KeepAlive</translation>
+    </message>
+    <message>
+        <source>Connected to %1</source>
+        <translation>已连接 %1</translation>
+    </message>
+    <message>
+        <source>Not connected</source>
+        <translation>未连接</translation>
+    </message>
+    <message>
+        <source>Status</source>
+        <translation>状态</translation>
+    </message>
+    <message>
+        <source>Save and connect</source>
+        <translation>保存并连接</translation>
+    </message>
+    <message>
+        <source>Connecting...</source>
+        <translation>正在连接...</translation>
+    </message>
+    <message>
+        <source>Disconnected</source>
+        <translation>已断开</translation>
+    </message>
+    <message>
+        <source>User Login</source>
+        <translation>用户登录</translation>
+    </message>
+    <message>
+        <source>Username</source>
+        <translation>用户名</translation>
+    </message>
+    <message>
+        <source>Password</source>
+        <translation>密码</translation>
+    </message>
+    <message>
+        <source>Login Failed</source>
+        <translation>登录失败</translation>
+    </message>
+    <message>
+        <source>Wrong username or password. Sensitive operations will be denied.</source>
+        <translation>用户名或密码错误，敏感操作将被拒绝</translation>
+    </message>
+    <message>
+        <source>Change Password</source>
+        <translation>修改密码</translation>
+    </message>
+    <message>
+        <source>This account uses the default/initial password. Set a new one (min 6 chars):</source>
+        <translation>当前账号使用默认/初始密码，请设置新密码（至少 6 位）：</translation>
+    </message>
+    <message>
+        <source>Password Too Short</source>
+        <translation>密码过短</translation>
+    </message>
+    <message>
+        <source>Password must be at least 6 characters</source>
+        <translation>密码至少需要 6 个字符</translation>
+    </message>
+    <message>
+        <source>Confirm New Password</source>
+        <translation>确认新密码</translation>
+    </message>
+    <message>
+        <source>Please re-enter the new password:</source>
+        <translation>请再次输入新密码：</translation>
+    </message>
+    <message>
+        <source>Mismatch</source>
+        <translation>两次输入不一致</translation>
+    </message>
+    <message>
+        <source>Passwords do not match. Please try again.</source>
+        <translation>两次输入的密码不一致，请重试</translation>
+    </message>
+    <message>
+        <source>Password Not Changed</source>
+        <translation>未修改密码</translation>
+    </message>
+    <message>
+        <source>For security, the default/initial password must be changed before use. This login was denied.</source>
+        <translation>出于安全考虑，使用默认/初始密码必须先完成修改，本次登录已被拒绝</translation>
+    </message>
+    <message>
+        <source>Password Changed</source>
+        <translation>密码已修改</translation>
+    </message>
+    <message>
+        <source>Remember your new password for the next login.</source>
+        <translation>请牢记新密码，下次登录使用</translation>
+    </message>
+    <message>
+        <source>Auto-reconnect stopped</source>
+        <translation>已取消自动重连</translation>
+    </message>
+    <message>
+        <source>Connect Failed</source>
+        <translation>连接失败</translation>
+    </message>
+    <message>
+        <source>Connect failed: %1</source>
+        <translation>连接失败: %1</translation>
+    </message>
+    <message>
+        <source>Holding register: double-click a cell to enter a hex value, then press Write.</source>
+        <translation>保持寄存器：双击单元格输入十六进制值，然后点「写入」下发</translation>
+    </message>
+    <message>
+        <source>Coil: check = write 1 (ON), uncheck = write 0 (OFF), then press Write.</source>
+        <translation>线圈：勾选 = 写 1（ON），取消勾选 = 写 0（OFF），然后点「写入」下发</translation>
+    </message>
+    <message>
+        <source>This register type is read-only and cannot be written.</source>
+        <translation>该寄存器类型只读，不支持写入</translation>
+    </message>
+    <message>
+        <source>Auto read</source>
+        <translation>定时读取</translation>
+    </message>
+    <message>
+        <source>Interval</source>
+        <translation>间隔</translation>
+    </message>
+    <message>
+        <source> ms</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>Connect first before enabling auto read</source>
+        <translation>请先连接设备再开启定时读取</translation>
+    </message>
+</context>
+<context>
+    <name>MqttClient</name>
+    <message>
+        <source>MQTT broker address is not configured</source>
+        <translation>MQTT broker 地址未配置</translation>
+    </message>
+    <message>
+        <source>MQTT connection error: %1</source>
+        <translation>MQTT 连接错误: %1</translation>
+    </message>
+    <message>
+        <source>MQTT reconnecting to %1 ...</source>
+        <translation>MQTT 正在重连 %1 ...</translation>
+    </message>
+    <message>
+        <source>Connection accepted</source>
+        <translation>连接被接受</translation>
+    </message>
+    <message>
+        <source>Unsupported protocol version</source>
+        <translation>不支持的协议版本</translation>
+    </message>
+    <message>
+        <source>Client identifier rejected</source>
+        <translation>客户端标识符被拒绝</translation>
+    </message>
+    <message>
+        <source>Server unavailable</source>
+        <translation>服务端不可用</translation>
+    </message>
+    <message>
+        <source>Bad username or password</source>
+        <translation>用户名或密码错误</translation>
+    </message>
+    <message>
+        <source>Not authorized</source>
+        <translation>未授权</translation>
+    </message>
+    <message>
+        <source>Unknown return code %1</source>
+        <translation>未知返回码 %1</translation>
+    </message>
+    <message>
+        <source>MQTT not connected: dropping published messages (%1 dropped, resumes when connected)</source>
+        <translation>MQTT 未连接，已丢弃 %1 条上送消息，恢复连接后自动继续</translation>
+    </message>
+    <message>
+        <source>MQTT broker refused connection: %1</source>
+        <translation>MQTT broker 拒绝连接: %1</translation>
+    </message>
+</context>
+<context>
+    <name>SettingsDialog</name>
+    <message>
+        <source>Modbus Settings</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>Serial Parameters</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>Parity:</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>No</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>Even</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>Odd</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>Space</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>Mark</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>Baud Rate:</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>1200</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>2400</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>4800</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>9600</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>19200</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>38400</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>57600</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>115200</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>Data Bits:</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>5</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>6</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>7</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>8</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>Stop Bits:</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>1</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>3</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>2</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>Response Timeout:</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source> ms</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>Number of retries:</source>
+        <translation type="unfinished" />
+    </message>
+    <message>
+        <source>Apply</source>
+        <translation type="unfinished" />
+    </message>
+</context>
+<context>
+    <name>WriteRegisterModel</name>
+    <message>
+        <source>Coil (check = ON)</source>
+        <translation>线圈（勾选 = ON）</translation>
+    </message>
+    <message>
+        <source>Holding register (hex)</source>
+        <translation>保持寄存器（十六进制）</translation>
     </message>
 </context>
 </TS>

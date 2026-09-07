@@ -428,7 +428,7 @@ static void testMqttClient()
     bool rejectedSeen = false;
     QObject::connect(&badClient, &MqttClient::errorOccurred, [&](const QString &message) {
         lastError = message;
-        if (message.contains(QStringLiteral("拒绝连接"))) rejectedSeen = true;
+        if (message.contains(QStringLiteral("refused connection"))) rejectedSeen = true;
     });
     badClient.setBroker(QStringLiteral("127.0.0.1"), broker.port());
     badClient.setCredentials(QStringLiteral("bad-client"), QStringLiteral("u"), QStringLiteral("p"));
