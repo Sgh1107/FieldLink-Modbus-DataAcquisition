@@ -12,6 +12,7 @@
 namespace {
 
 constexpr int kReconnectIntervalMs = 5 * 1000;
+constexpr int kConnectTimeoutMs = 10 * 1000;   // 连接超时：10s 内未收到 CONNACK 即断开重试
 
 // CONNACK 返回码（MQTT 3.1.1 表 3.1）
 enum ConnackCode {
@@ -53,6 +54,10 @@ MqttClient::MqttClient(QObject *parent)
 
     m_retransmitTimer.setInterval(2 * 1000);   // QoS1：2 秒无 PUBACK 即 DUP 重发
     connect(&m_retransmitTimer, &QTimer::timeout, this, &MqttClient::sendPendingRetransmits);
+
+    m_connectTimeoutTimer.setSingleShot(true);
+    m_connectTimeoutTimer.setInterval(kConnectTimeoutMs);
+    connect(&m_connectTimeoutTimer, &QTimer::timeout, this, &MqttClient::onConnectTimeout);
 }
 
 MqttClient::~MqttClient()
@@ -110,17 +115,16 @@ void MqttClient::connectToBroker()
         emit errorOccurred(tr("MQTT broker address is not configured"));
         return;
     }
-    if (m_socket->state() == QAbstractSocket::ConnectingState) {
-        // 上一次连接尝试还没结果（如 broker 未就绪时的挂起连接）：
-        // 中止它，立即用当前配置重连，避免用户再点"保存并连接"没有反应
+    // 任何非未连接状态（连接中/已连接/半开连接）一律断开重来，
+    // 避免"卡在正在连接"或"半开连接上静默返回"的死状态
+    if (m_socket->state() != QAbstractSocket::UnconnectedState)
         m_socket->abort();
-    } else if (m_socket->state() != QAbstractSocket::UnconnectedState) {
-        return;                                     // 已连接：忽略重复请求
-    }
 
     m_userRequestedDisconnect = false;
     m_brokerConnected = false;
     m_buffer.clear();
+    emit errorOccurred(tr("MQTT connecting to %1 ...").arg(brokerInfo()));
+    m_connectTimeoutTimer.start();
     m_socket->connectToHost(m_host, m_port);
 }
 
@@ -129,6 +133,7 @@ void MqttClient::disconnectFromBroker()
     m_userRequestedDisconnect = true;
     m_reconnectTimer.stop();
     m_pingTimer.stop();
+    m_connectTimeoutTimer.stop();
     if (m_brokerConnected)
         sendDisconnect();
     if (m_socket->state() != QAbstractSocket::UnconnectedState)
@@ -192,10 +197,23 @@ void MqttClient::resetSessionState()
 {
     m_brokerConnected = false;
     m_pingTimer.stop();
+    m_connectTimeoutTimer.stop();
     m_buffer.clear();
     m_pending.clear();              // 断线即清空 QoS1 待确认队列（会话已失效）
     m_retransmitTimer.stop();
     m_dropWarningEmitted = false;   // 新的断连周期允许再次告警
+}
+
+// 连接超时：TCP 已连上但 CONNACK 迟迟不来（broker 假死/被静默过滤等），
+// 或 TCP 握手本身挂起。断开并按自动重连策略重试，状态不再永久卡死。
+void MqttClient::onConnectTimeout()
+{
+    if (m_brokerConnected || m_userRequestedDisconnect)
+        return;
+    emit errorOccurred(tr("MQTT connect timeout: no CONNACK within %1 s, retrying...")
+                           .arg(kConnectTimeoutMs / 1000));
+    m_socket->abort();
+    scheduleReconnect();
 }
 
 // ---------------- 编码辅助 ----------------
@@ -417,6 +435,7 @@ void MqttClient::handleConnack(const QByteArray &body)
         return;
     }
     const int code = static_cast<unsigned char>(body.at(1));
+    m_connectTimeoutTimer.stop();   // 收到 CONNACK：连接阶段结束（无论接受与否）
     if (code != CONNACK_ACCEPTED) {
         // 认证/协议问题重试无意义：停止重连
         m_userRequestedDisconnect = true;
@@ -437,11 +456,12 @@ void MqttClient::handlePuback(const QByteArray &body)
         return;
     const quint16 packetId = static_cast<quint16>(
         (static_cast<unsigned char>(body.at(0)) << 8) | static_cast<unsigned char>(body.at(1)));
-    const auto it = m_pending.constFind(packetId);
-    if (it == m_pending.constEnd())
+    if (!m_pending.contains(packetId))
         return;   // 未知/重复 PUBACK，忽略
-    emit published(it->topic, it->payloadSize);
-    m_pending.erase(it);
+    const PendingPublish pending = m_pending.value(packetId);
+    emit published(pending.topic, pending.payloadSize);
+    // 注意：QMap::erase 只接受 iterator（const_iterator 不可用），直接按 key 移除
+    m_pending.remove(packetId);
     if (m_pending.isEmpty())
         m_retransmitTimer.stop();
 }
@@ -463,12 +483,9 @@ void MqttClient::sendPendingRetransmits()
     }
 
     for (const quint16 id : dropped) {
-        const auto it = m_pending.constFind(id);
-        if (it != m_pending.constEnd()) {
-            emit errorOccurred(tr("MQTT QoS1 message dropped after %1 retries (packet id %2)")
-                                   .arg(5).arg(id));
-            m_pending.erase(it);
-        }
+        emit errorOccurred(tr("MQTT QoS1 message dropped after %1 retries (packet id %2)")
+                               .arg(5).arg(id));
+        m_pending.remove(id);
     }
     if (m_pending.isEmpty())
         m_retransmitTimer.stop();

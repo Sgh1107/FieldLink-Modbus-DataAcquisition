@@ -5,6 +5,7 @@
 #include "devicesimulator.h"
 
 #include <QCoreApplication>
+#include <QCloseEvent>
 #include <QDir>
 #include <QFileInfo>
 #include <QFileDialog>
@@ -99,8 +100,10 @@ DeviceSimulatorPanel::DeviceSimulatorPanel(QWidget *parent)
 
 DeviceSimulatorPanel::~DeviceSimulatorPanel()
 {
-    if (m_process.state() != QProcess::NotRunning)
-        m_process.kill();   // 防止残留后台 python
+    if (m_process.state() != QProcess::NotRunning) {
+        m_process.kill();
+        m_process.waitForFinished(500);   // 防止残留后台 python
+    }
 }
 
 void DeviceSimulatorPanel::loadConfig()
@@ -179,9 +182,10 @@ void DeviceSimulatorPanel::onStop()
 {
     m_userStopped = true;
     if (m_process.state() != QProcess::NotRunning) {
-        m_process.terminate();   // Windows 控制台进程对 terminate 常不响应，超时后 kill 兜底
-        if (!m_process.waitForFinished(1500))
-            m_process.kill();
+        // Windows 控制台进程对 terminate（WM_CLOSE）基本不响应，直接强杀，
+        // 确保点击「停止」后 python 进程一定被释放（模拟器无需要保存的状态）
+        m_process.kill();
+        m_process.waitForFinished(1000);
     }
     m_statusLabel->setText(tr("Stopped"));
     updateButtons();
@@ -228,6 +232,17 @@ void DeviceSimulatorPanel::updateButtons()
     m_browseButton->setEnabled(!running);
     m_portSpin->setEnabled(!running);
     m_unitSpin->setEnabled(!running);
+}
+
+// 关闭面板：同时停止模拟从站子进程，避免后台残留 python 被误认为进程泄漏
+void DeviceSimulatorPanel::closeEvent(QCloseEvent *event)
+{
+    if (m_process.state() != QProcess::NotRunning) {
+        m_userStopped = true;
+        m_process.kill();
+        m_process.waitForFinished(1000);
+    }
+    event->accept();
 }
 
 void DeviceSimulatorPanel::appendLog(const QString &text)

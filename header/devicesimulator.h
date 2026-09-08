@@ -36,6 +36,10 @@ private slots:
     void onProcessError(QProcess::ProcessError error);
     void updateButtons();
 
+protected:
+    // 关闭面板 = 释放 python 子进程（避免后台残留被误认为进程泄漏）
+    void closeEvent(QCloseEvent *event) override;
+
 private:
     void loadConfig();
     void saveConfig();

@@ -2,10 +2,12 @@ name: unit-tests
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, 'hotfix/**']
   pull_request:
+  workflow_dispatch:
 
 jobs:
+  # ---- 常规单元/集成测试（原生构建，最快）----
   qt6-tests:
     runs-on: ubuntu-24.04
     steps:
@@ -31,3 +33,79 @@ jobs:
 
       - name: Run tests
         run: ./build/tests/fieldlink_tests
+
+  # ---- 内存检查（ASan + LeakSanitizer）：泄漏即失败 ----
+  # 说明：内存检查只在 Linux 上可行（MinGW/Windows 无 libasan，也没有 Valgrind），
+  #       被测对象是 tests/ 下的无 GUI 测试套件。
+  asan-leak:
+    name: ASan + LeakSanitizer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Qt 6 (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qt6-base-dev libqt6sql6-sqlite \
+            libqt6serialport6-dev libqt6serialbus6-dev g++ make
+
+      - name: Configure with AddressSanitizer
+        run: |
+          mkdir -p build/asan
+          cd build/asan
+          qmake6 ../../tests/tests.pro \
+            "QMAKE_CXXFLAGS+=-fsanitize=address -fno-omit-frame-pointer -g" \
+            "QMAKE_LFLAGS+=-fsanitize=address"
+
+      - name: Build tests (ASan)
+        run: |
+          cd build/asan
+          make -j"$(nproc)"
+
+      - name: Run tests under ASan/LSan
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          LSAN_OPTIONS: report_objects=1
+        run: |
+          ./build/asan/fieldlink_tests
+          echo "ASan/LSan: no memory leaks detected"
+
+  # ---- 内存检查（Valgrind Memcheck）：非法读写 + 确定性泄漏即失败 ----
+  valgrind:
+    name: Valgrind Memcheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Qt 6 + Valgrind (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qt6-base-dev libqt6sql6-sqlite \
+            libqt6serialport6-dev libqt6serialbus6-dev g++ make valgrind
+
+      - name: Configure (qmake6)
+        run: |
+          mkdir -p build/vg
+          cd build/vg
+          qmake6 ../../tests/tests.pro "QMAKE_CXXFLAGS+=-g"
+
+      - name: Build tests (debug info)
+        run: |
+          cd build/vg
+          make -j"$(nproc)"
+
+      - name: Run tests under Valgrind
+        run: |
+          valgrind --tool=memcheck \
+                   --leak-check=full \
+                   --show-leak-kinds=definite,indirect \
+                   --errors-for-leak-kinds=definite,indirect \
+                   --track-origins=yes \
+                   --num-callers=25 \
+                   --error-exitcode=1 \
+                   ./build/vg/fieldlink_tests
+          echo "Valgrind: no definite/indirect leaks, no invalid memory access"

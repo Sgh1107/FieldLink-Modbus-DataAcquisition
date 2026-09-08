@@ -258,8 +258,19 @@ class MiniBroker:
     def run(self) -> None:
         """启动broker主循环"""
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind((self.host, self.port))
+        if sys.platform == "win32":
+            # Windows：SO_REUSEADDR 允许端口被重复绑定（旧实例仍占着端口时新实例
+            # 也能 bind 成功，但连接会进到旧进程 → 表现为"连不上且无任何日志"）。
+            # 改用独占绑定：端口被占用时 bind 直接失败并大声报错。
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.server_socket.bind((self.host, self.port))
+        except OSError as error:
+            log(f"错误：端口 {self.port} 绑定失败（{error}）。")
+            log("可能原因：端口已被占用——含此前未关闭的本脚本实例（任务管理器结束旧 python 进程）或 mosquitto 等。")
+            return
         self.server_socket.listen(8)
         log(f"MQTT mini broker 已启动 {self.host}:{self.port} "
             f"(认证={'开启' if self.username else '关闭'})")

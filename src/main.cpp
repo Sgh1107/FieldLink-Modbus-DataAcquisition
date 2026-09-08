@@ -15,8 +15,12 @@ int main(int argc, char *argv[])
     QLoggingCategory::setFilterRules(QStringLiteral("qt.modbus* = true"));
 
     QApplication a(argc, argv);
-    a.setApplicationName("fieldlink");
-    a.setApplicationVersion("1.0.0");
+    // 关键：QSettings 依赖 organization + application 名称定位存储。
+    // 缺省 organization 名时 QSettings 的 fileName 为空、所有键都存不下来
+    // （配置仅存在于内存，重启即丢），因此必须显式设置。
+    a.setOrganizationName(QStringLiteral("FieldLink"));
+    a.setApplicationName(QStringLiteral("fieldlink"));
+    a.setApplicationVersion(QStringLiteral("1.0.0"));
     CrashLogger::install();
 
     // ---------- 界面主题初始化 ----------

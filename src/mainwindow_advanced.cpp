@@ -1079,7 +1079,13 @@ void MainWindow::initMqttSupport()
     m_mqttClient = new MqttClient(this);
 
     // 读取持久化配置（mqtt/ 配置节）
-    const QString host = m_appSettings.value(QStringLiteral("mqtt/host"), QStringLiteral("127.0.0.1")).toString();
+    // host 空值兜底：键存在但值为空（如对话框清空后保存）时回落默认地址，
+    // 避免启动时反复出现 [ERROR] MQTT broker 地址未配置
+    QString host = m_appSettings.value(QStringLiteral("mqtt/host"), QStringLiteral("127.0.0.1")).toString().trimmed();
+    if (host.isEmpty()) {
+        host = QStringLiteral("127.0.0.1");
+        m_appSettings.setValue(QStringLiteral("mqtt/host"), host);
+    }
     const int port = m_appSettings.value(QStringLiteral("mqtt/port"), 1883).toInt();
     QString clientId = m_appSettings.value(QStringLiteral("mqtt/clientId")).toString();
     if (clientId.isEmpty()) {
@@ -1194,7 +1200,11 @@ void MainWindow::showMqttSettings()
     form->addRow(buttonBox);
 
     auto saveSettings = [this, hostEdit, portSpin, clientEdit, userEdit, passEdit, prefixEdit, keepaliveSpin]() {
-        m_appSettings.setValue(QStringLiteral("mqtt/host"), hostEdit->text().trimmed());
+        // host 空值兜底：清空后保存按未配置处理，回落默认地址（避免 mqtt/host 存成空串）
+        QString host = hostEdit->text().trimmed();
+        if (host.isEmpty())
+            host = QStringLiteral("127.0.0.1");
+        m_appSettings.setValue(QStringLiteral("mqtt/host"), host);
         m_appSettings.setValue(QStringLiteral("mqtt/port"), portSpin->value());
         if (!clientEdit->text().trimmed().isEmpty())
             m_appSettings.setValue(QStringLiteral("mqtt/clientId"), clientEdit->text().trimmed());

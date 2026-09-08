@@ -61,6 +61,7 @@ private slots:
     void onSocketError(QAbstractSocket::SocketError error);
     void onPingTimer();
     void onReconnectTimer();
+    void onConnectTimeout();                   // 连接超时：10s 内未收到 CONNACK 则断开重试
 
 private:
     // MQTT 3.1.1 控制包类型（本客户端关注的子集）
@@ -113,6 +114,7 @@ private:
     QTimer m_pingTimer;           // keepalive/2 发送 PINGREQ
     QTimer m_reconnectTimer;      // 断线后 5 秒重连
     QTimer m_retransmitTimer;     // QoS1 重发定时器
+    QTimer m_connectTimeoutTimer; // 连接超时（10s 无 CONNACK → 断开重试）
 };
 
 #endif // MQTTCLIENT_H
