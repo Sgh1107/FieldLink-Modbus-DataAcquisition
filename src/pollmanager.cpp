@@ -19,6 +19,14 @@ PollManager::~PollManager()
 
 void PollManager::addTask(const PollTask &task)
 {
+    // PM1：任务 id 查重——同 id 视为更新，避免出现同 id 双定时器
+    for (const auto &entry : m_timers) {
+        if (entry.task.id == task.id) {
+            updateTask(task);
+            return;
+        }
+    }
+
     TimerEntry entry;
     entry.task = task;
     entry.timer = new QTimer(this);

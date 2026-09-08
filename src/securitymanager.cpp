@@ -4,6 +4,8 @@
 #include <QFile>
 #include <QTextStream>
 #include <QDate>
+#include <QDateTime>
+#include <QUuid>
 
 SecurityManager::SecurityManager(QObject *parent)
     : QObject(parent)
@@ -37,6 +39,7 @@ void SecurityManager::load(QSettings &settings)
         SecurityUser user;
         user.username = username;
         user.passwordHash = settings.value(QString("security/user/%1/passwordHash").arg(username)).toString();
+        user.passwordSalt = settings.value(QString("security/user/%1/passwordSalt").arg(username)).toString();
         user.role = settings.value(QString("security/user/%1/role").arg(username), "operator").toString();
         user.enabled = settings.value(QString("security/user/%1/enabled").arg(username), true).toBool();
         user.mustChangePassword = settings.value(QString("security/user/%1/mustChangePassword").arg(username), false).toBool();
@@ -58,6 +61,7 @@ void SecurityManager::save(QSettings &settings) const
     settings.setValue("security/users", QStringList(m_users.keys()));
     for (const auto &user : m_users) {
         settings.setValue(QString("security/user/%1/passwordHash").arg(user.username), user.passwordHash);
+        settings.setValue(QString("security/user/%1/passwordSalt").arg(user.username), user.passwordSalt);
         settings.setValue(QString("security/user/%1/role").arg(user.username), user.role);
         settings.setValue(QString("security/user/%1/enabled").arg(user.username), user.enabled);
         settings.setValue(QString("security/user/%1/mustChangePassword").arg(user.username), user.mustChangePassword);
@@ -66,7 +70,13 @@ void SecurityManager::save(QSettings &settings) const
 
 void SecurityManager::setApiToken(const QString &token)
 {
-    m_apiTokenHash = hashToken(token);
+    // S3：API Token 同样加盐（存储格式 "salt:hash"），不再使用裸 SHA256
+    if (token.isEmpty()) {
+        m_apiTokenHash.clear();
+        return;
+    }
+    const QString salt = generateSalt();
+    m_apiTokenHash = salt + QLatin1Char(':') + saltedHash(salt, token);
 }
 
 QString SecurityManager::apiTokenHash() const
@@ -76,7 +86,17 @@ QString SecurityManager::apiTokenHash() const
 
 bool SecurityManager::verifyApiToken(const QString &token) const
 {
-    return !token.isEmpty() && !m_apiTokenHash.isEmpty() && hashToken(token) == m_apiTokenHash;
+    if (token.isEmpty() || m_apiTokenHash.isEmpty())
+        return false;
+    // S3：新格式 "salt:hash"
+    const int sep = m_apiTokenHash.indexOf(QLatin1Char(':'));
+    if (sep > 0) {
+        const QString salt = m_apiTokenHash.left(sep);
+        const QString stored = m_apiTokenHash.mid(sep + 1);
+        return saltedHash(salt, token) == stored;
+    }
+    // 旧格式：裸 SHA256（向后兼容旧配置文件）
+    return isLegacyHash(m_apiTokenHash) && hashToken(token) == m_apiTokenHash;
 }
 
 bool SecurityManager::mustChangePassword(const QString &username) const
@@ -89,7 +109,9 @@ void SecurityManager::changePassword(const QString &username, const QString &new
     if (newPassword.isEmpty() || !m_users.contains(username))
         return;
     auto user = m_users.value(username);
-    user.passwordHash = hashPassword(newPassword);
+    // S3：改密时生成新随机盐
+    user.passwordSalt = generateSalt();
+    user.passwordHash = saltedHash(user.passwordSalt, newPassword);
     user.mustChangePassword = false;
     m_users.insert(username, user);
     audit(username, QStringLiteral("PASSWORD_CHANGE"), QStringLiteral("success"));
@@ -151,9 +173,16 @@ QString SecurityManager::auditLogPath() const
 bool SecurityManager::login(const QString &username, const QString &password)
 {
     ensureDefaults();
-    const auto user = m_users.value(username);
-    const bool ok = user.enabled && !user.username.isEmpty() && user.passwordHash == hashPassword(password);
+    auto user = m_users.value(username);
+    const bool ok = user.enabled && !user.username.isEmpty()
+                    && verifySecret(user.passwordSalt, user.passwordHash, password);
     if (ok) {
+        // S3：旧版无盐哈希在登录成功后透明升级为加盐哈希
+        if (user.passwordSalt.isEmpty() && isLegacyHash(user.passwordHash)) {
+            user.passwordSalt = generateSalt();
+            user.passwordHash = saltedHash(user.passwordSalt, password);
+            m_users.insert(username, user);
+        }
         m_currentUser = username;
         audit(username, QStringLiteral("LOGIN"), QStringLiteral("success"));
     } else {
@@ -207,13 +236,15 @@ void SecurityManager::addOrUpdateUser(const QString &username, const QString &pa
     SecurityUser user = m_users.value(username.trimmed());
     user.username = username.trimmed();
     if (!password.isEmpty()) {
-        // 显式设置密码：视为密码已变更，清除强制改密标记
-        user.passwordHash = hashPassword(password);
+        // 显式设置密码：视为密码已变更，清除强制改密标记（S3：新随机盐）
+        user.passwordSalt = generateSalt();
+        user.passwordHash = saltedHash(user.passwordSalt, password);
         user.mustChangePassword = false;
     } else if (user.passwordHash.isEmpty()) {
         // S4：新建用户未提供密码 → 默认密码 123456 + 强制改密标记，
-        // 默认密码仅能用于登录并触发修改流程，无法长期使用
-        user.passwordHash = hashPassword(QStringLiteral("123456"));
+        // 默认密码仅能用于登录并触发修改流程，无法长期使用（S3：新随机盐）
+        user.passwordSalt = generateSalt();
+        user.passwordHash = saltedHash(user.passwordSalt, QStringLiteral("123456"));
         user.mustChangePassword = true;
     }
     user.role = role.trimmed().isEmpty() ? QStringLiteral("operator") : role.trimmed();
@@ -306,4 +337,40 @@ QString SecurityManager::hashPassword(const QString &password) const
 QString SecurityManager::hashToken(const QString &token) const
 {
     return QString::fromLatin1(QCryptographicHash::hash(token.toUtf8(), QCryptographicHash::Sha256).toHex());
+}
+
+// ---------------- S3：加盐哈希 ----------------
+
+QString SecurityManager::generateSalt() const
+{
+    // 随机盐：128 位 UUID（32 个十六进制字符）+ 毫秒时间戳兜底
+    return QUuid::createUuid().toString(QUuid::Id128)
+           + QString::number(QDateTime::currentMSecsSinceEpoch(), 16);
+}
+
+QString SecurityManager::saltedHash(const QString &salt, const QString &secret) const
+{
+    return hashToken(QStringLiteral("v1:%1:%2").arg(salt, secret));
+}
+
+bool SecurityManager::isLegacyHash(const QString &hash) const
+{
+    if (hash.size() != 64)
+        return false;
+    for (const QChar &c : hash) {
+        if (!((c >= QLatin1Char('0') && c <= QLatin1Char('9'))
+              || (c >= QLatin1Char('a') && c <= QLatin1Char('f'))))
+            return false;
+    }
+    return true;
+}
+
+bool SecurityManager::verifySecret(const QString &salt, const QString &storedHash, const QString &secret) const
+{
+    if (storedHash.isEmpty() || secret.isEmpty())
+        return false;
+    if (!salt.isEmpty())
+        return saltedHash(salt, secret) == storedHash;
+    // 兼容旧版无盐哈希（"pwd:" 前缀裸 SHA256）
+    return isLegacyHash(storedHash) && hashToken(QStringLiteral("pwd:") + secret) == storedHash;
 }

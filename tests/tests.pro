@@ -32,6 +32,7 @@ HEADERS += \
     ../header/securitymanager.h \
     ../header/reliabilitymanager.h \
     ../header/mqttclient.h \
+    ../header/credentialcodec.h \
     ../header/dataexporter.h \
     ../header/pollmanager.h \
     ../header/devicemanager.h \

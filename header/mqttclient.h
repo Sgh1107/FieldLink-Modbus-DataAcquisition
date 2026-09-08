@@ -5,9 +5,10 @@
 // 极简 MQTT 3.1.1 发布端客户端（零外部依赖，基于 QTcpSocket）。
 //
 // 能力边界（刻意保持精简，降低出错面）：
-//   - 仅实现发布端所需的协议子集：CONNECT / CONNACK / PUBLISH(QoS0) /
-//     PINGREQ / PINGRESP / DISCONNECT
-//   - QoS 0（遥测高频数据常用级别，不做 PUBACK/重发队列）
+//   - 仅实现发布端所需的协议子集：CONNECT / CONNACK / PUBLISH(QoS0/QoS1) /
+//     PUBACK / PINGREQ / PINGRESP / DISCONNECT
+//   - QoS 0（即发即弃）与 QoS 1（报文标识符 + PUBACK 确认 + 超时 DUP 重发，
+//     重发 5 次仍无确认则丢弃并告警；断线时清空未确认队列）
 //   - 自动重连（broker 断开后每 5 秒重试；认证被拒时不重试）
 //   - MQTT 3.1.1（协议级别 4），兼容 mosquitto / EMQX / Mosca 等主流 broker
 //
@@ -35,6 +36,7 @@ public:
                         const QString &password = QString());
     void setKeepAlive(int seconds);            // 默认 60
     void setAutoReconnect(bool enabled);       // 默认 true
+    void setPublishQos(int qos);               // PUBLISH QoS：0 或 1，默认 0
 
     bool isConnectedToBroker() const;          // 已完成 CONNACK 握手
     QString brokerInfo() const;                // "host:port"
@@ -76,7 +78,17 @@ private:
     void sendDisconnect();
     void processBuffer();
     void handleConnack(const QByteArray &body);
+    void handlePuback(const QByteArray &body);     // QoS1：收到 PUBACK 后移出待确认队列
+    void sendPendingRetransmits();                 // QoS1：超时未确认的消息以 DUP=1 重发
     void resetSessionState();
+
+    // QoS1 待确认消息（原始 PUBLISH 包 DUP=0，重发时置位）
+    struct PendingPublish {
+        QByteArray packet;
+        QString topic;
+        int payloadSize;
+        int retries = 0;
+    };
 
     static QByteArray encodeRemainingLength(int length);
     static QByteArray encodeString(const QString &text);
@@ -95,8 +107,12 @@ private:
     bool m_userRequestedDisconnect;
     int m_droppedCount;           // 断连期间丢弃的上送消息数（M1：避免日志刷屏）
     bool m_dropWarningEmitted;    // 本次断连周期内是否已发过丢弃告警
+    int m_publishQos;             // PUBLISH QoS 级别（0/1）
+    quint16 m_nextPacketId;       // QoS1 报文标识符（0 为保留值）
+    QMap<quint16, PendingPublish> m_pending;   // 等待 PUBACK 的 QoS1 消息
     QTimer m_pingTimer;           // keepalive/2 发送 PINGREQ
     QTimer m_reconnectTimer;      // 断线后 5 秒重连
+    QTimer m_retransmitTimer;     // QoS1 重发定时器
 };
 
 #endif // MQTTCLIENT_H

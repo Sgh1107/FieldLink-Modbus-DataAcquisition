@@ -6,3 +6,4 @@ deploy/*
 # !slave/mqtt_test_broker.py
 __pycache__/
 
+fieldlink.pro.user*

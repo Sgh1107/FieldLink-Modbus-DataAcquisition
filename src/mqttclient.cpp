@@ -7,6 +7,7 @@
 
 #include <QDateTime>
 #include <QJsonDocument>
+#include <QVector>
 
 namespace {
 
@@ -34,6 +35,8 @@ MqttClient::MqttClient(QObject *parent)
     , m_userRequestedDisconnect(false)
     , m_droppedCount(0)
     , m_dropWarningEmitted(false)
+    , m_publishQos(0)
+    , m_nextPacketId(1)
 {
     connect(m_socket, &QTcpSocket::connected, this, &MqttClient::onSocketConnected);
     connect(m_socket, &QTcpSocket::disconnected, this, &MqttClient::onSocketDisconnected);
@@ -47,6 +50,9 @@ MqttClient::MqttClient(QObject *parent)
     m_reconnectTimer.setInterval(kReconnectIntervalMs);
     m_reconnectTimer.setSingleShot(true);
     connect(&m_reconnectTimer, &QTimer::timeout, this, &MqttClient::onReconnectTimer);
+
+    m_retransmitTimer.setInterval(2 * 1000);   // QoS1：2 秒无 PUBACK 即 DUP 重发
+    connect(&m_retransmitTimer, &QTimer::timeout, this, &MqttClient::sendPendingRetransmits);
 }
 
 MqttClient::~MqttClient()
@@ -79,6 +85,11 @@ void MqttClient::setKeepAlive(int seconds)
 void MqttClient::setAutoReconnect(bool enabled)
 {
     m_autoReconnect = enabled;
+}
+
+void MqttClient::setPublishQos(int qos)
+{
+    m_publishQos = (qos >= 1) ? 1 : 0;
 }
 
 bool MqttClient::isConnectedToBroker() const
@@ -167,6 +178,8 @@ void MqttClient::resetSessionState()
     m_brokerConnected = false;
     m_pingTimer.stop();
     m_buffer.clear();
+    m_pending.clear();              // 断线即清空 QoS1 待确认队列（会话已失效）
+    m_retransmitTimer.stop();
     m_dropWarningEmitted = false;   // 新的断连周期允许再次告警
 }
 
@@ -268,6 +281,33 @@ bool MqttClient::publish(const QString &topic, const QByteArray &payload, bool r
         return false;
     }
 
+    // QoS1：固定头 0x32|retain（重发时另置 DUP）+ 报文标识符，等待 PUBACK 确认
+    if (m_publishQos >= 1) {
+        const quint16 packetId = m_nextPacketId;
+        m_nextPacketId = static_cast<quint16>((m_nextPacketId % 65535) + 1);   // 跳过保留值 0
+
+        const QByteArray topicBytes = encodeString(topic);
+        const int remaining = topicBytes.size() + 2 + payload.size();
+
+        QByteArray packet;
+        packet.append(static_cast<char>(0x32 | (retain ? 0x01 : 0x00)));
+        packet += encodeRemainingLength(remaining);
+        packet += topicBytes;
+        packet.append(static_cast<char>((packetId >> 8) & 0xFF));
+        packet.append(static_cast<char>(packetId & 0xFF));
+        packet += payload;
+        m_socket->write(packet);
+
+        PendingPublish pending;
+        pending.packet = packet;
+        pending.topic = topic;
+        pending.payloadSize = payload.size();
+        m_pending.insert(packetId, pending);
+        if (!m_retransmitTimer.isActive())
+            m_retransmitTimer.start();
+        return true;   // published 信号延后到收到 PUBACK 时发出
+    }
+
     // PUBLISH QoS0：固定头 0x30|retain + 剩余长度 + 主题(变长字符串) + 载荷
     const QByteArray topicBytes = encodeString(topic);
     const int remaining = topicBytes.size() + payload.size();
@@ -337,6 +377,8 @@ void MqttClient::processBuffer()
             // 本客户端不订阅，正常不会收到；忽略
             break;
         case PKT_PUBACK:
+            handlePuback(body);
+            break;
         case PKT_PINGRESP:
             break;
         case PKT_DISCONNECT:
@@ -372,4 +414,47 @@ void MqttClient::handleConnack(const QByteArray &body)
     m_brokerConnected = true;
     m_pingTimer.start();
     emit connected();
+}
+
+void MqttClient::handlePuback(const QByteArray &body)
+{
+    if (body.size() < 2)
+        return;
+    const quint16 packetId = static_cast<quint16>(
+        (static_cast<unsigned char>(body.at(0)) << 8) | static_cast<unsigned char>(body.at(1)));
+    const auto it = m_pending.constFind(packetId);
+    if (it == m_pending.constEnd())
+        return;   // 未知/重复 PUBACK，忽略
+    emit published(it->topic, it->payloadSize);
+    m_pending.erase(it);
+    if (m_pending.isEmpty())
+        m_retransmitTimer.stop();
+}
+
+void MqttClient::sendPendingRetransmits()
+{
+    if (!m_brokerConnected || m_pending.isEmpty())
+        return;
+
+    QVector<quint16> dropped;
+    for (auto it = m_pending.begin(); it != m_pending.end(); ++it) {
+        if (++it->retries > 5) {   // 重发上限：放弃并告警
+            dropped.append(it.key());
+            continue;
+        }
+        QByteArray dup = it->packet;
+        dup[0] = static_cast<char>(static_cast<unsigned char>(dup.at(0)) | 0x08);   // DUP=1
+        m_socket->write(dup);
+    }
+
+    for (const quint16 id : dropped) {
+        const auto it = m_pending.constFind(id);
+        if (it != m_pending.constEnd()) {
+            emit errorOccurred(tr("MQTT QoS1 message dropped after %1 retries (packet id %2)")
+                                   .arg(5).arg(id));
+            m_pending.erase(it);
+        }
+    }
+    if (m_pending.isEmpty())
+        m_retransmitTimer.stop();
 }

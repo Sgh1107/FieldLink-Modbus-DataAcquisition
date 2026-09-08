@@ -256,6 +256,7 @@ void MainWindow::on_connectButton_clicked()
         attemptModbusConnection(true);
     } else {
         // 用户主动断开：清除意图，自动重连循环立即停止
+        m_userDisconnecting = true;   // 抑制 onStateChanged 中的"对端断开"弹窗
         m_reliabilityManager->setUserIntentConnected(false);
         modbusDevice->disconnectDevice();
         ui->actionConnect->setEnabled(true);
@@ -309,6 +310,10 @@ void MainWindow::attemptModbusConnection(bool manual)
 void MainWindow::onStateChanged(int state)
 {
     bool connected = (state != QModbusDevice::UnconnectedState);
+    // 上一次状态是否为"已连接"（用于区分"连接失败"与"连上后被对端断开"）
+    const bool wasConnected = (m_lastModbusState == QModbusDevice::ConnectedState);
+    m_lastModbusState = state;
+
     ui->actionConnect->setEnabled(!connected);
     ui->actionDisconnect->setEnabled(connected);
 
@@ -332,12 +337,46 @@ void MainWindow::onStateChanged(int state)
         m_dashboard->setServerAddress(ui->serverEdit->value());
     }
     if (m_reliabilityManager) {
-        if (connected)
+        if (connected) {
             m_reliabilityManager->notifySuccess();
-        else
+        } else {
+            // 意外断线（此前已连接且非用户主动断开）＝对端主动断开/网络中断：
+            // 先暂停自动重连循环，弹窗交给用户决定是否重连
+            const bool unexpected = wasConnected && !m_userDisconnecting;
+            if (unexpected)
+                m_reliabilityManager->setUserIntentConnected(false);
             m_reliabilityManager->notifyDisconnected();
+            if (unexpected)
+                askReconnectAfterRemoteClose();
+        }
     }
+    m_userDisconnecting = false;   // 断开流程已处理完毕，恢复默认
     saveSettings();
+}
+
+// 对端主动断开后的询问弹窗：
+//   「是」→ 立即重连并恢复自动重连循环（再次被对端断开时仍会询问）
+//   「否」→ 不再自动重连，直到用户手动点击「Connect」发起连接
+void MainWindow::askReconnectAfterRemoteClose()
+{
+    const QString addr = ui->portEdit->currentText();
+    logMessage(QStringLiteral("设备连接被对端断开: %1").arg(addr), 2);
+
+    const QMessageBox::StandardButton choice = QMessageBox::question(
+        this, tr("Connection Closed"),
+        tr("The server has closed the connection (%1).\n\nDo you want to reconnect?").arg(addr),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
+
+    if (choice == QMessageBox::Yes) {
+        logMessage(QStringLiteral("用户选择重新连接"));
+        m_reliabilityManager->setUserIntentConnected(true);
+        attemptModbusConnection(false);   // 失败仅状态栏提示，自动重连循环接管后续重试
+        if (modbusDevice && modbusDevice->state() == QModbusDevice::UnconnectedState)
+            m_reliabilityManager->notifyDisconnected();   // 立即失败时兜底启动重连循环
+    } else {
+        logMessage(QStringLiteral("用户选择不重连，等待手动连接"), 2);
+        statusBar()->showMessage(tr("Reconnect declined; press Connect to dial again"), 5000);
+    }
 }
 
 void MainWindow::on_readButton_clicked()

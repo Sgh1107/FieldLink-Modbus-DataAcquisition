@@ -183,9 +183,17 @@ bool AlarmManager::evaluateCondition(const AlarmRule &rule, double value) const
     case AlarmCondition::OutOfRange:
         return value < rule.threshold1 || value > rule.threshold2;
     case AlarmCondition::BitSet:
-        return (static_cast<int>(value) & (1 << static_cast<int>(rule.threshold1))) != 0;
-    case AlarmCondition::BitClear:
-        return (static_cast<int>(value) & (1 << static_cast<int>(rule.threshold1))) == 0;
+    case AlarmCondition::BitClear: {
+        // A3：位号必须落在 0~31，越界直接判"不触发"，避免 1 << 越界为 UB
+        const int bit = static_cast<int>(rule.threshold1);
+        if (bit < 0 || bit > 31)
+            return false;
+        const quint32 bitMask = 1u << bit;
+        const quint32 raw = static_cast<quint32>(static_cast<qlonglong>(value));
+        return rule.condition == AlarmCondition::BitSet
+                   ? (raw & bitMask) != 0
+                   : (raw & bitMask) == 0;
+    }
     }
     return false;
 }

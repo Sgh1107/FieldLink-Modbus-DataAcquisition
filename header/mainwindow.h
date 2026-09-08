@@ -115,6 +115,7 @@ private slots:
     QJsonObject executeRemoteWrite(int serverAddress, int registerType, int startAddress, const QVector<quint16> &values);
     void publishMqttTelemetry(int serverAddress, int registerType, int startAddress, const QVector<quint16> &values);
     void publishMqttStatus(bool connected);
+    void askReconnectAfterRemoteClose();   // 对端主动断开：弹窗询问用户是否重连
 
 private:
     Ui::MainWindow *ui;
@@ -149,6 +150,8 @@ private:
     class QTimer *m_autoReadTimer = nullptr;       // 实时读取定时轮询
     QMap<int, int> m_pointChartSeriesMap;
     QMap<int, int> m_pointDashboardGaugeMap;
+    int m_lastModbusState = -1;        // 上一次 Modbus 连接状态（识别"曾连接后意外断线"）
+    bool m_userDisconnecting = false;  // 用户主动断开标记（抑制对端断开弹窗）
 };
 
 #endif // MAINWINDOW_H

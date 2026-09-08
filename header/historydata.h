@@ -49,6 +49,7 @@ private:
     void createTables();
     QSqlDatabase m_db;
     QString m_connectionName;
+    int m_cleanupCounter = 0;   // H2：清理计数器改为成员变量（原函数级 static 多实例共享）
 };
 
 #endif // HISTORYDATA_H

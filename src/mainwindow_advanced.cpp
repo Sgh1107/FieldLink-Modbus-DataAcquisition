@@ -22,6 +22,7 @@
 #include "settingsdialog.h"
 #include "mqttclient.h"    // MQTT 发布端客户端
 #include "devicesimulator.h"   // 模拟设备（Modbus 从站）测试面板
+#include "credentialcodec.h"   // U1：凭据混淆编解码（broker 密码不明文落盘）
 
 #include <QFileDialog>
 #include <QMessageBox>
@@ -1087,7 +1088,9 @@ void MainWindow::initMqttSupport()
         m_appSettings.setValue(QStringLiteral("mqtt/clientId"), clientId);
     }
     const QString username = m_appSettings.value(QStringLiteral("mqtt/username")).toString();
-    const QString password = m_appSettings.value(QStringLiteral("mqtt/password")).toString();
+    // U1：broker 密码混淆存储，读取时解码（兼容历史明文）
+    const QString password = CredentialCodec::decode(
+        m_appSettings.value(QStringLiteral("mqtt/password")).toString());
     const int keepalive = m_appSettings.value(QStringLiteral("mqtt/keepalive"), 60).toInt();
 
     m_mqttClient->setBroker(host, static_cast<quint16>(port));
@@ -1157,7 +1160,8 @@ void MainWindow::showMqttSettings()
     auto *clientEdit = new QLineEdit(m_appSettings.value(QStringLiteral("mqtt/clientId")).toString(), &dialog);
     clientEdit->setPlaceholderText(tr("Leave empty to auto-generate"));
     auto *userEdit = new QLineEdit(m_appSettings.value(QStringLiteral("mqtt/username")).toString(), &dialog);
-    auto *passEdit = new QLineEdit(m_appSettings.value(QStringLiteral("mqtt/password")).toString(), &dialog);
+    auto *passEdit = new QLineEdit(CredentialCodec::decode(
+        m_appSettings.value(QStringLiteral("mqtt/password")).toString()), &dialog);
     passEdit->setEchoMode(QLineEdit::Password);
     auto *prefixEdit = new QLineEdit(
         m_appSettings.value(QStringLiteral("mqtt/topicPrefix"), QStringLiteral("fieldlink/")).toString(), &dialog);
@@ -1195,7 +1199,9 @@ void MainWindow::showMqttSettings()
         if (!clientEdit->text().trimmed().isEmpty())
             m_appSettings.setValue(QStringLiteral("mqtt/clientId"), clientEdit->text().trimmed());
         m_appSettings.setValue(QStringLiteral("mqtt/username"), userEdit->text());
-        m_appSettings.setValue(QStringLiteral("mqtt/password"), passEdit->text());
+        // U1：保存时统一混淆（历史明文在下次保存后升级）
+        m_appSettings.setValue(QStringLiteral("mqtt/password"),
+                               CredentialCodec::encode(passEdit->text()));
         QString prefix = prefixEdit->text();
         if (!prefix.isEmpty() && !prefix.endsWith(QLatin1Char('/')))
             prefix += QLatin1Char('/');
@@ -1211,7 +1217,8 @@ void MainWindow::showMqttSettings()
         m_mqttClient->setCredentials(
             m_appSettings.value(QStringLiteral("mqtt/clientId")).toString(),
             m_appSettings.value(QStringLiteral("mqtt/username")).toString(),
-            m_appSettings.value(QStringLiteral("mqtt/password")).toString());
+            CredentialCodec::decode(
+                m_appSettings.value(QStringLiteral("mqtt/password")).toString()));
         m_mqttClient->setKeepAlive(m_appSettings.value(QStringLiteral("mqtt/keepalive"), 60).toInt());
         m_appSettings.setValue(QStringLiteral("mqtt/enabled"), true);
         m_mqttClient->connectToBroker();

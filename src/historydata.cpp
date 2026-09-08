@@ -16,6 +16,10 @@ HistoryData::~HistoryData()
 
 bool HistoryData::openDatabase(const QString &dbPath)
 {
+    // H1：重复打开直接返回成功，避免 addDatabase 重复连接名警告
+    if (m_db.isValid() && m_db.isOpen())
+        return true;
+
     m_db = QSqlDatabase::addDatabase("QSQLITE", m_connectionName);
     m_db.setDatabaseName(dbPath);
     if (!m_db.open())
@@ -65,9 +69,9 @@ void HistoryData::addRecord(int serverAddress, QModbusDataUnit::RegisterType reg
     if (!m_db.isOpen())
         return;
 
-    static int cleanupCounter = 0;
-    if (++cleanupCounter >= 1000) {
-        cleanupCounter = 0;
+    // H2：清理计数器为实例成员（原来为函数级 static，多实例共享）
+    if (++m_cleanupCounter >= 1000) {
+        m_cleanupCounter = 0;
         clearOlderThan(QDateTime::currentDateTime().addDays(-30));
     }
 

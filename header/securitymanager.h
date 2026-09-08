@@ -13,6 +13,7 @@
 struct SecurityUser {
     QString username;
     QString passwordHash;
+    QString passwordSalt;              // S3：每用户随机盐（空 = 旧版无盐哈希，登录成功后透明升级）
     QString role;
     bool enabled = true;
     bool mustChangePassword = false;   // true = 使用默认/初始密码，登录后强制修改
@@ -67,9 +68,16 @@ public:
     QStringList availablePermissions() const;
 
 private:
+    // 旧版裸 SHA256（仅用于旧数据兼容校验，不再直接生成新凭据）
     QString hashToken(const QString &token) const;
     void ensureDefaults();
     QString hashPassword(const QString &password) const;
+
+    // S3：加盐哈希（SHA256("v1:" + salt + ":" + secret)），防彩虹表预计算
+    QString generateSalt() const;
+    QString saltedHash(const QString &salt, const QString &secret) const;
+    bool isLegacyHash(const QString &hash) const;
+    bool verifySecret(const QString &salt, const QString &storedHash, const QString &secret) const;
 
     QString m_apiTokenHash;
     bool m_remoteWriteEnabled;

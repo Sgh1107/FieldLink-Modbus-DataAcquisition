@@ -27,6 +27,7 @@
 #include "securitymanager.h"
 #include "reliabilitymanager.h"
 #include "mqttclient.h"
+#include "credentialcodec.h"
 #include "dataexporter.h"
 #include "pollmanager.h"
 #include "devicemanager.h"
@@ -67,6 +68,7 @@ public:
     int connackAccepted = 0;
     int connackRejected = 0;
     int pingCount = 0;
+    int pubackSent = 0;
     QVector<QPair<QString, QString>> publishes;   // topic, payload
     QVector<bool> publishRetained;
 
@@ -141,13 +143,27 @@ private:
                 }
                 break;
             }
-            case 3: {   // PUBLISH (QoS0)
+            case 3: {   // PUBLISH (QoS0/QoS1)
                 const bool retain = typeFlags & 0x01;
+                const int qos = (typeFlags >> 1) & 0x03;
                 if (body.size() < 2) return;
                 const int topicLen = (static_cast<unsigned char>(body.at(0)) << 8)
                                      | static_cast<unsigned char>(body.at(1));
                 const QString topic = QString::fromUtf8(body.mid(2, topicLen));
-                const QString payload = QString::fromUtf8(body.mid(2 + topicLen));
+                int payloadOffset = 2 + topicLen;
+                if (qos >= 1) {
+                    // QoS1：剥离报文标识符并回 PUBACK
+                    if (body.size() < payloadOffset + 2) return;
+                    const int packetId = (static_cast<unsigned char>(body.at(payloadOffset)) << 8)
+                                         | static_cast<unsigned char>(body.at(payloadOffset + 1));
+                    ++pubackSent;
+                    QByteArray ackBody;
+                    ackBody.append(static_cast<char>((packetId >> 8) & 0xFF));
+                    ackBody.append(static_cast<char>(packetId & 0xFF));
+                    sendPacket(socket, 4, ackBody);
+                    payloadOffset += 2;
+                }
+                const QString payload = QString::fromUtf8(body.mid(payloadOffset));
                 publishes.append(qMakePair(topic, payload));
                 publishRetained.append(retain);
                 break;
@@ -421,6 +437,23 @@ static void testMqttClient()
     waitMs(200);
     CHECK("主动断开不再重连", !client.isConnectedToBroker());
 
+    // QoS1：PUBLISH 带报文标识符，broker 回 PUBACK 后 published 信号发出
+    broker.publishes.clear();
+    broker.publishRetained.clear();
+    MqttClient qos1Client;
+    int qos1Published = 0;
+    QString qos1Topic;
+    QObject::connect(&qos1Client, &MqttClient::published,
+                     [&](const QString &topic, int) { ++qos1Published; qos1Topic = topic; });
+    qos1Client.setBroker(QStringLiteral("127.0.0.1"), broker.port());
+    qos1Client.setCredentials(QStringLiteral("qos1-client"));
+    qos1Client.setPublishQos(1);
+    QObject::connect(&qos1Client, &MqttClient::connected, [&]() {
+        qos1Client.publish(QStringLiteral("fieldlink/test/qos1"), QByteArray("qos1-payload"));
+    });
+    qos1Client.connectToBroker();
+    waitMs(1000);
+
     // 认证拒绝路径：broker 切换为拒绝模式
     broker.rejectAuth = true;
     MqttClient badClient;
@@ -436,6 +469,15 @@ static void testMqttClient()
     waitMs(800);
     CHECK("broker 拒绝后客户端报错", rejectedSeen);
     CHECK("拒绝后未进入连接态", !badClient.isConnectedToBroker());
+    CHECK("QoS1: broker 收到 PUBLISH", broker.publishes.size() == 1);
+    if (broker.publishes.size() == 1)
+        CHECK("QoS1: 载荷正确（报文标识符已剥离）", broker.publishes[0].second == QStringLiteral("qos1-payload"));
+    CHECK("QoS1: broker 回了 PUBACK", broker.pubackSent == 1);
+    CHECK("QoS1: PUBACK 后 published 信号发出",
+          qos1Published == 1 && qos1Topic == QStringLiteral("fieldlink/test/qos1"));
+    qos1Client.disconnectFromBroker();
+    waitMs(200);
+
     Q_UNUSED(errors); Q_UNUSED(disconnectedSeen);
 }
 
@@ -466,8 +508,26 @@ static void testDataExporter()
     const QString content = QString::fromUtf8(file.readAll());
     file.close();
     CHECK("CSV 表头正确", content.startsWith(QStringLiteral("Timestamp,ServerAddress,RegisterType,StartAddress,Values\n")));
-    CHECK("CSV Coils 行内容", content.contains(QStringLiteral("2026-09-06T10:00:00.000,1,Coils,0,\"1;2;3\"")));
-    CHECK("CSV HoldingRegisters 行内容", content.contains(QStringLiteral("2026-09-06T10:00:01.000,1,HoldingRegisters,10,\"65535\"")));
+    CHECK("CSV Coils 行内容", content.contains(QStringLiteral(
+        "\"2026-09-06T10:00:00.000\",\"1\",\"Coils\",\"0\",\"1;2;3\"")));
+    CHECK("CSV HoldingRegisters 行内容", content.contains(QStringLiteral(
+        "\"2026-09-06T10:00:01.000\",\"1\",\"HoldingRegisters\",\"10\",\"65535\"")));
+
+    // U3 修复：字段含逗号/引号时正确转义，不破坏 CSV 结构（使用独立实例，不影响上面的容量断言）
+    DataExporter exporter2;
+    ExportRecord rComma;
+    rComma.timestamp = QStringLiteral("2026-09-06T10:00:02,5");   // 恶意时间戳（含逗号）
+    rComma.serverAddress = 3; rComma.registerType = QModbusDataUnit::Coils;
+    rComma.startAddress = 1; rComma.values = {7};
+    exporter2.addRecord(rComma);
+    const QString csvPath2 = dir.path() + "/export2.csv";
+    CHECK("U3: 含逗号记录导出成功", exporter2.exportToCsv(csvPath2));
+    QFile file2(csvPath2);
+    CHECK("U3: 第二个 CSV 文件存在", file2.open(QIODevice::ReadOnly | QIODevice::Text));
+    const QString content2 = QString::fromUtf8(file2.readAll());
+    file2.close();
+    CHECK("U3: 逗号字段被引号包裹且行结构完整", content2.contains(QStringLiteral(
+        "\"2026-09-06T10:00:02,5\",\"3\",\"Coils\",\"1\",\"7\"")));
 
     // 容量环绕：保留最新一条
     exporter.setMaxRecords(1);
@@ -527,6 +587,15 @@ static void testPollManager()
     // removeTask
     pm.removeTask(1);
     CHECK("removeTask 生效", pm.tasks().size() == 1);
+
+    // PM1 修复：重复 id 视为更新而非新增
+    PollTask dup2 = t2;
+    dup2.name = QStringLiteral("任务2-更新");
+    dup2.intervalMs = 2000;
+    pm.addTask(dup2);
+    CHECK("PM1: 同 id 不产生重复任务", pm.tasks().size() == 1);
+    CHECK("PM1: 同 id 走更新路径", pm.tasks().first().name == QStringLiteral("任务2-更新")
+          && pm.tasks().first().intervalMs == 2000);
 
     // P2 在途请求保护：请求发出后未回填完成前，同任务 tick 被跳过
     PollManager pm2;
@@ -625,6 +694,19 @@ static void testHistoryData()
     // 清理：未来时间线之前的记录全部清除
     history.clearOlderThan(now.addSecs(60));
     CHECK("clearOlderThan 清空", history.totalRecords() == 0);
+
+    // H1 修复：重复打开直接返回成功且状态正常（不再产生重复连接名警告）
+    CHECK("H1: 重复 openDatabase 返回 true", history.openDatabase(dir.path() + "/history.db"));
+    CHECK("H1: 重复打开后 isOpen", history.isOpen());
+    history.addRecord(3, QModbusDataUnit::InputRegisters, 0, {9});
+    CHECK("H1: 重复打开后可正常写入", history.totalRecords() == 1);
+
+    // H2 修复：清理计数器为实例成员——第二实例独立计数，写入路径正常
+    HistoryData history2;
+    CHECK("H2: 第二实例打开数据库", history2.openDatabase(dir.path() + "/history2.db"));
+    history2.addRecord(1, QModbusDataUnit::Coils, 0, {1});
+    CHECK("H2: 第二实例独立写入正常", history2.totalRecords() == 1);
+
     history.closeDatabase();
     CHECK("关闭后 isOpen=false", !history.isOpen());
 }
@@ -731,15 +813,131 @@ static void testDataParser()
     CHECK("swapBytes", DataParser::swapBytes(0x1234) == 0x3412);
 }
 
+// ---------------- S3 修复：加盐哈希 ----------------
+
+static void testSecuritySaltedHash()
+{
+    printf("\n=== SecurityManager S3 加盐哈希 ===\n");
+    SecurityManager smA;
+    smA.addOrUpdateUser(QStringLiteral("saltuser"), QStringLiteral("pw123456"), QStringLiteral("operator"), true);
+    SecurityManager smB;
+    smB.addOrUpdateUser(QStringLiteral("saltuser"), QStringLiteral("pw123456"), QStringLiteral("operator"), true);
+
+    QString hashA, hashB;
+    for (const auto &u : smA.users())
+        if (u.username == QStringLiteral("saltuser")) hashA = u.passwordHash;
+    for (const auto &u : smB.users())
+        if (u.username == QStringLiteral("saltuser")) hashB = u.passwordHash;
+
+    const QString legacy = QString::fromLatin1(
+        QCryptographicHash::hash(QString(QStringLiteral("pwd:pw123456")).toUtf8(),
+                                 QCryptographicHash::Sha256).toHex());
+    CHECK("S3: 哈希非空", !hashA.isEmpty() && !hashB.isEmpty());
+    CHECK("S3: 相同密码两次哈希结果不同（随机盐）", hashA != hashB);
+    CHECK("S3: 存储哈希不再等于旧裸 SHA256", hashA != legacy && hashB != legacy);
+    CHECK("S3: 加盐后仍可登录", smA.login(QStringLiteral("saltuser"), QStringLiteral("pw123456")));
+    CHECK("S3: 错误密码拒绝", !smA.login(QStringLiteral("saltuser"), QStringLiteral("wrong")));
+    smA.logout();
+
+    // API Token：salt:hash 格式
+    smA.setApiToken(QStringLiteral("tok-abc"));
+    CHECK("S3: 加盐 Token 校验通过", smA.verifyApiToken(QStringLiteral("tok-abc")));
+    CHECK("S3: Token 存储格式为 salt:hash", smA.apiTokenHash().contains(QLatin1Char(':')));
+    CHECK("S3: 错误 Token 拒绝", !smA.verifyApiToken(QStringLiteral("tok-x")));
+
+    // 旧版无盐哈希兼容：手工构造 legacy 配置 → load → 登录成功并透明升级
+    QTemporaryDir dir;
+    CHECK("S3: QTemporaryDir 可用", dir.isValid());
+    const QString iniPath = dir.path() + "/legacy.ini";
+    const QString legacyPwdHash = QString::fromLatin1(
+        QCryptographicHash::hash(QString(QStringLiteral("pwd:oldpw")).toUtf8(),
+                                 QCryptographicHash::Sha256).toHex());
+    {
+        QSettings writer(iniPath, QSettings::IniFormat);
+        writer.setValue("security/users", QStringList() << QStringLiteral("legacyuser"));
+        writer.setValue("security/user/legacyuser/passwordHash", legacyPwdHash);
+        writer.setValue("security/user/legacyuser/role", QStringLiteral("operator"));
+        writer.setValue("security/user/legacyuser/enabled", true);
+    }
+    SecurityManager smC;
+    QSettings settings(iniPath, QSettings::IniFormat);
+    smC.load(settings);
+    CHECK("S3: 旧版无盐哈希用户可登录（兼容）", smC.login(QStringLiteral("legacyuser"), QStringLiteral("oldpw")));
+    smC.logout();
+    QString upgradedHash, upgradedSalt;
+    for (const auto &u : smC.users())
+        if (u.username == QStringLiteral("legacyuser")) { upgradedHash = u.passwordHash; upgradedSalt = u.passwordSalt; }
+    CHECK("S3: 登录后透明升级为加盐哈希", !upgradedSalt.isEmpty() && upgradedHash != legacyPwdHash);
+}
+
+// ---------------- A3 修复：BitSet/BitClear 位号越界防护 ----------------
+
+static void testAlarmBitGuard()
+{
+    printf("\n=== AlarmManager A3 位号越界防护 ===\n");
+    AlarmManager am;
+    int triggered = 0;
+    QObject::connect(&am, &AlarmManager::alarmTriggered, [&](const AlarmEvent &) { ++triggered; });
+
+    AlarmRule base;
+    base.enabled = true; base.serverAddress = 9; base.registerType = 4;
+    base.severity = AlarmSeverity::Info; base.debounceMs = 0;
+    base.acknowledged = false; base.threshold2 = 0;
+
+    // 合法位号 bit5：值 32 = 1<<5，BitSet 语义验证
+    AlarmRule rBit5 = base;
+    rBit5.name = QStringLiteral("bit5"); rBit5.address = 0;
+    rBit5.condition = AlarmCondition::BitSet; rBit5.threshold1 = 5;
+    am.addRule(rBit5);
+    am.checkValue(9, 4, 0, 32.0);
+    CHECK("A3: bit5 BitSet 正常触发", triggered == 1);
+    am.checkValue(9, 4, 0, 0.0);
+    CHECK("A3: bit5 BitSet 回落清除", am.activeAlarmCount() == 0);
+
+    // 越界位号（>31 或 <0）：不得触发、不得 UB（原实现 1 << 越界为未定义行为）
+    AlarmRule rOver = base;
+    rOver.name = QStringLiteral("bit32"); rOver.address = 1;
+    rOver.condition = AlarmCondition::BitSet; rOver.threshold1 = 32;
+    am.addRule(rOver);
+    AlarmRule rNeg = base;
+    rNeg.name = QStringLiteral("bitneg"); rNeg.address = 2;
+    rNeg.condition = AlarmCondition::BitClear; rNeg.threshold1 = -1;
+    am.addRule(rNeg);
+    am.checkValue(9, 4, 1, 5.0);
+    am.checkValue(9, 4, 2, 5.0);
+    CHECK("A3: 越界位号不触发（无 UB）", triggered == 1 && am.activeAlarmCount() == 0);
+}
+
+// ---------------- U1 修复：凭据混淆编解码 ----------------
+
+static void testCredentialCodec()
+{
+    printf("\n=== CredentialCodec U1 凭据混淆 ===\n");
+    const QString plain = QStringLiteral("broker-Pass!123");
+    const QString encoded = CredentialCodec::encode(plain);
+    CHECK("U1: 编码结果带前缀", encoded.startsWith(QStringLiteral("enc:v1:")));
+    CHECK("U1: 编码后不含明文", !encoded.contains(plain));
+    CHECK("U1: 解码回环", CredentialCodec::decode(encoded) == plain);
+    CHECK("U1: 历史明文原样透传", CredentialCodec::decode(plain) == plain);
+    CHECK("U1: 空串处理", CredentialCodec::encode(QString()).isEmpty()
+          && CredentialCodec::decode(QString()).isEmpty());
+    CHECK("U1: 同一明文编码稳定", CredentialCodec::encode(plain) == encoded);
+    const QString zh = QStringLiteral("密码abc");
+    CHECK("U1: UTF-8 回环", CredentialCodec::decode(CredentialCodec::encode(zh)) == zh);
+}
+
 int main(int argc, char *argv[])
 {
     QCoreApplication app(argc, argv);
     printf("==== FieldLink master 测试套件 ====\n");
 
     testAlarmManager();
+    testAlarmBitGuard();
     testSecurityManager();
+    testSecuritySaltedHash();
     testReliabilityManager();
     testMqttClient();
+    testCredentialCodec();
     testDataExporter();
     testPollManager();
     testDeviceManager();

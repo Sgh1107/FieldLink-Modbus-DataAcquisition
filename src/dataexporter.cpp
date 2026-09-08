@@ -4,6 +4,18 @@
 #include <QDateTime>
 #include <QtGlobal>
 
+namespace {
+
+// U3：CSV 字段统一加引号并转义内部引号（双写），避免字段内容含逗号/引号破坏 CSV 结构
+QString csvField(const QString &raw)
+{
+    QString field = raw;
+    field.replace(QLatin1Char('"'), QStringLiteral("\"\""));
+    return QLatin1Char('"') + field + QLatin1Char('"');
+}
+
+} // namespace
+
 DataExporter::DataExporter(QObject *parent) : QObject(parent) {}
 
 void DataExporter::addRecord(const ExportRecord &record)
@@ -48,11 +60,11 @@ bool DataExporter::exportToCsv(const QString &filePath) const
         for (quint16 v : rec.values)
             valStrs.append(QString::number(v));
 
-        out << rec.timestamp << ","
-            << rec.serverAddress << ","
-            << typeStr << ","
-            << rec.startAddress << ","
-            << "\"" << valStrs.join(";") << "\"\n";
+        out << csvField(rec.timestamp) << ","
+            << csvField(QString::number(rec.serverAddress)) << ","
+            << csvField(typeStr) << ","
+            << csvField(QString::number(rec.startAddress)) << ","
+            << csvField(valStrs.join(";")) << "\n";
     }
 
     file.close();
