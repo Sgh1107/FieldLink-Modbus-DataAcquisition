@@ -6,7 +6,7 @@
 
 ## 一、功能概述
 
-FieldLink 内置了一个**极简 MQTT 3.1.1 发布端客户端**（QoS 0），无需引入任何第三方库，即可把采集数据与报警事件实时上送到 MQTT broker，供组态软件、IoT 平台、Python 脚本等订阅消费。
+FieldLink 内置了一个**极简 MQTT 3.1.1 发布端客户端**（QoS 0/1），无需引入任何第三方库，即可把采集数据与报警事件实时上送到 MQTT broker，供组态软件、IoT 平台、Python 脚本等订阅消费。（完整使用说明见 `doc/USAGE.md`）
 
 **主题结构**（前缀可配置，默认 `fieldlink/`）：
 
@@ -58,9 +58,9 @@ python slave\mqtt_test_broker.py --port 1883 --user test --pass secret
 
 ## 五、已知边界（刻意精简）
 
-- 仅实现**发布端 QoS 0**（遥测高频数据的标准选择），无订阅/无 PUBACK 重发
+- 发布端 QoS 0（即发即弃）/ **QoS 1**（报文标识符 + PUBACK 确认，2 秒超时 DUP 重发，重发 5 次仍无确认则丢弃并告警）；无订阅
 - MQTT 3.1.1（协议级别 4），兼容 mosquitto / EMQX / HiveMQ 等主流 broker
-- 密码以明文存于本地 QSettings（与大多数桌面工具一致），如需加密存储可后续接入 SecurityManager
+- broker 密码经 `header/credentialcodec.h` 混淆后存于本地 QSettings（`enc:v1:` 前缀，历史明文读取时兼容），如需强加密可后续接入系统凭据库
 
-> 本实现已通过线缆级协议自测：CONNECT/CONNACK、QoS0 发布、retain 标志、PINGREQ 心跳、
-> 认证拒绝处理，均使用 mini broker 逐字节验证。
+> 本实现已通过线缆级协议自测：CONNECT/CONNACK、QoS0/QoS1 发布、PUBACK、retain 标志、
+> PINGREQ 心跳、认证拒绝处理、断连静默丢弃，均使用进程内 mini broker 逐字节验证（155 项回归）。
