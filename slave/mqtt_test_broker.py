@@ -4,12 +4,12 @@
 FieldLink MQTT 测试用迷你 broker（纯 Python 标准库，零依赖）
 
 【使用方式】
-  python slave/mqtt_test_broker.py                       # 监听 0.0.0.0:1883
-  python slave/mqtt_test_broker.py --port 11883          # 指定端口
-  python slave/mqtt_test_broker.py --user test --pass secret   # 开启认证校验
+  python slave/mqtt_test_broker.py                                  # 监听 0.0.0.0:1883
+  python slave/mqtt_test_broker.py --port 11883                     # 指定端口
+  python slave/mqtt_test_broker.py --user admin --pass admin123     # 开启认证校验
 
 【连接方法】
-  FieldLink 菜单 Advanced → MQTT Publishing，Broker 地址填 127.0.0.1:<端口>，
+  FieldLink 菜单 Advanced → MQTT Publishing，Broker 地址填 127.0.0.1:<端口>
   若 broker 开启了认证则填同样的用户名/密码 → 保存并连接。
   本脚本会把收到的每条 PUBLISH 打印到控制台，便于核对上送数据。
 
@@ -30,6 +30,8 @@ import threading
 import signal
 import sys
 
+# 客户端 socket 接收超时时间（秒），用于定期检查运行标志
+CLIENT_SOCKET_TIMEOUT = 1.0
 
 def log(message: str) -> None:
     print(message, flush=True)
@@ -44,11 +46,12 @@ class MiniBroker:
         # 订阅表：socket -> set(topic)
         self.subscriptions: dict[socket.socket, set[str]] = {}
         self.lock = threading.Lock()
-        self.running = True  # 新增：运行标志
-        self.server_socket: socket.socket | None = None  # 新增：保存服务器socket引用
+        self.running = True
+        self.server_socket: socket.socket | None = None  # 保存服务器socket引用
+        # 用于协调线程退出的停止事件
+        self.stop_event = threading.Event()
 
     # ---------- MQTT 编解码辅助 ----------
-
     @staticmethod
     def recv_exact(sock: socket.socket, size: int) -> bytes | None:
         buf = b""
@@ -64,7 +67,7 @@ class MiniBroker:
 
     @staticmethod
     def recv_packet(sock: socket.socket) -> tuple[int, bytes] | None:
-        """读取一个 MQTT 控制包，返回 (类型|标志, 包体)；连接关闭返回 None。"""
+        """ 读取一个 MQTT 控制包，返回 (类型|标志, 包体)；连接关闭返回 None """
         first = MiniBroker.recv_exact(sock, 1)
         if first is None:
             log("RECV-EOF first-byte")
@@ -98,13 +101,21 @@ class MiniBroker:
         return struct.pack(">H", len(raw)) + raw
 
     # ---------- 服务端行为 ----------
-
     def handle_client(self, sock: socket.socket, addr) -> None:
         client_id = "?"
         log(f"ACCEPT addr={addr[0]}:{addr[1]}")
+        # 设置 socket 超时，使 recv 不会永久阻塞
+        sock.settimeout(CLIENT_SOCKET_TIMEOUT)
         try:
-            while self.running:  # 检查运行标志
-                packet = self.recv_packet(sock)
+            while self.running:
+                try:
+                    packet = self.recv_packet(sock)
+                except socket.timeout:
+                    # 超时是为了检查运行标志，继续循环
+                    continue
+                except (ConnectionError, OSError):
+                    break
+                
                 if packet is None:
                     break
                 type_flags, body = packet
@@ -181,13 +192,34 @@ class MiniBroker:
             sock.close()
 
     def forward(self, topic: str, payload: bytes) -> None:
-        """把 PUBLISH 转发给主题匹配的订阅者（支持 '+' 单层通配）。"""
+        """
+        把 PUBLISH 转发给主题匹配的订阅者。
+        支持 MQTT 通配符：
+        - '+' 匹配单层
+        - '#' 匹配多层（必须放在最后）
+        """
         def matches(sub: str) -> bool:
             sub_parts = sub.split("/")
             pub_parts = topic.split("/")
+            # 处理 # 通配符（必须出现在订阅主题的最后）
+            if sub_parts[-1] == "#":
+                # 如果订阅是 "sensors/#"，可以匹配 "sensors/temp" 和 "sensors/temp/inside"
+                # 要求前面的部分必须完全匹配
+                if len(sub_parts) - 1 > len(pub_parts):
+                    return False
+                # 检查前面的部分是否匹配（不包括最后的 #）
+                for i in range(len(sub_parts) - 1):
+                    if sub_parts[i] != "+" and sub_parts[i] != pub_parts[i]:
+                        return False
+                return True
+            # 没有 # 通配符，层数必须相同
             if len(sub_parts) != len(pub_parts):
                 return False
-            return all(s == "+" or s == p for s, p in zip(sub_parts, pub_parts))
+            # 逐层匹配，支持 + 通配符
+            for s, p in zip(sub_parts, pub_parts):
+                if s != "+" and s != p:
+                    return False
+            return True
 
         frame = b"\x30" + self._remaining(len(self.encode_string(topic)) + len(payload)) \
             + self.encode_string(topic) + payload
@@ -213,7 +245,7 @@ class MiniBroker:
                 return out
 
     def stop(self) -> None:
-        """停止broker"""
+        """停止 broker，设置停止事件并关闭服务器 socket"""
         log("正在停止 MQTT broker...")
         self.running = False
         # 关闭服务器socket以解除accept阻塞
@@ -233,27 +265,41 @@ class MiniBroker:
             f"(认证={'开启' if self.username else '关闭'})")
         log("按 Ctrl+C 停止服务")
 
-        # 设置非阻塞模式以便检查运行标志
-        self.server_socket.settimeout(1.0)
+        # 服务器 socket 也设置超时，定期检查停止事件
+        self.server_socket.settimeout(CLIENT_SOCKET_TIMEOUT)
 
-        while self.running:
+        while self.running and not self.stop_event.is_set():
             try:
                 client, addr = self.server_socket.accept()
-                # 检查是否在停止过程中
-                if not self.running:
+                # 快速检查是否在停止过程中
+                if not self.running or self.stop_event.is_set():
                     client.close()
                     break
-                threading.Thread(target=self.handle_client, args=(client, addr), daemon=True).start()
+                # 为每个客户端创建线程，传递停止事件引用
+                thread = threading.Thread(
+                    target=self.handle_client, 
+                    args=(client, addr), 
+                    daemon=True
+                )
+                thread.start()
             except socket.timeout:
-                # 超时是为了能够检查running标志
+                # 超时是为了检查停止事件
                 continue
             except OSError:
-                # socket被关闭，跳出循环
+                # socket 被关闭，跳出循环
                 break
+        
+        # 等待所有客户端线程结束（给它们一点时间）
+        log("正在等待客户端断开...")
+        # 由于客户端线程设置了超时，它们会在检查到 stop_event 后自行退出
+        # 等待主线程中的所有非守护线程结束
+        for thread in threading.enumerate():
+            if thread is not threading.main_thread() and thread.daemon:
+                thread.join(timeout=0.5)
 
 
 def signal_handler(broker: MiniBroker):
-    """信号处理函数，用于优雅地停止broker"""
+    """ 信号处理函数用于优雅地停止broker """
     def handler(signum, frame):
         log(f"\n收到终止信号 (Signal {signum})")
         broker.stop()

@@ -110,8 +110,13 @@ void MqttClient::connectToBroker()
         emit errorOccurred(tr("MQTT broker address is not configured"));
         return;
     }
-    if (m_socket->state() != QAbstractSocket::UnconnectedState)
-        return;                                     // 连接中/已连接：忽略重复请求
+    if (m_socket->state() == QAbstractSocket::ConnectingState) {
+        // 上一次连接尝试还没结果（如 broker 未就绪时的挂起连接）：
+        // 中止它，立即用当前配置重连，避免用户再点"保存并连接"没有反应
+        m_socket->abort();
+    } else if (m_socket->state() != QAbstractSocket::UnconnectedState) {
+        return;                                     // 已连接：忽略重复请求
+    }
 
     m_userRequestedDisconnect = false;
     m_brokerConnected = false;
@@ -157,6 +162,16 @@ void MqttClient::onSocketError(QAbstractSocket::SocketError error)
     Q_UNUSED(error);
     if (m_socket->error() != QAbstractSocket::RemoteHostClosedError)
         emit errorOccurred(tr("MQTT connection error: %1").arg(m_socket->errorString()));
+
+    // 连接阶段失败（broker 未启动/地址不可达/端口错误等）：TCP 从未连上，
+    // 不会触发 disconnected()，这里兜底启动自动重连循环——否则状态会永远
+    // 卡在"连接中"，之后再启动 broker 也不会重试。
+    // 注意：errorOccurred 发出时 socket 状态往往还是 ConnectingState（尚未切到
+    // Unconnected），因此这里不检查状态；重连定时器触发时自带状态校验，
+    // 且 scheduleReconnect 对"定时器已在跑"幂等。认证被拒等不可恢复错误已在
+    // handleConnack 里置 m_userRequestedDisconnect，不会进入重试。
+    if (!m_userRequestedDisconnect && !m_brokerConnected)
+        scheduleReconnect();
 }
 
 void MqttClient::onReconnectTimer()

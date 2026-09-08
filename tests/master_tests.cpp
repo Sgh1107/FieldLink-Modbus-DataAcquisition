@@ -478,6 +478,44 @@ static void testMqttClient()
     qos1Client.disconnectFromBroker();
     waitMs(200);
 
+    // 连接阶段失败后的自动重连兜底：先对一个"无服务"端口发起连接（必失败），
+    // 失败后应进入 5 秒重连循环；期间把目标换到真实 broker，重连应自动成功
+    {
+        broker.rejectAuth = false;   // 恢复上面的认证拒绝测试切换的模式
+        QTcpServer probe;
+        CHECK("重连测试探针监听", probe.listen(QHostAddress::LocalHost));
+        const quint16 emptyPort = probe.serverPort();
+        probe.close();   // 关闭后该端口无服务
+
+        MqttClient retryClient;
+        int retryConnected = 0;
+        QString retryLastError;
+        QObject::connect(&retryClient, &MqttClient::connected,
+                         [&]() { ++retryConnected; });
+        QObject::connect(&retryClient, &MqttClient::errorOccurred,
+                         [&](const QString &m) { retryLastError = m;
+                             printf("  [retry-error] %s\n", qPrintable(m)); });
+        retryClient.setBroker(QStringLiteral("127.0.0.1"), emptyPort);
+        retryClient.setCredentials(QStringLiteral("retry-client"));
+        retryClient.connectToBroker();
+        waitMs(600);   // 第一次连接失败（connection refused）
+        printf("  [retry-debug] after 600ms: connected=%d lastError=%s\n",
+               retryConnected, qPrintable(retryLastError));
+        CHECK("连接失败后进入重连循环", !retryClient.isConnectedToBroker());
+
+        retryClient.setBroker(QStringLiteral("127.0.0.1"), broker.port());   // broker 此时才"上线"
+        // 注：Windows 上对无服务端口的连接拒绝要 ~3 秒才返回，之后才进入 5s 重连周期
+        waitMs(3500);  // 期间应收到第一次 refused 错误
+        printf("  [retry-debug] after +3500ms: connected=%d lastError=%s\n",
+               retryConnected, qPrintable(retryLastError));
+        waitMs(6000);  // 覆盖 5s 重连周期（自 refused 到达起算）
+        printf("  [retry-debug] after +9500ms: connected=%d lastError=%s\n",
+               retryConnected, qPrintable(retryLastError));
+        CHECK("连接阶段失败后自动重连成功", retryConnected >= 1 && retryClient.isConnectedToBroker());
+        retryClient.disconnectFromBroker();
+        waitMs(200);
+    }
+
     Q_UNUSED(errors); Q_UNUSED(disconnectedSeen);
 }
 

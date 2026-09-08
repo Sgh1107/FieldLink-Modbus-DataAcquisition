@@ -71,6 +71,8 @@ private:
     void logMessage(const QString &line, int level = 1) const;
     void updateConnectionChip(bool connected);   // 顶部状态胶囊（红/绿）
     void applyLanguage(const QString &lang);     // 应用界面语言（zh_CN / en）
+    bool sendReadRequests(bool clearResult);     // 发起分段读取；clearResult=先清空结果列表
+    void updateAutoReadIndicator(bool on);       // 定时读取可见状态指示（状态栏常驻标签）
 
 private slots:
     void on_connectButton_clicked();
@@ -148,6 +150,9 @@ private:
     MqttClient *m_mqttClient = nullptr;            // MQTT 发布端客户端
     DeviceSimulatorPanel *m_deviceSimulatorPanel = nullptr;   // 模拟设备面板
     class QTimer *m_autoReadTimer = nullptr;       // 实时读取定时轮询
+    bool m_autoReadBusy = false;                   // 定时读取在途保护：上一 tick 未完成则跳过
+    bool m_readUpdatesInPlace = false;             // true=定时读取按地址原地刷新行；false=手动读取追加
+    class QLabel *m_autoReadIndicator = nullptr;   // 定时读取常驻状态指示（状态栏右侧）
     QMap<int, int> m_pointChartSeriesMap;
     QMap<int, int> m_pointDashboardGaugeMap;
     int m_lastModbusState = -1;        // 上一次 Modbus 连接状态（识别"曾连接后意外断线"）

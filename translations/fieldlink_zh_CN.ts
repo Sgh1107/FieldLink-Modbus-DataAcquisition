@@ -597,6 +597,30 @@
         <source>Connect first before enabling auto read</source>
         <translation>请先连接设备再开启定时读取</translation>
     </message>
+    <message>
+        <source>Connection Closed</source>
+        <translation>连接已断开</translation>
+    </message>
+    <message>
+        <source>The server has closed the connection (%1).
+
+Do you want to reconnect?</source>
+        <translation>服务器已主动断开连接（%1）。
+
+是否重新连接？</translation>
+    </message>
+    <message>
+        <source>Reconnect declined; press Connect to dial again</source>
+        <translation>已取消自动重连：请点击「Connect」手动重连</translation>
+    </message>
+    <message>
+        <source>Auto reading every %1 ms (uncheck to stop)</source>
+        <translation>自动读取中：每 %1 ms（取消勾选停止）</translation>
+    </message>
+    <message>
+        <source>● Auto reading every %1 ms (uncheck to stop) — last update %2</source>
+        <translation>● 自动读取中：每 %1 ms（取消勾选停止）— 最后更新 %2</translation>
+    </message>
 </context>
 <context>
     <name>MqttClient</name>

@@ -43,11 +43,8 @@ import signal
 import sys
 
 # ---------------- 数据模型 ----------------
-
-
 class DataStore:
-    """模拟从站数据区，后台线程让数值持续变化，方便观察曲线与报警。"""
-
+    """ 模拟从站数据区，后台线程让数值持续变化，方便观察曲线与报警 """
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.holding: list[int] = [0] * 100
@@ -56,7 +53,7 @@ class DataStore:
         self.discrete: list[bool] = [False] * 32
         self._t0 = time.time()
         self._walk = 1000
-        self.running = True  # 新增：运行标志
+        self.running = True
         threading.Thread(target=self._tick, daemon=True).start()
 
     def _tick(self) -> None:
@@ -106,7 +103,6 @@ class DataStore:
 
 
 # ---------------- Modbus TCP 协议 ----------------
-
 FC_READ_COILS = 0x01
 FC_READ_DISCRETE = 0x02
 FC_READ_HOLDING = 0x03
@@ -244,7 +240,6 @@ def recv_exact(sock: socket.socket, size: int) -> bytes | None:
 
 
 # ---------------- 内置协议自检 ----------------
-
 def selftest(port: int, unit: int) -> int:
     """不依赖 FieldLink，用内置客户端验证模拟器协议实现的正确性。"""
     store = DataStore()

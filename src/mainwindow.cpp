@@ -35,6 +35,9 @@ using QModbusRtuSerialClient = QModbusRtuSerialMaster;
 #endif
 #include <QStandardItemModel>
 #include <QStatusBar>
+#include <QLabel>
+#include <QDateTime>
+#include <QTime>
 #include <QUrl>
 #include <QIcon>
 #include <QSerialPortInfo>
@@ -90,7 +93,22 @@ MainWindow::MainWindow(QWidget *parent)
     connect(ui->autoReadInterval, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (m_autoReadTimer->isActive())
             m_autoReadTimer->setInterval(value);
+        if (m_autoReadIndicator && m_autoReadIndicator->isVisible())
+            updateAutoReadIndicator(true);   // 运行中间隔变化时同步指示文案
     });
+
+    // 定时读取常驻指示：状态栏右侧红点标签，比底部小字更醒目
+    m_autoReadIndicator = new QLabel(this);
+    m_autoReadIndicator->setStyleSheet(QStringLiteral("color:#e74c3c; font-weight:bold; padding:0 8px;"));
+    m_autoReadIndicator->hide();
+    statusBar()->addPermanentWidget(m_autoReadIndicator);
+
+    // 「定时读取」勾选框做成醒目的胶囊开关：平时灰边框，勾选后绿底白字
+    ui->autoReadCheck->setStyleSheet(QStringLiteral(
+        "QCheckBox{font-weight:bold; font-size:13px; padding:4px 12px;"
+        "  border:2px solid #95a5a6; border-radius:14px;}"
+        "QCheckBox:hover{border-color:#27ae60;}"
+        "QCheckBox:checked{color:white; background-color:#27ae60; border-color:#27ae60;}"));
 
     ui->readValue->setAlternatingRowColors(true);
     ui->writeValueTable->setAlternatingRowColors(true);
@@ -383,8 +401,22 @@ void MainWindow::on_readButton_clicked()
 {
     if (!modbusDevice)
         return;
-    ui->readValue->clear();
+    m_readUpdatesInPlace = false;   // 手动读取：清空列表重新列出
     statusBar()->clearMessage();
+    sendReadRequests(true);   // 手动读取：先清空结果列表
+}
+
+/** @brief 发起分段读取
+ *  @param clearResult true  : 手动读取语义，发送前清空「读取结果」列表
+ *  @param clearResult false : 定时读取语义，滚动追加，值变化肉眼可见且不闪屏
+ *  @return 返回是否成功发出了至少一个请求
+ */
+bool MainWindow::sendReadRequests(bool clearResult)
+{
+    if (!modbusDevice)
+        return false;
+    if (clearResult)
+        ui->readValue->clear();
 
     // 分段读取
     const auto req = readRequest();
@@ -408,10 +440,12 @@ void MainWindow::on_readButton_clicked()
     };
 
     const auto segments = makeReadSegments(req.registerType(), req.startAddress(), req.valueCount());
+    bool sent = false;
     for (const auto &seg : segments) {
         logMessage(QStringLiteral("READ[%1] addr=%2 count=%3")
                    .arg(seg.registerType()).arg(seg.startAddress()).arg(seg.valueCount()));
         if (auto *reply = modbusDevice->sendReadRequest(seg, ui->serverEdit->value())) {
+            sent = true;
             if (!reply->isFinished())
                 connect(reply, &QModbusReply::finished, this, &MainWindow::readReady);
             else
@@ -420,6 +454,7 @@ void MainWindow::on_readButton_clicked()
             statusBar()->showMessage(tr("Read error: ") + modbusDevice->errorString(), 5000);
         }
     }
+    return sent;
 }
 
 void MainWindow::readReady()
@@ -432,17 +467,70 @@ void MainWindow::readReady()
         const QModbusDataUnit unit = reply->result();
         ui->readValue->setUpdatesEnabled(false);
         QListWidgetItem *lastItem = nullptr;
+        QVector<quint16> raw;
+        raw.reserve(static_cast<int>(unit.valueCount()));
         for (uint i = 0; i < unit.valueCount(); i++) {
-            const QString entry = tr("Address: %1, Value: %2").arg(unit.startAddress() + i)
-                                     .arg(QString::number(unit.value(i),
+            const int addr = unit.startAddress() + static_cast<int>(i);
+            const quint16 val = unit.value(i);
+            const QString entry = tr("Address: %1, Value: %2").arg(addr)
+                                     .arg(QString::number(val,
                                           unit.registerType() <= QModbusDataUnit::Coils ? 10 : 16));
-            lastItem = new QListWidgetItem(entry);
-            ui->readValue->addItem(lastItem);
+            raw.append(val);
+
+            QListWidgetItem *item = nullptr;
+            if (m_readUpdatesInPlace) {
+                // 定时读取：按地址匹配既有行，原地刷新数值，不追加新记录
+                for (int r = 0; r < ui->readValue->count(); ++r) {
+                    QListWidgetItem *row = ui->readValue->item(r);
+                    if (row->data(Qt::UserRole).toInt() == addr) {
+                        item = row;
+                        break;
+                    }
+                }
+                if (item) {
+                    item->setText(entry);
+                    continue;   // 行数与顺序保持不变
+                }
+                // 首次读到该地址：先追加一行，之后一直原地刷新
+            }
+
+            item = new QListWidgetItem(entry);
+            item->setData(Qt::UserRole, addr);
+            ui->readValue->addItem(item);
+            lastItem = item;
         }
         ui->readValue->setUpdatesEnabled(true);
         if (lastItem)
             ui->readValue->scrollToItem(lastItem, QAbstractItemView::PositionAtBottom);
         logMessage(QStringLiteral("READ-OK addr=%1 count=%2").arg(unit.startAddress()).arg(unit.valueCount()));
+
+        // 同步驱动可视化/存档/报警：让手动读、定时读取与轮询路径行为一致。
+        // 此前只有轮询任务会喂点位模型/历史库/报警，定时读取读到的值
+        // 不会反映到曲线/仪表盘，也不会触发报警规则。
+        const int server = ui->serverEdit->value();
+        if (m_pointModel && !raw.isEmpty())
+            m_pointModel->updateFromRaw(server, unit.registerType(), unit.startAddress(), raw);
+        if (m_historyData && m_historyData->isOpen() && !raw.isEmpty())
+            m_historyData->addRecord(server, unit.registerType(), unit.startAddress(), raw);
+        if (m_dataExporter && !raw.isEmpty()) {
+            ExportRecord rec;
+            rec.timestamp = QDateTime::currentDateTime().toString(Qt::ISODateWithMs);
+            rec.serverAddress = server;
+            rec.registerType = unit.registerType();
+            rec.startAddress = unit.startAddress();
+            rec.values = raw;
+            m_dataExporter->addRecord(rec);
+        }
+        if (m_alarmManager) {
+            for (int i = 0; i < raw.size(); ++i)
+                m_alarmManager->checkValue(server, static_cast<int>(unit.registerType()),
+                                           unit.startAddress() + i, raw[i]);
+        }
+        // 定时读取运行中：指示标签显示最后成功更新时间，方便确认"确实在读"
+        if (m_autoReadTimer->isActive() && m_autoReadIndicator)
+            m_autoReadIndicator->setText(tr("● Auto reading every %1 ms (uncheck to stop) — last update %2")
+                                             .arg(ui->autoReadInterval->value())
+                                             .arg(QTime::currentTime().toString(QStringLiteral("hh:mm:ss"))));
     } else if (reply->error() == QModbusDevice::ProtocolError) {
         statusBar()->showMessage(tr("Read response error: %1 (Mobus exception: 0x%2)").
                                     arg(reply->errorString()).
@@ -455,6 +543,7 @@ void MainWindow::readReady()
         logMessage(QStringLiteral("READ-ERR %1 code=0x%2").arg(reply->errorString()).arg(reply->error(), -1, 16));
     }
 
+    m_autoReadBusy = false;   // 本 tick 的读取已结束（成功或失败），允许下一个 tick
     reply->deleteLater();
 }
 
@@ -467,23 +556,53 @@ void MainWindow::onAutoReadToggled(bool checked)
             statusBar()->showMessage(tr("Connect first before enabling auto read"), 3000);
             return;
         }
+        m_autoReadBusy = false;
         m_autoReadTimer->setInterval(ui->autoReadInterval->value());
         m_autoReadTimer->start();
+        updateAutoReadIndicator(true);
+        statusBar()->showMessage(tr("Auto reading every %1 ms (uncheck to stop)")
+                                     .arg(ui->autoReadInterval->value()), 4000);
         logMessage(QStringLiteral("定时读取已开启：每 %1 ms").arg(ui->autoReadInterval->value()));
+        // 立即触发第一次读取，不用干等一个周期就能看到值刷新
+        QTimer::singleShot(0, this, &MainWindow::onAutoReadTimeout);
     } else {
         m_autoReadTimer->stop();
+        m_autoReadBusy = false;
+        updateAutoReadIndicator(false);
         logMessage(QStringLiteral("定时读取已关闭"));
     }
 }
 
-// 定时到点：复用手动读取的分段读取逻辑（结果仍进入「读取结果」列表）
+// 定时读取状态指示：状态栏常驻红点标签，一眼可见是否在轮询
+void MainWindow::updateAutoReadIndicator(bool on)
+{
+    if (!m_autoReadIndicator)
+        return;
+    if (on) {
+        m_autoReadIndicator->setText(tr("● Auto reading every %1 ms (uncheck to stop)")
+                                         .arg(ui->autoReadInterval->value()));
+        m_autoReadIndicator->show();
+    } else {
+        m_autoReadIndicator->hide();
+    }
+}
+
+// 定时到点：发起一次读取。带在途保护——上一 tick 未完成时跳过本次，
+// 避免短间隔下请求堆积导致响应越来越慢甚至失败。
 void MainWindow::onAutoReadTimeout()
 {
     if (!modbusDevice || modbusDevice->state() != QModbusDevice::ConnectedState) {
         ui->autoReadCheck->setChecked(false);
         return;
     }
-    on_readButton_clicked();
+    if (m_autoReadBusy)
+        return;   // 在途保护：跳过本 tick
+
+    m_readUpdatesInPlace = true;   // 定时读取：按地址原地刷新既有行，不追加新记录
+    if (!sendReadRequests(false))
+        m_autoReadBusy = false;   // 一条都没发出去（如设备繁忙），下一 tick 重试
+    else
+        m_autoReadBusy = true;    // readReady 回调里复位
 }
 
 void MainWindow::on_writeButton_clicked()

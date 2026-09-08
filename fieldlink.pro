@@ -69,6 +69,7 @@ HEADERS  += header/mainwindow.h \
         header/crashlogger.h \
         header/thememanager.h \
         header/mqttclient.h \
+        header/credentialcodec.h \
         header/devicesimulator.h
 
 FORMS    += mainwindow.ui \
