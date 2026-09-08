@@ -20,9 +20,9 @@
 #include "deliverymanager.h"
 #include "logviewer.h"
 #include "settingsdialog.h"
-#include "mqttclient.h"    // MQTT 发布端客户端
-#include "devicesimulator.h"   // 模拟设备（Modbus 从站）测试面板
-#include "credentialcodec.h"   // U1：凭据混淆编解码（broker 密码不明文落盘）
+#include "mqttclient.h"         // MQTT 发布端客户端
+#include "devicesimulator.h"    // 模拟设备（Modbus 从站）测试面板
+#include "credentialcodec.h"    // U1：凭据混淆编解码（broker 密码不明文落盘）
 
 #include <QFileDialog>
 #include <QMessageBox>

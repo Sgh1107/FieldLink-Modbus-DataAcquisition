@@ -1,7 +1,4 @@
-// main.cpp
-// 应用程序入口文件
-
-#include "mainwindow.h"  // 包含主窗口头文件
+#include "mainwindow.h"
 #include "crashlogger.h"
 #include "thememanager.h"  // 主题管理器（Fusion + Palette + QSS 三层主题方案）
 
@@ -17,12 +14,9 @@ int main(int argc, char *argv[])
     // 这里启用所有qt.modbus前缀的日志输出（调试时有用）
     QLoggingCategory::setFilterRules(QStringLiteral("qt.modbus* = true"));
 
-    // 创建Qt应用程序对象
-    // argc: 命令行参数数量
-    // argv: 命令行参数数组
     QApplication a(argc, argv);
     a.setApplicationName("fieldlink");
-    a.setApplicationVersion("2.1.0");
+    a.setApplicationVersion("1.0.0");
     CrashLogger::install();
 
     // ---------- 界面主题初始化 ----------
@@ -39,14 +33,9 @@ int main(int argc, char *argv[])
         ThemeManager::applyTheme(theme);
     }
 
-    // 创建应用程序主窗口
     MainWindow w;
-
-    // 设置应用程序窗口图标
-    // ":/images/logo.ico" 是资源文件路径（需在.qrc文件中定义）
+    // ":/images/logo.ico" 是资源文件路径（在.qrc文件中定义）
     w.setWindowIcon(QIcon(":/images/logo.ico"));
-
-    // 显示主窗口
     w.show();
 
     // 进入Qt主事件循环
