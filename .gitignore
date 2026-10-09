@@ -8,3 +8,5 @@ __pycache__/
 
 fieldlink.pro.user*
 .qm
+.workbuddy
+MODBUS_CROSS_VALIDATION.md
