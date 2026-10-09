@@ -52,9 +52,9 @@ bool validateScanRange(int startUnit, int endUnit, int *totalOut, QString *error
 
 // 扫描器可选的探测功能码（与界面下拉一致）。
 struct ProbeOption {
-    int code;                             // 功能码
-    QModbusDataUnit::RegisterType type;   // 对应寄存器表
-    const char *label;
+    int code = 0;                                        // 功能码
+    QModbusDataUnit::RegisterType type = QModbusDataUnit::HoldingRegisters;  // 对应寄存器表
+    const char *label = nullptr;
 };
 const ProbeOption *probeOptions();
 int probeOptionCount();

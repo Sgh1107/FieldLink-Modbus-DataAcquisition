@@ -7,23 +7,25 @@
 #include <QDateTime>
 #include <QModbusDataUnit>
 
+// 标量成员一律带默认值，避免漏设字段后条件判断读到未定值（Valgrind 会报
+// Conditional jump depends on uninitialised value）。
 struct BatchTask {
-    int id;
+    int id = 0;
     QString name;
-    enum Type { Read, Write } type;
-    int serverAddress;
-    QModbusDataUnit::RegisterType registerType;
-    int startAddress;
-    int quantity;
+    enum Type { Read, Write } type = Read;
+    int serverAddress = 1;
+    QModbusDataUnit::RegisterType registerType = QModbusDataUnit::HoldingRegisters;
+    int startAddress = 0;
+    int quantity = 1;
     QVector<quint16> writeValues;
-    int delayAfterMs;
-    bool enabled;
+    int delayAfterMs = 0;
+    bool enabled = true;
 };
 
 struct BatchTaskResult {
-    int taskId;
+    int taskId = 0;
     QString taskName;
-    bool success;
+    bool success = false;
     QString errorMessage;
     QVector<quint16> readValues;
     QDateTime timestamp;

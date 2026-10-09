@@ -87,7 +87,7 @@ private:
     struct PendingPublish {
         QByteArray packet;
         QString topic;
-        int payloadSize;
+        int payloadSize = 0;
         int retries = 0;
     };
 

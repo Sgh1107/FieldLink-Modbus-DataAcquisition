@@ -10,13 +10,14 @@
 #include <QSqlQuery>
 #include <QModbusDataUnit>
 
+// 标量成员带默认值：记录会经 QVector 批量存储与筛选，未初始化成员会流入 SQL 绑定
 struct HistoryRecord {
-    qint64 id;
+    qint64 id = 0;
     QDateTime timestamp;
-    int serverAddress;
-    QModbusDataUnit::RegisterType registerType;
-    int startAddress;
-    int count;
+    int serverAddress = 1;
+    QModbusDataUnit::RegisterType registerType = QModbusDataUnit::HoldingRegisters;
+    int startAddress = 0;
+    int count = 0;
     QVector<quint16> values;
 };
 

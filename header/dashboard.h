@@ -12,14 +12,15 @@
 #include <QHBoxLayout>
 #include <QDateTime>
 
+// 标量成员带默认值：仪表初值应为 0，避免未初始化数值参与阈值比较
 struct GaugeConfig {
     QString name;
     QString unit;
-    double minValue;
-    double maxValue;
-    double warningThreshold;
-    double criticalThreshold;
-    double currentValue;
+    double minValue = 0.0;
+    double maxValue = 100.0;
+    double warningThreshold = 80.0;
+    double criticalThreshold = 90.0;
+    double currentValue = 0.0;
     QColor normalColor;
     QColor warningColor;
     QColor criticalColor;

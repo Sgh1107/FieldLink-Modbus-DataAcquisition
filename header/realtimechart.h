@@ -9,14 +9,14 @@
 
 struct ChartDataPoint {
     QDateTime timestamp;
-    double value;
+    double value = 0.0;
 };
 
 struct ChartSeries {
     QString name;
     QColor color;
     QVector<ChartDataPoint> data;
-    int maxPoints;
+    int maxPoints = 1000;   // 与图表默认容量一致
 };
 
 class RealTimeChart : public QWidget

@@ -24,31 +24,34 @@ enum class AlarmSeverity {
     Critical
 };
 
+// 标量成员一律带默认值：结构体常以 `AlarmRule r;` 声明后逐字段赋值，
+// 漏设成员会留下未定值，被后续条件判断读到（Valgrind 会报
+// Conditional jump depends on uninitialised value）。
 struct AlarmRule {
-    int id;
+    int id = 0;
     QString name;
-    bool enabled;
-    int serverAddress;
-    int registerType;
-    int address;
-    AlarmCondition condition;
-    double threshold1;
-    double threshold2;
-    AlarmSeverity severity;
+    bool enabled = true;
+    int serverAddress = 1;
+    int registerType = 0;
+    int address = 0;
+    AlarmCondition condition = AlarmCondition::GreaterThan;
+    double threshold1 = 0.0;
+    double threshold2 = 0.0;
+    AlarmSeverity severity = AlarmSeverity::Warning;
     QString message;
-    int debounceMs;
-    bool acknowledged;
+    int debounceMs = 0;
+    bool acknowledged = false;
 };
 
 struct AlarmEvent {
-    qint64 id;
+    qint64 id = 0;
     QDateTime timestamp;
-    int ruleId;
+    int ruleId = 0;
     QString ruleName;
-    AlarmSeverity severity;
+    AlarmSeverity severity = AlarmSeverity::Warning;
     QString message;
-    double value;
-    bool acknowledged;
+    double value = 0.0;
+    bool acknowledged = false;
     QDateTime acknowledgedTime;
 };
 

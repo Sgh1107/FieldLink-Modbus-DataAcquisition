@@ -7,7 +7,7 @@
 
 struct DeliveryEnvironmentItem {
     QString name;
-    bool passed;
+    bool passed = false;
     QString detail;
 };
 

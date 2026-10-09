@@ -11,19 +11,19 @@
 
 struct RegisterDefinition {
     QString name;
-    QModbusDataUnit::RegisterType registerType;
-    int address;
-    int count;
+    QModbusDataUnit::RegisterType registerType = QModbusDataUnit::HoldingRegisters;
+    int address = 0;
+    int count = 1;
     QString dataType; // "uint16", "int16", "uint32", "int32", "float32", "ascii"
     QString byteOrder; // "ABCD", "DCBA", "BADC", "CDAB"
-    double scale;
-    double offset;
+    double scale = 1.0;
+    double offset = 0.0;
     QString unit;
     QString description;
 };
 
 struct DeviceTemplate {
-    int id;
+    int id = 0;
     QString name;
     QString manufacturer;
     QString model;

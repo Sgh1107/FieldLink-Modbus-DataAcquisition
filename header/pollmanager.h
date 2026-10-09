@@ -6,18 +6,20 @@
 #include <QVector>
 #include <QModbusDataUnit>
 
+// 标量成员带默认值：轮询任务经文件持久化（saveToFile/loadFromFile），
+// 漏设字段会写入未定义值并在下次加载时被沿用。
 struct PollTask {
-    int id;
+    int id = 0;
     QString name;
-    int serverAddress;
-    QModbusDataUnit::RegisterType registerType;
-    int startAddress;
-    int quantity;
-    int intervalMs;
-    bool enabled;
-    bool alarmEnabled;
-    double alarmMin;
-    double alarmMax;
+    int serverAddress = 1;
+    QModbusDataUnit::RegisterType registerType = QModbusDataUnit::HoldingRegisters;
+    int startAddress = 0;
+    int quantity = 1;
+    int intervalMs = 1000;
+    bool enabled = true;
+    bool alarmEnabled = false;
+    double alarmMin = 0.0;
+    double alarmMax = 65535.0;
 };
 
 class PollManager : public QObject

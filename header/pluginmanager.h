@@ -15,12 +15,12 @@ struct PluginInfo {
     QString version;
     QString description;
     QString author;
-    bool loaded;
-    bool enabled;
+    bool loaded = false;
+    bool enabled = false;
     QString lastError;
     QJsonObject config;
-    PluginInterface *instance;
-    QPluginLoader *loader;
+    PluginInterface *instance = nullptr;   // 未加载时必须为空，析构里会用到
+    QPluginLoader *loader = nullptr;
 };
 
 class PluginManager : public QObject

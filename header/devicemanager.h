@@ -16,20 +16,21 @@ using QModbusRtuSerialClient = QModbusRtuSerialMaster;
 #endif
 
 struct DeviceConfig {
-    int id;
+    int id = 0;
     QString name;
-    bool isTcp;
+    bool isTcp = true;
     QString portOrAddress;
-    int serverAddress;
-    int parity;
-    int baud;
-    int dataBits;
-    int stopBits;
-    int responseTime;
-    int numberOfRetries;
-    bool connected;
+    int serverAddress = 1;
+    // 串口参数默认值与 UI 初始值一致（9600 8N1、无校验）
+    int parity = 0;
+    int baud = 9600;
+    int dataBits = 8;
+    int stopBits = 1;
+    int responseTime = 1000;
+    int numberOfRetries = 3;
+    bool connected = false;
     QString lastError;
-    int pollIntervalMs;
+    int pollIntervalMs = 1000;
     QString archiveTag;
 };
 
