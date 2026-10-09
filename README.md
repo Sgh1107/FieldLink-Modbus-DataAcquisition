@@ -40,7 +40,7 @@
 - ✅ **Modbus 调试工具**：原始功能码/报文发送窗（基于 `sendRawRequest`，覆盖 FC07/08/0B/0C/11/16(22)/17(23)/18(24)/2B·0E 等 Qt SerialBus 未封装功能，支持循环发送与异常码解析）+ **总线扫描器**（区间扫描在线从站、可一键生成轮询任务）
 - ✅ **点表批量导入导出**：CSV / JSON 双向，表头自适应定位列、支持「追加 / 覆盖」、严格校验（解析失败不破坏现有点位），CSV 带 BOM 且正确转义
 - ✅ **主题与本地化**：深色/浅色工业风主题一键切换（Fusion + QSS），配置自动记忆；内置 i18n 框架（lrelease 构建期编译翻译并嵌入资源）
-- ✅ **内置测试套件**：`tests/` 下 158 项无 GUI 断言（报警条件/位号越界防护/加盐哈希/权限模型/MQTT QoS0+QoS1 协议/字节序换算/任务调度/CSV 转义），`qmake + make` 一键回归
+- ✅ **内置测试套件**：`tests/` 下 465 项无 GUI 断言（报警条件/位号越界防护/加盐哈希/权限模型/MQTT QoS0+QoS1 协议/字节序换算/任务调度/CSV 转义/点表 CSV·JSON 导入导出往返与原子性/Modbus 调试工具 PDU 解析·异常码·报文构造·扫描区间校验），`qmake + make` 一键回归；另附 `tools/run_tests.sh` 一键跑全量回归
 - ✅ **交付工具链内置**：交付清单、运行环境检查、日志打包、发布说明/用户手册/维护手册自动生成、Windows 打包脚本一键产出
 
 ---
@@ -177,6 +177,7 @@ FieldLink-Modbus-DataAcquisition/
 │   ├── ── Modbus 调试工具 ──
 │   ├── rawrequestdialog.h    # 原始功能码/报文发送窗（sendRawRequest）
 │   ├── scannerdialog.h       # 总线扫描器（区间扫描在线从站）
+│   ├── modbusdiagnostics.h   # 调试工具纯逻辑层：PDU 解析/异常码/报文构造/扫描区间（无 GUI 依赖，可单测）
 │   │
 │   ├── ── 测试与模拟 ──
 │   ├── devicesimulator.h     # 模拟设备面板（一键起停 Modbus TCP 从站）
@@ -196,7 +197,7 @@ FieldLink-Modbus-DataAcquisition/
 ├── images/                   # 界面图标资源
 ├── deploy/                   # Windows 发布打包脚本（package_windows.ps1）
 ├── slave/                    # 测试用模拟服务端：Modbus 从站模拟器 / MQTT 测试 broker
-├── tests/                    # 单元/集成测试套件（无 GUI，158 项断言）
+├── tests/                    # 单元/集成测试套件（无 GUI，465 项断言）
 ├── .github/workflows/        # CI：Qt 6 自动构建 + 测试回归 + ASan/Valgrind 内存泄漏检查
 ├── doc/                      # USAGE 使用手册 / MQTT 指南 / Code Review 报告 / AI 集成设计
 └── build/                    # 构建输出目录（Makefile 由 qmake 自动生成）
