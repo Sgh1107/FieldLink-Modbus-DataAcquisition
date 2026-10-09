@@ -1,5 +1,6 @@
 #include "scannerdialog.h"
 #include "pollmanager.h"
+#include "modbusdiagnostics.h"
 
 #include <QModbusClient>
 #include <QModbusReply>
@@ -25,34 +26,6 @@
 #include <QClipboard>
 #include <QTimer>
 #include <QStringList>
-
-namespace {
-
-struct ProbeEntry {
-    int code;
-    QModbusDataUnit::RegisterType type;
-    const char *label;
-};
-
-// 探测用功能码（读类，负载 = 起始地址Hi Lo + 数量Hi Lo）
-const ProbeEntry kProbes[] = {
-    { 0x03, QModbusDataUnit::HoldingRegisters, "03 读保持寄存器" },
-    { 0x01, QModbusDataUnit::Coils,            "01 读线圈" },
-    { 0x04, QModbusDataUnit::InputRegisters,   "04 读输入寄存器" },
-    { 0x02, QModbusDataUnit::DiscreteInputs,   "02 读离散输入" },
-};
-
-QByteArray readPayload(int startAddress, int count)
-{
-    QByteArray d;
-    d.append(static_cast<char>((startAddress >> 8) & 0xFF));
-    d.append(static_cast<char>(startAddress & 0xFF));
-    d.append(static_cast<char>((count >> 8) & 0xFF));
-    d.append(static_cast<char>(count & 0xFF));
-    return d;
-}
-
-} // namespace
 
 ScannerDialog::ScannerDialog(std::function<QModbusClient *()> clientProvider,
                              PollManager *pollManager,
@@ -90,8 +63,9 @@ ScannerDialog::ScannerDialog(std::function<QModbusClient *()> clientProvider,
     form->addRow(QStringLiteral("每地址尝试次数"), m_attemptsSpin);
 
     m_funcCombo = new QComboBox(cfgGroup);
-    for (const ProbeEntry &p : kProbes)
-        m_funcCombo->addItem(QString::fromUtf8(p.label), p.code);
+    const ModbusDiagnostics::ProbeOption *opts = ModbusDiagnostics::probeOptions();
+    for (int i = 0; i < ModbusDiagnostics::probeOptionCount(); ++i)
+        m_funcCombo->addItem(QString::fromUtf8(opts[i].label), opts[i].code);
     m_funcCombo->setCurrentIndex(0);
     form->addRow(QStringLiteral("探测功能码"), m_funcCombo);
 
@@ -189,8 +163,11 @@ void ScannerDialog::startScan()
                              QStringLiteral("请先在主界面连接设备（TCP/RTU）后再扫描。"));
         return;
     }
-    if (m_unitEndSpin->value() < m_unitStartSpin->value()) {
-        QMessageBox::warning(this, QStringLiteral("无法扫描"), QStringLiteral("结束地址必须不小于起始地址。"));
+    int totalUnits = 0;
+    QString rangeError;
+    if (!ModbusDiagnostics::validateScanRange(m_unitStartSpin->value(),
+                                              m_unitEndSpin->value(), &totalUnits, &rangeError)) {
+        QMessageBox::warning(this, QStringLiteral("无法扫描"), rangeError);
         return;
     }
 
@@ -200,7 +177,7 @@ void ScannerDialog::startScan()
     m_scanned = 0;
     m_currentUnit = m_unitStartSpin->value();
     m_currentAttempt = 0;
-    m_total = m_unitEndSpin->value() - m_unitStartSpin->value() + 1;
+    m_total = totalUnits;
 
     m_startBtn->setEnabled(false);
     m_stopBtn->setEnabled(true);
@@ -244,7 +221,7 @@ void ScannerDialog::sendNextProbe()
 
     const int code = m_funcCombo->currentData().toInt();
     QModbusRequest request(static_cast<QModbusPdu::FunctionCode>(code & 0xFF),
-                           readPayload(m_addrSpin->value(), m_countSpin->value()));
+                           ModbusDiagnostics::readPayload(m_addrSpin->value(), m_countSpin->value()));
     m_inFlight = client->sendRawRequest(request, m_currentUnit);
     if (!m_inFlight) {
         // 发送失败直接跳过该地址
@@ -342,9 +319,9 @@ void ScannerDialog::appendFound(int unit, int elapsedMs, const QString &note)
 
 void ScannerDialog::updateProgress()
 {
-    m_progress->setValue(qMin(m_scanned, m_total));
-    m_status->setText(QStringLiteral("已扫描 %1/%2，发现 %3 个在线从站")
-                          .arg(m_scanned).arg(m_total).arg(m_found));
+    // 进度条范围是「地址个数」，直接按计数设置并夹到 [0, total]
+    m_progress->setValue(qBound(0, m_scanned, m_total));
+    m_status->setText(ModbusDiagnostics::scanProgressText(m_scanned, m_total, m_found));
 }
 
 void ScannerDialog::finishScan()
@@ -368,28 +345,23 @@ void ScannerDialog::createPollTaskForSelection()
         return;
     }
 
-    const QModbusDataUnit::RegisterType type = [this]() {
-        switch (m_funcCombo->currentData().toInt()) {
-        case 0x01: return QModbusDataUnit::Coils;
-        case 0x02: return QModbusDataUnit::DiscreteInputs;
-        case 0x04: return QModbusDataUnit::InputRegisters;
-        default:   return QModbusDataUnit::HoldingRegisters;
-        }
-    }();
-
     int added = 0;
     for (const QModelIndex &index : rows) {
         const int unit = m_table->item(index.row(), 0)->text().toInt();
+        // 任务参数（寄存器表类型、id、名称等）统一由公共逻辑生成，避免界面层重复推导
+        const ModbusDiagnostics::PollTaskSeed seed = ModbusDiagnostics::makePollTaskSeed(
+            unit, m_funcCombo->currentData().toInt(),
+            m_addrSpin->value(), m_countSpin->value());
         PollTask task;
-        task.id = 40000 + unit;
-        task.name = QStringLiteral("扫描生成-从站%1").arg(unit);
-        task.serverAddress = unit;
-        task.registerType = type;
-        task.startAddress = m_addrSpin->value();
-        task.quantity = qMax(1, m_countSpin->value());
-        task.intervalMs = 1000;
+        task.id = seed.id;
+        task.name = seed.name;
+        task.serverAddress = seed.serverAddress;
+        task.registerType = seed.registerType;
+        task.startAddress = seed.startAddress;
+        task.quantity = seed.quantity;
+        task.intervalMs = seed.intervalMs;
         task.enabled = true;
-        task.alarmEnabled = false;
+        task.alarmEnabled = seed.alarmEnabled;
         task.alarmMin = 0.0;
         task.alarmMax = 65535.0;
         m_pollManager->removeTask(task.id);

@@ -1,4 +1,5 @@
 #include "rawrequestdialog.h"
+#include "modbusdiagnostics.h"
 
 #include <QModbusClient>
 #include <QModbusReply>
@@ -19,7 +20,6 @@
 #include <QDialogButtonBox>
 #include <QTimer>
 #include <QDateTime>
-#include <QRegularExpression>
 
 namespace {
 
@@ -48,53 +48,6 @@ const FuncCodeEntry kFuncCodes[] = {
     { 0x18, "18 读 FIFO 队列 Read FIFO Queue" },
     { 0x2B, "2B 读设备标识 Read Device Identification (MEI 0E)" },
 };
-
-QString exceptionName(int code)
-{
-    switch (code) {
-    case 0x01: return QStringLiteral("非法功能");
-    case 0x02: return QStringLiteral("非法数据地址");
-    case 0x03: return QStringLiteral("非法数据值");
-    case 0x04: return QStringLiteral("从站设备故障");
-    case 0x05: return QStringLiteral("确认(处理中)");
-    case 0x06: return QStringLiteral("从站设备忙");
-    case 0x08: return QStringLiteral("存储奇偶校验错");
-    case 0x0A: return QStringLiteral("网关路径不可用");
-    case 0x0B: return QStringLiteral("网关目标设备响应失败");
-    default:   return QStringLiteral("未知异常");
-    }
-}
-
-// 把 "0x00 0x0A" / "00,0a" / "000A" 之类文本解析为字节数组
-bool parseHexBytes(const QString &text, QByteArray *out, QString *error)
-{
-    QString s = text;
-    s.remove(QRegularExpression(QStringLiteral("[\\s,;:_-]")));
-    s.remove(QRegularExpression(QStringLiteral("0[xX]")));
-    if (s.isEmpty()) {
-        out->clear();
-        return true;   // 允许空 PDU（部分功能码无数据域）
-    }
-    if (s.size() % 2 != 0) {
-        if (error) *error = QStringLiteral("十六进制字符数必须为偶数（每字节 2 个字符）");
-        return false;
-    }
-    for (int i = 0; i < s.size(); i += 2) {
-        bool ok = false;
-        const int b = s.mid(i, 2).toInt(&ok, 16);
-        if (!ok) {
-            if (error) *error = QStringLiteral("非法十六进制片段：%1").arg(s.mid(i, 2));
-            return false;
-        }
-        out->append(static_cast<char>(b & 0xFF));
-    }
-    return true;
-}
-
-QString hexByte(quint8 v)
-{
-    return QString::number(v, 16).rightJustified(2, QChar('0')).toUpper();
-}
 
 QString timestamp()
 {
@@ -244,7 +197,7 @@ void RawRequestDialog::sendRequest()
 
     QByteArray payload;
     QString err;
-    if (!parseHexBytes(m_payloadEdit->text(), &payload, &err)) {
+    if (!ModbusDiagnostics::parseHexBytes(m_payloadEdit->text(), &payload, &err)) {
         appendLog(QStringLiteral("[%1] PDU 解析失败：%2").arg(timestamp(), err), true);
         if (m_loopCheck->isChecked())
             m_loopCheck->setChecked(false);
@@ -252,7 +205,7 @@ void RawRequestDialog::sendRequest()
     }
 
     const quint8 code = currentFunctionCode();
-    if (code == 0) {
+    if (!ModbusDiagnostics::isValidFunctionCode(code)) {
         appendLog(QStringLiteral("[%1] 功能码无效，请输入 01~7F 的十六进制值。").arg(timestamp()), true);
         if (m_loopCheck->isChecked())
             m_loopCheck->setChecked(false);
@@ -292,7 +245,7 @@ void RawRequestDialog::onReplyFinished()
     m_busy = false;
 
     const int ms = static_cast<int>(m_elapsed.elapsed());
-    const QString fc = hexByte(currentFunctionCode());
+    const QString fc = ModbusDiagnostics::hexByte(currentFunctionCode());
 
     if (reply->error() != QModbusDevice::NoError) {
         ++m_fail;
@@ -304,16 +257,17 @@ void RawRequestDialog::onReplyFinished()
     } else {
         ++m_ok;
         const QModbusResponse resp = reply->rawResult();
-        const QString hex = QString::fromLatin1(resp.data().toHex(' ')).toUpper();
+        const QString hex = ModbusDiagnostics::hexBytes(resp.data());
         QString extra;
         if (resp.isException()) {
             const int ex = static_cast<int>(resp.exceptionCode());
-            extra = QStringLiteral("   ← 异常码 %1 (%2)").arg(hexByte(static_cast<quint8>(ex)), exceptionName(ex));
+            extra = QStringLiteral("   ← 异常码 %1 (%2)").arg(ModbusDiagnostics::hexByte(static_cast<quint8>(ex)),
+                                                 ModbusDiagnostics::exceptionName(ex));
         }
         appendLog(QStringLiteral("[%1] 从站 %2  FC %3  → OK  响应功能码 %4  数据(%5字节)= %6%7  (%8 ms)")
                       .arg(timestamp())
                       .arg(m_serverSpin->value())
-                      .arg(fc, hexByte(static_cast<quint8>(resp.functionCode())))
+                      .arg(fc, ModbusDiagnostics::hexByte(static_cast<quint8>(resp.functionCode())))
                       .arg(resp.data().size())
                       .arg(hex.isEmpty() ? QStringLiteral("(空)") : hex)
                       .arg(extra)
@@ -335,7 +289,7 @@ void RawRequestDialog::onGuardTimeout()
     appendLog(QStringLiteral("[%1] 从站 %2  FC %3  → 超时无响应（广播或被静默丢弃）")
                   .arg(timestamp())
                   .arg(m_serverSpin->value())
-                  .arg(hexByte(currentFunctionCode())), true);
+                  .arg(ModbusDiagnostics::hexByte(currentFunctionCode())), true);
     reply->deleteLater();
     updateStats();
 }

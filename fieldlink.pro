@@ -42,7 +42,8 @@ SOURCES += src/main.cpp\
         src/mqttclient.cpp \
         src/devicesimulator.cpp \
         src/rawrequestdialog.cpp \
-        src/scannerdialog.cpp
+        src/scannerdialog.cpp \
+        src/modbusdiagnostics.cpp
 
 HEADERS  += header/mainwindow.h \
          header/settingsdialog.h \
@@ -74,7 +75,8 @@ HEADERS  += header/mainwindow.h \
         header/credentialcodec.h \
         header/devicesimulator.h \
         header/rawrequestdialog.h \
-        header/scannerdialog.h
+        header/scannerdialog.h \
+        header/modbusdiagnostics.h
 
 FORMS    += mainwindow.ui \
          settingsdialog.ui
