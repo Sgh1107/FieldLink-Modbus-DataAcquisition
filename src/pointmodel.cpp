@@ -249,12 +249,18 @@ bool registerTypeFromToken(const QString &token, QModbusDataUnit::RegisterType *
     bool ok = false;
     const int numeric = t.toInt(&ok);
     if (ok) {
+        // 必须与 QModbusDataUnit::RegisterType 的真实枚举值严格一致：
+        //   Invalid=0, DiscreteInputs=1, Coils=2, InputRegisters=3, HoldingRegisters=4
+        // 导出路径写出的就是这些值（pointToJson / exportToCsv 均用 static_cast<int>），
+        // 若这里按「表格习惯序号 0=线圈…3=保持寄存器」解析，导出的 Coils(2) 会被
+        // 重新读成 InputRegisters —— 静默改变寄存器类型，属数据损坏。
+        // 因此数字形式只接受 Qt 枚举值；Invalid 与未知值一律拒绝（回落默认保持寄存器）。
         switch (numeric) {
-        case 0: *out = QModbusDataUnit::Coils; return true;
-        case 1: *out = QModbusDataUnit::DiscreteInputs; return true;
-        case 2: *out = QModbusDataUnit::InputRegisters; return true;
-        case 3: *out = QModbusDataUnit::HoldingRegisters; return true;
-        default: return false;
+        case static_cast<int>(QModbusDataUnit::Coils):           *out = QModbusDataUnit::Coils; return true;
+        case static_cast<int>(QModbusDataUnit::DiscreteInputs):   *out = QModbusDataUnit::DiscreteInputs; return true;
+        case static_cast<int>(QModbusDataUnit::InputRegisters):  *out = QModbusDataUnit::InputRegisters; return true;
+        case static_cast<int>(QModbusDataUnit::HoldingRegisters): *out = QModbusDataUnit::HoldingRegisters; return true;
+        default: return false;   // 含 Invalid(0) 与越界值
         }
     }
     const QString low = t.toLower();
@@ -350,16 +356,18 @@ bool PointModel::importFromJson(const QString &filePath, bool append, int *impor
         if (error) *error = QStringLiteral("JSON 解析失败：%1").arg(parseError.errorString());
         return false;
     }
+    // 原子性：先解析到临时列表，确认有内容后再改动现有数据（与 CSV 导入保持一致）
+    QVector<PointDefinition> parsed;
+    for (const auto &v : doc.array())
+        parsed.append(pointFromJson(v.toObject()));
+
     if (!append) {
         m_points.clear();
         m_values.clear();
     }
-    int count = 0;
-    for (const auto &v : doc.array()) {
-        addPoint(pointFromJson(v.toObject()));
-        ++count;
-    }
-    if (imported) *imported = count;
+    for (const PointDefinition &p : parsed)
+        addPoint(p);
+    if (imported) *imported = parsed.size();
     return true;
 }
 
@@ -389,6 +397,7 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
             rows << r;
     }
     if (rows.isEmpty()) {
+        // 空文件 / 只有空白：视为「无内容可导入」，不算失败（区别于「有内容但全部无效」）
         if (imported) *imported = 0;
         return true;
     }
@@ -424,12 +433,9 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
         return row.at(index).trimmed();
     };
 
-    if (!append) {
-        m_points.clear();
-        m_values.clear();
-    }
-
-    int count = 0;
+    // 原子性：先解析到临时列表，确认有有效点位后再改动现有数据。
+    // 否则「覆盖模式导入一个全是无效行的 CSV」会先把用户现有点位清空再报错，造成数据丢失。
+    QVector<PointDefinition> parsed;
     int skipped = 0;
     const int startRow = hasHeader ? 1 : 0;
     for (int r = startRow; r < rows.size(); ++r) {
@@ -466,15 +472,24 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
         p.archiveIntervalSec = qMax(1, archiveInterval > 0 ? archiveInterval : 5);
         if (p.name.isEmpty())
             p.name = QStringLiteral("点位%1").arg(p.address);
-        addPoint(p);
-        ++count;
+        parsed.append(p);
     }
 
-    if (imported) *imported = count;
-    if (count == 0) {
+    if (parsed.isEmpty()) {
+        // 一条有效点位都没有 → 视为导入失败，且不触碰现有点位
+        if (imported) *imported = 0;
         if (error) *error = QStringLiteral("未解析到有效点位（共 %1 行被跳过），请检查表头或列顺序。").arg(skipped);
         return false;
     }
+
+    if (!append) {
+        m_points.clear();
+        m_values.clear();
+    }
+    for (const PointDefinition &p : parsed)
+        addPoint(p);
+
+    if (imported) *imported = parsed.size();
     return true;
 }
 
@@ -484,9 +499,34 @@ bool PointModel::importAuto(const QString &filePath, bool append, int *imported,
         return importFromCsv(filePath, append, imported, error);
     if (filePath.endsWith(QStringLiteral(".json"), Qt::CaseInsensitive))
         return importFromJson(filePath, append, imported, error);
-    // 未知扩展名：先按 JSON 试，失败再按 CSV 试
-    QString firstError;
-    if (importFromJson(filePath, append, imported, &firstError))
-        return true;
-    return importFromCsv(filePath, append, imported, error);
+    // 未知扩展名：先按 JSON 试，失败再按 CSV 试。
+    // 两次尝试都必须走「非覆盖」的安全路径：若调用方要求覆盖，而最终失败，
+    // 现有点位必须完好 —— 否则「探测格式」本身就可能清空用户数据。
+    if (append) {
+        // 追加模式：直接依次尝试，失败不涉及覆盖，天然安全
+        QString firstError;
+        if (importFromJson(filePath, true, imported, &firstError))
+            return true;
+        return importFromCsv(filePath, true, imported, error);
+    }
+
+    // 覆盖模式：先探测，再落地
+    PointModel probe;
+    int probeCount = 0;
+    QString jsonError;
+    if (probe.importFromJson(filePath, true, &probeCount, &jsonError)) {
+        const bool ok = importFromJson(filePath, false, imported, error);
+        return ok;
+    }
+    QString csvError;
+    if (probe.importFromCsv(filePath, true, &probeCount, &csvError)) {
+        const bool ok = importFromCsv(filePath, false, imported, error);
+        return ok;
+    }
+    // 两种格式都解析失败：给出合并后的错误信息，且不改动现有点位
+    if (error)
+        *error = QStringLiteral("无法识别文件格式（既非 JSON 也非 CSV）。JSON 解析：%1；CSV 解析：%2")
+                     .arg(jsonError, csvError);
+    if (imported) *imported = 0;
+    return false;
 }
