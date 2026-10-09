@@ -106,6 +106,8 @@ private slots:
     void showPointManager();
     void showRawRequestTool();                 // 原始功能码 / 报文发送工具窗
     void showScanner();                        // Modbus 总线扫描器
+    void importPointsFile();                   // 点表批量导入（CSV/JSON）
+    void exportPointsFile();                   // 点表批量导出（CSV/JSON）
     void showVerificationManager();
     void showDeliveryManager();
     void showSecurityManager();

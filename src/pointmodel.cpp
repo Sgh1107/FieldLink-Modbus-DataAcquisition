@@ -3,6 +3,9 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonArray>
+#include <QJsonParseError>
+#include <QTextStream>
+#include <QHash>
 #include <QtGlobal>
 
 PointModel::PointModel(QObject *parent)
@@ -181,4 +184,309 @@ bool PointModel::loadFromFile(const QString &filePath)
     for (const auto &v : doc.array())
         addPoint(pointFromJson(v.toObject()));
     return true;
+}
+
+// ==================== 点表批量导入 / 导出 ====================
+
+namespace {
+
+QString csvEscape(const QString &value)
+{
+    if (value.contains(QLatin1Char(',')) || value.contains(QLatin1Char('"'))
+        || value.contains(QLatin1Char('\n')) || value.contains(QLatin1Char('\r'))) {
+        QString s = value;
+        s.replace(QLatin1Char('"'), QStringLiteral("\"\""));
+        return QLatin1Char('"') + s + QLatin1Char('"');
+    }
+    return value;
+}
+
+// 支持双引号包裹与 "" 转义的 CSV 解析
+QVector<QStringList> parseCsvText(const QString &text)
+{
+    QVector<QStringList> rows;
+    QStringList row;
+    QString cell;
+    bool inQuotes = false;
+    const int n = text.size();
+    int i = 0;
+    while (i < n) {
+        const QChar ch = text.at(i);
+        if (inQuotes) {
+            if (ch == QLatin1Char('"')) {
+                if (i + 1 < n && text.at(i + 1) == QLatin1Char('"')) {
+                    cell.append(QLatin1Char('"'));
+                    i += 2;
+                    continue;
+                }
+                inQuotes = false;
+                ++i;
+                continue;
+            }
+            cell.append(ch);
+            ++i;
+            continue;
+        }
+        if (ch == QLatin1Char('"')) { inQuotes = true; ++i; continue; }
+        if (ch == QLatin1Char(',')) { row << cell; cell.clear(); ++i; continue; }
+        if (ch == QLatin1Char('\r')) { ++i; continue; }
+        if (ch == QLatin1Char('\n')) { row << cell; cell.clear(); rows << row; row.clear(); ++i; continue; }
+        cell.append(ch);
+        ++i;
+    }
+    if (!cell.isEmpty() || !row.isEmpty()) {
+        row << cell;
+        rows << row;
+    }
+    return rows;
+}
+
+bool registerTypeFromToken(const QString &token, QModbusDataUnit::RegisterType *out)
+{
+    const QString t = token.trimmed();
+    if (t.isEmpty())
+        return false;
+    bool ok = false;
+    const int numeric = t.toInt(&ok);
+    if (ok) {
+        switch (numeric) {
+        case 0: *out = QModbusDataUnit::Coils; return true;
+        case 1: *out = QModbusDataUnit::DiscreteInputs; return true;
+        case 2: *out = QModbusDataUnit::InputRegisters; return true;
+        case 3: *out = QModbusDataUnit::HoldingRegisters; return true;
+        default: return false;
+        }
+    }
+    const QString low = t.toLower();
+    if (low.contains(QStringLiteral("holding")) || low.contains(QStringLiteral("保持"))) { *out = QModbusDataUnit::HoldingRegisters; return true; }
+    if (low.contains(QStringLiteral("input")) || low.contains(QStringLiteral("输入寄存器"))) { *out = QModbusDataUnit::InputRegisters; return true; }
+    if (low.contains(QStringLiteral("discrete")) || low.contains(QStringLiteral("离散"))) { *out = QModbusDataUnit::DiscreteInputs; return true; }
+    if (low.contains(QStringLiteral("coil")) || low.contains(QStringLiteral("线圈"))) { *out = QModbusDataUnit::Coils; return true; }
+    return false;
+}
+
+bool boolFromToken(const QString &token, bool defaultValue)
+{
+    const QString t = token.trimmed().toLower();
+    if (t.isEmpty())
+        return defaultValue;
+    if (t == QStringLiteral("1") || t == QStringLiteral("true") || t == QStringLiteral("yes")
+        || t == QStringLiteral("y") || t == QStringLiteral("是") || t == QStringLiteral("on"))
+        return true;
+    if (t == QStringLiteral("0") || t == QStringLiteral("false") || t == QStringLiteral("no")
+        || t == QStringLiteral("n") || t == QStringLiteral("否") || t == QStringLiteral("off"))
+        return false;
+    return defaultValue;
+}
+
+} // namespace
+
+QString PointModel::registerTypeName(QModbusDataUnit::RegisterType type)
+{
+    switch (type) {
+    case QModbusDataUnit::Coils: return QStringLiteral("Coils");
+    case QModbusDataUnit::DiscreteInputs: return QStringLiteral("DiscreteInputs");
+    case QModbusDataUnit::InputRegisters: return QStringLiteral("InputRegisters");
+    case QModbusDataUnit::HoldingRegisters: return QStringLiteral("HoldingRegisters");
+    default: return QStringLiteral("HoldingRegisters");
+    }
+}
+
+bool PointModel::exportToJson(const QString &filePath, QString *error) const
+{
+    QJsonArray arr;
+    for (const auto &p : m_points)
+        arr.append(pointToJson(p));
+    QFile file(filePath);
+    if (!file.open(QIODevice::WriteOnly)) {
+        if (error) *error = QStringLiteral("无法写入文件：%1").arg(file.errorString());
+        return false;
+    }
+    file.write(QJsonDocument(arr).toJson(QJsonDocument::Indented));
+    return true;
+}
+
+bool PointModel::exportToCsv(const QString &filePath, QString *error) const
+{
+    QFile file(filePath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        if (error) *error = QStringLiteral("无法写入文件：%1").arg(file.errorString());
+        return false;
+    }
+    QTextStream out(&file);
+    out.setGenerateByteOrderMark(true);
+    out << "id,name,serverAddress,registerType,address,count,dataType,scale,offset,unit,alarmLow,alarmHigh,archiveEnabled,archiveIntervalSec\n";
+    for (const auto &p : m_points) {
+        QStringList cells;
+        cells << QString::number(p.id)
+              << csvEscape(p.name)
+              << QString::number(p.serverAddress)
+              << QString::number(static_cast<int>(p.registerType))
+              << QString::number(p.address)
+              << QString::number(p.count)
+              << csvEscape(p.dataType)
+              << QString::number(p.scale)
+              << QString::number(p.offset)
+              << csvEscape(p.unit)
+              << QString::number(p.alarmLow)
+              << QString::number(p.alarmHigh)
+              << QString(p.archiveEnabled ? QLatin1String("1") : QLatin1String("0"))
+              << QString::number(p.archiveIntervalSec);
+        out << cells.join(QLatin1Char(',')) << '\n';
+    }
+    return true;
+}
+
+bool PointModel::importFromJson(const QString &filePath, bool append, int *imported, QString *error)
+{
+    QFile file(filePath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        if (error) *error = QStringLiteral("无法读取文件：%1").arg(file.errorString());
+        return false;
+    }
+    QJsonParseError parseError{};
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isArray()) {
+        if (error) *error = QStringLiteral("JSON 解析失败：%1").arg(parseError.errorString());
+        return false;
+    }
+    if (!append) {
+        m_points.clear();
+        m_values.clear();
+    }
+    int count = 0;
+    for (const auto &v : doc.array()) {
+        addPoint(pointFromJson(v.toObject()));
+        ++count;
+    }
+    if (imported) *imported = count;
+    return true;
+}
+
+bool PointModel::importFromCsv(const QString &filePath, bool append, int *imported, QString *error)
+{
+    QFile file(filePath);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        if (error) *error = QStringLiteral("无法读取文件：%1").arg(file.errorString());
+        return false;
+    }
+    QTextStream in(&file);
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+    in.setCodec("UTF-8");
+#endif
+    QString text = in.readAll();
+    if (!text.isEmpty() && text.at(0) == QChar(0xFEFF))
+        text.remove(0, 1);
+
+    const QVector<QStringList> rawRows = parseCsvText(text);
+    QVector<QStringList> rows;
+    for (const QStringList &r : rawRows) {
+        bool hasContent = false;
+        for (const QString &c : r) {
+            if (!c.trimmed().isEmpty()) { hasContent = true; break; }
+        }
+        if (hasContent)
+            rows << r;
+    }
+    if (rows.isEmpty()) {
+        if (imported) *imported = 0;
+        return true;
+    }
+
+    // 表头识别（含 name / serverAddress / registerType / dataType 任一即视为表头）
+    QHash<QString, int> col;
+    bool hasHeader = false;
+    const QStringList headerRow = rows.first();
+    for (int i = 0; i < headerRow.size(); ++i) {
+        const QString key = headerRow.at(i).trimmed().toLower();
+        if (key.isEmpty())
+            continue;
+        if (key == QLatin1String("name") || key == QLatin1String("serveraddress")
+            || key == QLatin1String("registertype") || key == QLatin1String("datatype")) {
+            hasHeader = true;
+        }
+        col.insert(key, i);
+    }
+
+    // 无表头时按导出顺序回退定位
+    const QStringList defaultOrder = { "id", "name", "serveraddress", "registertype", "address",
+                                       "count", "datatype", "scale", "offset", "unit",
+                                       "alarmlow", "alarmhigh", "archiveenabled", "archiveintervalsec" };
+    for (int i = 0; i < defaultOrder.size(); ++i) {
+        if (!col.contains(defaultOrder.at(i)))
+            col.insert(defaultOrder.at(i), i);
+    }
+
+    auto cellOf = [&col](const QStringList &row, const QString &key) -> QString {
+        const int index = col.value(key, -1);
+        if (index < 0 || index >= row.size())
+            return QString();
+        return row.at(index).trimmed();
+    };
+
+    if (!append) {
+        m_points.clear();
+        m_values.clear();
+    }
+
+    int count = 0;
+    int skipped = 0;
+    const int startRow = hasHeader ? 1 : 0;
+    for (int r = startRow; r < rows.size(); ++r) {
+        const QStringList &row = rows.at(r);
+        PointDefinition p;
+        p.name = cellOf(row, QStringLiteral("name"));
+        const QString addrText = cellOf(row, QStringLiteral("address"));
+        if (p.name.isEmpty() && addrText.isEmpty()) {
+            ++skipped;
+            continue;
+        }
+        p.serverAddress = cellOf(row, QStringLiteral("serveraddress")).toInt();
+        if (p.serverAddress <= 0)
+            p.serverAddress = 1;
+        QModbusDataUnit::RegisterType type = QModbusDataUnit::HoldingRegisters;
+        if (registerTypeFromToken(cellOf(row, QStringLiteral("registertype")), &type))
+            p.registerType = type;
+        p.address = addrText.toInt();
+        p.count = qMax(1, cellOf(row, QStringLiteral("count")).toInt());
+        const QString dt = cellOf(row, QStringLiteral("datatype"));
+        p.dataType = dt.isEmpty() ? QStringLiteral("uint16") : dt;
+        const QString scaleText = cellOf(row, QStringLiteral("scale"));
+        p.scale = scaleText.isEmpty() ? 1.0 : scaleText.toDouble();
+        const QString offsetText = cellOf(row, QStringLiteral("offset"));
+        p.offset = offsetText.isEmpty() ? 0.0 : offsetText.toDouble();
+        p.unit = cellOf(row, QStringLiteral("unit"));
+        p.alarmLow = cellOf(row, QStringLiteral("alarmlow")).toDouble();
+        const QString highText = cellOf(row, QStringLiteral("alarmhigh"));
+        p.alarmHigh = highText.isEmpty() ? 65535.0 : highText.toDouble();
+        if (p.alarmHigh <= p.alarmLow)
+            p.alarmHigh = 65535.0;
+        p.archiveEnabled = boolFromToken(cellOf(row, QStringLiteral("archiveenabled")), true);
+        const int archiveInterval = cellOf(row, QStringLiteral("archiveintervalsec")).toInt();
+        p.archiveIntervalSec = qMax(1, archiveInterval > 0 ? archiveInterval : 5);
+        if (p.name.isEmpty())
+            p.name = QStringLiteral("点位%1").arg(p.address);
+        addPoint(p);
+        ++count;
+    }
+
+    if (imported) *imported = count;
+    if (count == 0) {
+        if (error) *error = QStringLiteral("未解析到有效点位（共 %1 行被跳过），请检查表头或列顺序。").arg(skipped);
+        return false;
+    }
+    return true;
+}
+
+bool PointModel::importAuto(const QString &filePath, bool append, int *imported, QString *error)
+{
+    if (filePath.endsWith(QStringLiteral(".csv"), Qt::CaseInsensitive))
+        return importFromCsv(filePath, append, imported, error);
+    if (filePath.endsWith(QStringLiteral(".json"), Qt::CaseInsensitive))
+        return importFromJson(filePath, append, imported, error);
+    // 未知扩展名：先按 JSON 试，失败再按 CSV 试
+    QString firstError;
+    if (importFromJson(filePath, append, imported, &firstError))
+        return true;
+    return importFromCsv(filePath, append, imported, error);
 }

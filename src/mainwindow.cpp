@@ -1014,6 +1014,8 @@ void MainWindow::initMenus()
     dataMenu->addAction(tr("Batch Tasks"), this, &MainWindow::showBatchTaskDialog);
     dataMenu->addAction(tr("Alarm Config"), this, &MainWindow::showAlarmConfig);
     dataMenu->addAction(tr("History Query"), this, &MainWindow::showHistoryQuery);
+    dataMenu->addAction(tr("Import Points..."), this, &MainWindow::importPointsFile);
+    dataMenu->addAction(tr("Export Points..."), this, &MainWindow::exportPointsFile);
     QMenu *advMenu = menuBar()->addMenu(tr("&Advanced"));
     advMenu->addAction(tr("Device Manager"), this, &MainWindow::showDeviceManager);
     advMenu->addAction(tr("Bus Scanner"), this, &MainWindow::showScanner);

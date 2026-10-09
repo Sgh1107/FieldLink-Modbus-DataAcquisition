@@ -60,6 +60,17 @@ public:
     bool saveToFile(const QString &filePath) const;
     bool loadFromFile(const QString &filePath);
 
+    // ---------- 点表批量导入 / 导出 ----------
+    // 说明：id 在导入时一律重新分配；append=true 追加到现有点位，false 覆盖全部。
+    bool exportToJson(const QString &filePath, QString *error = nullptr) const;
+    bool exportToCsv(const QString &filePath, QString *error = nullptr) const;
+    bool importFromJson(const QString &filePath, bool append, int *imported = nullptr, QString *error = nullptr);
+    bool importFromCsv(const QString &filePath, bool append, int *imported = nullptr, QString *error = nullptr);
+    // 按扩展名自动选择 CSV / JSON
+    bool importAuto(const QString &filePath, bool append, int *imported = nullptr, QString *error = nullptr);
+
+    static QString registerTypeName(QModbusDataUnit::RegisterType type);
+
 signals:
     void pointValueUpdated(const PointDefinition &point, const PointValue &value);
     void pointQualityChanged(int pointId, DataQuality quality);

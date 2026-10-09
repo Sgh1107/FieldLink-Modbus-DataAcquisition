@@ -23,6 +23,7 @@
 14. 功能搭配典型方案
 15. 常见问题 FAQ
 16. Modbus 调试工具（原始功能码窗 / 总线扫描器）
+17. 点表批量导入导出
 
 ---
 
@@ -395,5 +396,27 @@ data 消息由**轮询/批量读取成功**触发，先确认有轮询任务在�
    点「复制结果」可把表格（含表头）以 Tab 分隔复制到剪贴板。
 
 > 扫描为异步执行，界面不阻塞；扫描期间请勿断开连接。
+
+---
+
+## 十七、点表批量导入 / 导出（新增）
+
+批量维护点表，避免几十上百个点位在界面上逐个手点。入口：菜单 **Data → Import Points... / Export Points...**，
+点位管理窗（Advanced → Point Manager）内的「导入/导出」按钮行为一致。
+
+**支持格式**
+
+- **CSV**：带表头，列为
+  `id,name,serverAddress,registerType,address,count,dataType,scale,offset,unit,alarmLow,alarmHigh,archiveEnabled,archiveIntervalSec`
+  - `registerType` 可写数字 `0=Coils,1=DiscreteInputs,2=InputRegisters,3=HoldingRegisters`，也可写英文/中文名；
+  - `archiveEnabled` 接受 `1/0`、`true/false`、`是/否`；
+  - 导入时会**按表头名定位列**，列顺序可调整；无表头时回退到上述默认顺序；
+  - 正确解析双引号包裹与 `""` 转义，字段含逗号/引号/换行也不会串行。
+- **JSON**：与内部 `points.json` 同构（对象数组）。
+
+**导入方式**：若当前已有点位，会询问 **追加** 或 **清空覆盖**；导入的 `id` 一律重新分配。
+解析失败（缺列、格式错误）会给出明确提示，且**不会**破坏现有点位；导入成功后自动落盘到程序目录 `points.json`。
+
+**导出**：按扩展名选择 CSV 或 JSON；CSV 带 UTF-8 BOM，Excel 直接打开不乱码；字段按需加引号转义。
 
 

@@ -171,51 +171,71 @@ static PointValue currentPointValue(const PointModel *model, int pointId)
     return PointValue();
 }
 
-static bool exportPointsToCsv(const QVector<PointDefinition> &points, const QString &filePath)
+// 点表批量导入：交互式选择文件 + 追加/覆盖，返回是否有数据被导入
+static bool importPointsInteractive(QWidget *parent, PointModel *model)
 {
-    QFile file(filePath);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Text))
+    if (!model)
         return false;
-    QTextStream out(&file);
-    out.setGenerateByteOrderMark(true);
-    out << "id,name,serverAddress,registerType,address,count,dataType,scale,offset,unit,alarmLow,alarmHigh,archiveEnabled,archiveIntervalSec\n";
-    for (const auto &p : points) {
-        out << p.id << ',' << '"' << p.name << '"' << ',' << p.serverAddress << ',' << static_cast<int>(p.registerType) << ','
-            << p.address << ',' << p.count << ',' << p.dataType << ',' << p.scale << ',' << p.offset << ',' << '"' << p.unit << '"' << ','
-            << p.alarmLow << ',' << p.alarmHigh << ',' << (p.archiveEnabled ? 1 : 0) << ',' << p.archiveIntervalSec << '\n';
+    const QString file = QFileDialog::getOpenFileName(
+        parent, QStringLiteral("导入点表"), QCoreApplication::applicationDirPath(),
+        QStringLiteral("Point Files (*.csv *.json);;CSV Files (*.csv);;JSON Files (*.json)"));
+    if (file.isEmpty())
+        return false;
+
+    bool append = true;
+    if (!model->points().isEmpty()) {
+        const QMessageBox::StandardButton btn = QMessageBox::question(
+            parent, QStringLiteral("导入方式"),
+            QStringLiteral("当前已有 %1 个点位：\n\n【是】追加到现有点位\n【否】清空后覆盖导入\n【取消】放弃导入")
+                .arg(model->points().size()),
+            QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel, QMessageBox::Yes);
+        if (btn == QMessageBox::Cancel)
+            return false;
+        append = (btn == QMessageBox::Yes);
     }
+
+    int imported = 0;
+    QString error;
+    if (!model->importAuto(file, append, &imported, &error)) {
+        QMessageBox::warning(parent, QStringLiteral("导入失败"),
+                             error.isEmpty() ? QStringLiteral("未知错误") : error);
+        return false;
+    }
+    QMessageBox::information(parent, QStringLiteral("导入完成"),
+                             QStringLiteral("已导入 %1 个点位（%2）")
+                                 .arg(imported)
+                                 .arg(append ? QStringLiteral("追加") : QStringLiteral("覆盖")));
     return true;
 }
 
-static QVector<QStringList> parseCsvRows(const QString &filePath)
+// 点表批量导出：按扩展名选择 CSV / JSON
+static bool exportPointsInteractive(QWidget *parent, PointModel *model)
 {
-    QVector<QStringList> rows;
-    QFile file(filePath);
-    if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
-        return rows;
-    QTextStream in(&file);
-    while (!in.atEnd()) {
-        QString line = in.readLine();
-        QStringList row;
-        QString cell;
-        bool quoted = false;
-        for (int i = 0; i < line.size(); ++i) {
-            const QChar ch = line.at(i);
-            if (ch == '"') {
-                quoted = !quoted;
-            } else if (ch == ',' && !quoted) {
-                row << cell.trimmed();
-                cell.clear();
-            } else {
-                cell.append(ch);
-            }
-        }
-        row << cell.trimmed();
-        rows << row;
+    if (!model)
+        return false;
+    if (model->points().isEmpty()) {
+        QMessageBox::information(parent, QStringLiteral("导出点表"), QStringLiteral("当前没有点位可导出。"));
+        return false;
     }
-    return rows;
-}
+    const QString file = QFileDialog::getSaveFileName(
+        parent, QStringLiteral("导出点表"), QDir::homePath() + QStringLiteral("/points.csv"),
+        QStringLiteral("CSV Files (*.csv);;JSON Files (*.json)"));
+    if (file.isEmpty())
+        return false;
 
+    QString error;
+    const bool ok = file.endsWith(QStringLiteral(".json"), Qt::CaseInsensitive)
+                        ? model->exportToJson(file, &error)
+                        : model->exportToCsv(file, &error);
+    if (!ok) {
+        QMessageBox::warning(parent, QStringLiteral("导出失败"),
+                             error.isEmpty() ? QStringLiteral("未知错误") : error);
+        return false;
+    }
+    QMessageBox::information(parent, QStringLiteral("导出完成"),
+                             QStringLiteral("已导出 %1 个点位到：\n%2").arg(model->points().size()).arg(file));
+    return true;
+}
 
 void MainWindow::onPollRequest(const PollTask &task)
 {
@@ -1546,30 +1566,12 @@ void MainWindow::showPointManager()
     connect(deleteBtn, &QPushButton::clicked, &dialog, [&]() { const int id = selectedPointId(); if (id) { m_pointModel->removePoint(id); m_pointModel->saveToFile(pointFilePath()); refresh(); } });
     connect(saveBtn, &QPushButton::clicked, &dialog, [&]() { m_pointModel->saveToFile(pointFilePath()); statusBar()->showMessage("点位配置已保存", 3000); });
     connect(importBtn, &QPushButton::clicked, &dialog, [&]() {
-        const QString file = QFileDialog::getOpenFileName(&dialog, "导入点位", QCoreApplication::applicationDirPath(), "Point Files (*.json *.csv)");
-        if (file.isEmpty()) return;
-        bool ok = false;
-        int imported = 0;
-        if (file.endsWith(".csv", Qt::CaseInsensitive)) {
-            const auto rows = parseCsvRows(file);
-            for (int i = 1; i < rows.size(); ++i) {
-                const auto row = rows[i];
-                if (row.size() < 14) continue;
-                PointDefinition p;
-                p.name = row[1]; p.serverAddress = row[2].toInt(); p.registerType = static_cast<QModbusDataUnit::RegisterType>(row[3].toInt());
-                p.address = row[4].toInt(); p.count = row[5].toInt(); p.dataType = row[6]; p.scale = row[7].toDouble(); p.offset = row[8].toDouble(); p.unit = row[9];
-                p.alarmLow = row[10].toDouble(); p.alarmHigh = row[11].toDouble(); p.archiveEnabled = row[12].toInt() != 0; p.archiveIntervalSec = row[13].toInt();
-                m_pointModel->addPoint(p); ++imported;
-            }
-            ok = imported > 0;
-        } else {
-            ok = m_pointModel->loadFromFile(file);
-            imported = m_pointModel->points().size();
+        if (importPointsInteractive(&dialog, m_pointModel)) {
+            m_pointModel->saveToFile(pointFilePath());
+            refresh();
         }
-        if (ok) { m_pointModel->saveToFile(pointFilePath()); refresh(); statusBar()->showMessage(QString("点位导入完成: %1").arg(imported), 3000); }
-        else statusBar()->showMessage("点位导入失败", 3000);
     });
-    connect(exportBtn, &QPushButton::clicked, &dialog, [&]() { const QString file = QFileDialog::getSaveFileName(&dialog, "导出点位", QDir::homePath() + "/points.json", "JSON Files (*.json);;CSV Files (*.csv)"); if (file.isEmpty()) return; const bool ok = file.endsWith(".csv", Qt::CaseInsensitive) ? exportPointsToCsv(m_pointModel->points(), file) : m_pointModel->saveToFile(file); statusBar()->showMessage(ok ? "点位导出完成" : "点位导出失败", 3000); });
+    connect(exportBtn, &QPushButton::clicked, &dialog, [&]() { exportPointsInteractive(&dialog, m_pointModel); });
     connect(templateBtn, &QPushButton::clicked, &dialog, [&]() { showTemplateManager(); refresh(); });
     connect(pollBtn, &QPushButton::clicked, &dialog, [&]() { const int id = selectedPointId(); if (!id) return; const auto p = m_pointModel->point(id); PollTask task{30000 + p.id, QStringLiteral("点位.%1").arg(p.name), p.serverAddress, p.registerType, p.address, p.count, qMax(100, p.archiveIntervalSec * 1000), true, true, p.alarmLow, p.alarmHigh}; m_pollManager->removeTask(task.id); m_pollManager->addTask(task); statusBar()->showMessage("点位轮询任务已生成", 3000); });
     connect(alarmBtn, &QPushButton::clicked, &dialog, [&]() { const int id = selectedPointId(); if (!id) return; const auto p = m_pointModel->point(id); AlarmRule r{}; r.name = p.name + " 上下限报警"; r.enabled = true; r.serverAddress = p.serverAddress; r.registerType = static_cast<int>(p.registerType); r.address = p.address; r.condition = AlarmCondition::OutOfRange; r.threshold1 = p.alarmLow; r.threshold2 = p.alarmHigh; r.severity = AlarmSeverity::Warning; r.message = p.name + " 超出上下限"; r.debounceMs = 0; m_alarmManager->addRule(r); statusBar()->showMessage("点位报警规则已绑定", 3000); });
@@ -1988,7 +1990,7 @@ void MainWindow::loadProfile()
     }
 }
 
-// ==================== 原始功能码工具窗 / 总线扫描器 ====================
+// ==================== 原始功能码工具窗 / 总线扫描器 / 点表批量导入导出 ====================
 
 void MainWindow::showRawRequestTool()
 {
@@ -2002,4 +2004,18 @@ void MainWindow::showScanner()
     ScannerDialog dialog([this]() { return modbusDevice; }, m_pollManager, this);
     dialog.exec();
     statusBar()->showMessage(QStringLiteral("总线扫描结束"), 3000);
+}
+
+void MainWindow::importPointsFile()
+{
+    if (importPointsInteractive(this, m_pointModel)) {
+        m_pointModel->saveToFile(pointFilePath());
+        statusBar()->showMessage(QStringLiteral("点表导入完成"), 3000);
+    }
+}
+
+void MainWindow::exportPointsFile()
+{
+    if (exportPointsInteractive(this, m_pointModel))
+        statusBar()->showMessage(QStringLiteral("点表导出完成"), 3000);
 }
