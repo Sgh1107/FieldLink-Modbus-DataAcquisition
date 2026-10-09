@@ -104,6 +104,8 @@ private slots:
     void showDeviceSimulator();
     void showPluginManager();
     void showPointManager();
+    void showRawRequestTool();                 // 原始功能码 / 报文发送工具窗
+    void showScanner();                        // Modbus 总线扫描器
     void showVerificationManager();
     void showDeliveryManager();
     void showSecurityManager();

@@ -40,7 +40,9 @@ SOURCES += src/main.cpp\
         src/deliverymanager.cpp \
         src/crashlogger.cpp \
         src/mqttclient.cpp \
-        src/devicesimulator.cpp
+        src/devicesimulator.cpp \
+        src/rawrequestdialog.cpp \
+        src/scannerdialog.cpp
 
 HEADERS  += header/mainwindow.h \
          header/settingsdialog.h \
@@ -70,7 +72,9 @@ HEADERS  += header/mainwindow.h \
         header/thememanager.h \
         header/mqttclient.h \
         header/credentialcodec.h \
-        header/devicesimulator.h
+        header/devicesimulator.h \
+        header/rawrequestdialog.h \
+        header/scannerdialog.h
 
 FORMS    += mainwindow.ui \
          settingsdialog.ui

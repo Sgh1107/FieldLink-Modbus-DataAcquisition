@@ -1016,6 +1016,8 @@ void MainWindow::initMenus()
     dataMenu->addAction(tr("History Query"), this, &MainWindow::showHistoryQuery);
     QMenu *advMenu = menuBar()->addMenu(tr("&Advanced"));
     advMenu->addAction(tr("Device Manager"), this, &MainWindow::showDeviceManager);
+    advMenu->addAction(tr("Bus Scanner"), this, &MainWindow::showScanner);
+    advMenu->addAction(tr("Raw Request (Tools)"), this, &MainWindow::showRawRequestTool);
     advMenu->addAction(tr("Device Templates"), this, &MainWindow::showTemplateManager);
     advMenu->addAction(tr("Script Console"), this, &MainWindow::showScriptConsole);
     advMenu->addAction(tr("Remote Service"), this, &MainWindow::toggleRemoteServer);

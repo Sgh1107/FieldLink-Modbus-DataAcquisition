@@ -23,6 +23,8 @@
 #include "mqttclient.h"         // MQTT 发布端客户端
 #include "devicesimulator.h"    // 模拟设备（Modbus 从站）测试面板
 #include "credentialcodec.h"    // U1：凭据混淆编解码（broker 密码不明文落盘）
+#include "rawrequestdialog.h"   // 原始功能码 / 报文发送工具窗
+#include "scannerdialog.h"      // Modbus 总线扫描器
 
 #include <QFileDialog>
 #include <QMessageBox>
@@ -1984,4 +1986,20 @@ void MainWindow::loadProfile()
         statusBar()->showMessage("配置已加载: " + name, 3000);
         logMessage("配置加载: " + name);
     }
+}
+
+// ==================== 原始功能码工具窗 / 总线扫描器 ====================
+
+void MainWindow::showRawRequestTool()
+{
+    // 通过回调实时取当前客户端：自动重连会重建 modbusDevice，缓存裸指针会失效
+    RawRequestDialog dialog([this]() { return modbusDevice; }, this);
+    dialog.exec();
+}
+
+void MainWindow::showScanner()
+{
+    ScannerDialog dialog([this]() { return modbusDevice; }, m_pollManager, this);
+    dialog.exec();
+    statusBar()->showMessage(QStringLiteral("总线扫描结束"), 3000);
 }

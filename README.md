@@ -37,6 +37,7 @@
 - ✅ **CI 自动回归**：GitHub Actions（Qt 6）每次 push/PR 自动构建并运行测试套件，并额外用 **ASan/LSan + Valgrind** 做内存泄漏与非法访问检查
 - ✅ **脚本与插件扩展**：内置 QJSEngine 脚本控制台（可加载脚本文件、注册全局对象），标准 Qt 插件接口（数据回调 + 连接状态回调 + 读写设置），二次开发友好
 - ✅ **设备模板/点表管理**：寄存器点表支持数据类型（uint16/int16/uint32/int32/float32/ascii）、字节序（ABCD/DCBA/BADC/CDAB）、缩放/偏移/工程单位换算
+- ✅ **Modbus 调试工具**：原始功能码/报文发送窗（基于 `sendRawRequest`，覆盖 FC07/08/0B/0C/11/16(22)/17(23)/18(24)/2B·0E 等 Qt SerialBus 未封装功能，支持循环发送与异常码解析）+ **总线扫描器**（区间扫描在线从站、可一键生成轮询任务）
 - ✅ **主题与本地化**：深色/浅色工业风主题一键切换（Fusion + QSS），配置自动记忆；内置 i18n 框架（lrelease 构建期编译翻译并嵌入资源）
 - ✅ **内置测试套件**：`tests/` 下 158 项无 GUI 断言（报警条件/位号越界防护/加盐哈希/权限模型/MQTT QoS0+QoS1 协议/字节序换算/任务调度/CSV 转义），`qmake + make` 一键回归
 - ✅ **交付工具链内置**：交付清单、运行环境检查、日志打包、发布说明/用户手册/维护手册自动生成、Windows 打包脚本一键产出
@@ -171,6 +172,10 @@ FieldLink-Modbus-DataAcquisition/
 │   │
 │   ├── ── MQTT 上送 ──
 │   ├── mqttclient.h          # 零依赖 MQTT 3.1.1 发布端（QoS0/自动重连/心跳）
+│   │
+│   ├── ── Modbus 调试工具 ──
+│   ├── rawrequestdialog.h    # 原始功能码/报文发送窗（sendRawRequest）
+│   ├── scannerdialog.h       # 总线扫描器（区间扫描在线从站）
 │   │
 │   ├── ── 测试与模拟 ──
 │   ├── devicesimulator.h     # 模拟设备面板（一键起停 Modbus TCP 从站）
