@@ -8,6 +8,8 @@
 //
 // 输出约定：[PASS]/[FAIL] 为断言结果（FAIL 计入失败数）；
 //           [KNOWN-ISSUE CONFIRMED] 为 code review 已知问题的证据（不计失败，见测试报告）。
+//
+// PM 组：PointModel 点表管理 + CSV/JSON 批量导入导出（此前无任何自动化覆盖）
 
 #include <QCoreApplication>
 #include <QEventLoop>
@@ -20,8 +22,13 @@
 #include <QDateTime>
 #include <QFile>
 #include <QTextStream>
+#include <QElapsedTimer>
+#include <QJsonDocument>
+#include <QJsonArray>
 #include <cstdio>
+#include <cstring>
 #include <algorithm>
+#include <memory>
 
 #include "alarmmanager.h"
 #include "securitymanager.h"
@@ -34,6 +41,8 @@
 #include "historydata.h"
 #include "batchtaskmanager.h"
 #include "dataparser.h"
+#include "pointmodel.h"
+#include "modbusdiagnostics.h"
 
 static int g_failed = 0;
 static int g_passed = 0;
@@ -964,6 +973,1199 @@ static void testCredentialCodec()
     CHECK("U1: UTF-8 回环", CredentialCodec::decode(CredentialCodec::encode(zh)) == zh);
 }
 
+// =====================================================================
+// PM 组：PointModel 点表管理 + CSV/JSON 批量导入导出
+// 覆盖此前完全无自动化测试的新模块（提交 9138eac）。
+// 重点：往返无损、列自适应、转义、原子性（失败不破坏现有点位）。
+// =====================================================================
+
+namespace pmtest {
+
+// 写文本文件（默认 UTF-8，便于构造畸形输入）
+static bool writeFile(const QString &path, const QByteArray &content, bool withBom = false)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return false;
+    if (withBom)
+        f.write("\xEF\xBB\xBF", 3);
+    f.write(content);
+    f.close();
+    return true;
+}
+
+static QByteArray readFile(const QString &path)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly))
+        return QByteArray();
+    return f.readAll();
+}
+
+// 判断两点除 id 外的业务字段是否一致（id 在导入时按约定重新分配，不参与比较）
+static bool sameBusinessFields(const PointDefinition &a, const PointDefinition &b)
+{
+    return a.name == b.name
+        && a.serverAddress == b.serverAddress
+        && a.registerType == b.registerType
+        && a.address == b.address
+        && a.count == b.count
+        && a.dataType == b.dataType
+        && qFuzzyCompare(a.scale + 1.0, b.scale + 1.0)
+        && qFuzzyCompare(a.offset + 1.0, b.offset + 1.0)
+        && a.unit == b.unit
+        && qFuzzyCompare(a.alarmLow + 1.0, b.alarmLow + 1.0)
+        && qFuzzyCompare(a.alarmHigh + 1.0, b.alarmHigh + 1.0)
+        && a.archiveEnabled == b.archiveEnabled
+        && a.archiveIntervalSec == b.archiveIntervalSec;
+}
+
+static QVector<PointDefinition> samplePoints()
+{
+    QVector<PointDefinition> pts;
+    for (int i = 0; i < 4; ++i) {
+        PointDefinition p;
+        p.name = QStringLiteral("点位%1").arg(i);
+        p.serverAddress = 1 + i % 3;
+        p.registerType = static_cast<QModbusDataUnit::RegisterType>(1 + i % 4); // 四张表轮转（跳过 Invalid）
+        p.address = i * 10;
+        p.count = (i % 3) + 1;
+        p.dataType = QStringLiteral("uint16");
+        p.scale = 1.0 + i * 0.25;
+        p.offset = -i * 2.5;
+        p.unit = QStringLiteral("°C");
+        p.alarmLow = -100.0 - i;
+        p.alarmHigh = 8000.0 + i * 100;
+        p.archiveEnabled = (i % 2 == 0);
+        p.archiveIntervalSec = 5 + i * 5;
+        pts.append(p);
+    }
+    // 追加一个覆盖全部寄存器类型的点，确保四种类型都被往返覆盖
+    PointDefinition t;
+    t.name = QStringLiteral("线圈A");
+    t.registerType = QModbusDataUnit::Coils;
+    t.address = 3;
+    t.count = 1;
+    t.dataType = QStringLiteral("uint16");
+    t.unit = QStringLiteral("V");
+    t.alarmHigh = 1.0;
+    pts.append(t);
+    return pts;
+}
+
+// 填充模型（PointModel 继承 QObject 不可拷贝，故返回 unique_ptr 供引用绑定）
+static std::unique_ptr<PointModel> buildModel(const QVector<PointDefinition> &pts)
+{
+    std::unique_ptr<PointModel> m(new PointModel);
+    for (const PointDefinition &p : pts)
+        m->addPoint(p);
+    return m;
+}
+
+} // namespace pmtest
+
+// =====================================================================
+// DG 组：Modbus 调试工具纯逻辑（原 RawRequestDialog / ScannerDialog 内部逻辑）
+// 这两个对话框是 GUI + 异步网络类，逻辑无法直接测，故已抽出 ModbusDiagnostics 模块。
+// =====================================================================
+
+// ---- DG1: PDU 十六进制解析容错 ----
+static void testDiagParseHexBytes()
+{
+    printf("\n=== ModbusDiagnostics DG1 PDU 十六进制解析 ===\n");
+
+    struct Case { const char *input; bool shouldPass; const char *bytesHex; const char *desc; };
+    const Case cases[] = {
+        { "00 00 00 0A", true,  "0000000A", "空格分隔" },
+        { "00,0a",        true,  "000A",     "逗号分隔 + 小写" },
+        { "000A",         true,  "000A",     "无分隔符" },
+        { "0x00 0x0A",    true,  "000A",     "带 0x 前缀" },
+        { "0X00 0X0a",    true,  "000A",     "大写 0X 前缀 + 小写数字" },
+        { "00;0A:0B_0C-0D", true, "000A0B0C0D", "混合分隔符 ; : _ -" },
+        { "  00  0A  ",   true,  "000A",     "前后空白" },
+        { "",             true,  "",         "空串（允许空 PDU）" },
+        { "   ",          true,  "",         "纯空白（允许空 PDU）" },
+        { "0",            false, nullptr,    "单个字符（奇数长度）" },
+        { "000",          false, nullptr,    "三个字符（奇数长度）" },
+        { "0G",           false, nullptr,    "非法十六进制字符 G" },
+        { "00 ZZ",        false, nullptr,    "含非法片段" },
+        { "GG",           false, nullptr,    "全非法" },
+        { "AB-CD",        true,  "ABCD",     "连字符作为分隔符" },
+    };
+
+    for (const Case &c : cases) {
+        QByteArray out;
+        QString err;
+        const bool ok = ModbusDiagnostics::parseHexBytes(QString::fromUtf8(c.input), &out, &err);
+        const QString expected = QString::fromUtf8(c.bytesHex ? c.bytesHex : "");
+        const QByteArray expectBytes = QByteArray::fromHex(expected.toLatin1());
+        if (c.shouldPass) {
+            const bool same = (ok && out == expectBytes);
+            CHECK(QStringLiteral("DG1: 解析「%1」→ %2（%3）")
+                      .arg(QString::fromUtf8(c.input), expected, QString::fromUtf8(c.desc)),
+                  same);
+        } else {
+            CHECK(QStringLiteral("DG1: 拒绝「%1」（%2）")
+                      .arg(QString::fromUtf8(c.input), QString::fromUtf8(c.desc)),
+                  !ok);
+            CHECK(QStringLiteral("DG1: 失败时给出错误信息 —「%1」").arg(QString::fromUtf8(c.input)),
+                  !err.isEmpty());
+        }
+    }
+
+    // 失败时输出缓冲必须被清空（不能残留上一次的内容）
+    {
+        QByteArray out("STALE-DATA");
+        QString err;
+        ModbusDiagnostics::parseHexBytes(QStringLiteral("XYZ"), &out, &err);
+        CHECK("DG1: 解析失败时输出缓冲被清空", out.isEmpty());
+    }
+    {   // 空 PDU 也要清空
+        QByteArray out("STALE");
+        QString err;
+        ModbusDiagnostics::parseHexBytes(QString(), &out, &err);
+        CHECK("DG1: 空输入时输出缓冲被清空", out.isEmpty());
+    }
+    {   // out 为 nullptr 时安全返回 false，不崩溃
+        QString err;
+        CHECK("DG1: out 为空指针时安全返回 false",
+              !ModbusDiagnostics::parseHexBytes(QStringLiteral("00"), nullptr, &err));
+    }
+    {   // error 传 nullptr 不崩溃
+        QByteArray out;
+        CHECK("DG1: error 为空指针时解析仍成功",
+              ModbusDiagnostics::parseHexBytes(QStringLiteral("00 01"), &out, nullptr)
+                  && out.size() == 2);
+    }
+}
+
+// ---- DG2: 十六进制显示 ----
+static void testDiagHexFormatting()
+{
+    printf("\n=== ModbusDiagnostics DG2 十六进制显示 ===\n");
+    CHECK("DG2: 0 → \"00\"（补零到两位）", ModbusDiagnostics::hexByte(0) == QStringLiteral("00"));
+    CHECK("DG2: 1 → \"01\"", ModbusDiagnostics::hexByte(1) == QStringLiteral("01"));
+    CHECK("DG2: 10 → \"0A\"（大写）", ModbusDiagnostics::hexByte(10) == QStringLiteral("0A"));
+    CHECK("DG2: 15 → \"0F\"", ModbusDiagnostics::hexByte(15) == QStringLiteral("0F"));
+    CHECK("DG2: 255 → \"FF\"", ModbusDiagnostics::hexByte(255) == QStringLiteral("FF"));
+    CHECK("DG2: 128 → \"80\"", ModbusDiagnostics::hexByte(128) == QStringLiteral("80"));
+    CHECK("DG2: 全部字节两字符宽", ModbusDiagnostics::hexByte(1).size() == 2);
+
+    CHECK("DG2: 空数组 → 空串", ModbusDiagnostics::hexBytes(QByteArray()).isEmpty());
+    CHECK("DG2: 单字节 → \"0A\"",
+          ModbusDiagnostics::hexBytes(QByteArray::fromHex("0A")) == QStringLiteral("0A"));
+    CHECK("DG2: 多字节空格分隔",
+          ModbusDiagnostics::hexBytes(QByteArray::fromHex("0A0B0C")) == QStringLiteral("0A 0B 0C"));
+    CHECK("DG2: 高位字节正确",
+          ModbusDiagnostics::hexBytes(QByteArray::fromHex("FF0080")) == QStringLiteral("FF 00 80"));
+}
+
+// ---- DG3: 异常码解析全覆盖 ----
+static void testDiagExceptionNames()
+{
+    printf("\n=== ModbusDiagnostics DG3 异常码解析 ===\n");
+    struct Case { int code; const char *keyword; };
+    const Case cases[] = {
+        { 0x01, "非法功能" }, { 0x02, "非法数据地址" }, { 0x03, "非法数据值" },
+        { 0x04, "设备故障" }, { 0x05, "确认" },        { 0x06, "忙" },
+        { 0x08, "奇偶校验" }, { 0x0A, "网关路径" },    { 0x0B, "网关目标" },
+    };
+    for (const Case &c : cases) {
+        const QString name = ModbusDiagnostics::exceptionName(c.code);
+        CHECK(QStringLiteral("DG3: 异常码 0x%1 → 「%2」")
+                  .arg(c.code, 2, 16, QLatin1Char('0')).arg(name),
+              name.contains(QString::fromUtf8(c.keyword)));
+    }
+    // 规范里 0x07 / 0x09 未定义，0x0C+ 为厂商自定义
+    for (int code : { 0x00, 0x07, 0x09, 0x0C, 0x0D, 0xFF }) {
+        CHECK(QStringLiteral("DG3: 未定义异常码 0x%1 → 「未知异常」（非空）")
+                  .arg(code, 2, 16, QLatin1Char('0')),
+              ModbusDiagnostics::exceptionName(code) == QStringLiteral("未知异常"));
+    }
+    for (const Case &c : cases) {
+        CHECK(QStringLiteral("DG3: 异常码 0x%1 不退化为未知")
+                  .arg(c.code, 2, 16, QLatin1Char('0')),
+              ModbusDiagnostics::exceptionName(c.code) != QStringLiteral("未知异常"));
+    }
+}
+
+// ---- DG4: 报文构造（大端字节序）----
+static void testDiagPayloadBuilding()
+{
+    printf("\n=== ModbusDiagnostics DG4 报文构造 ===\n");
+
+    const QByteArray p = ModbusDiagnostics::readPayload(0, 10);
+    CHECK("DG4: readPayload(0,10) 长度 4", p.size() == 4);
+    CHECK("DG4: readPayload(0,10) 字节序正确（大端 00 00 00 0A）",
+          p == QByteArray::fromHex("0000000A"));
+    CHECK("DG4: readPayload(1,1) = 00 01 00 01",
+          ModbusDiagnostics::readPayload(1, 1) == QByteArray::fromHex("00010001"));
+    CHECK("DG4: readPayload(255,256) = 00 FF 01 00",
+          ModbusDiagnostics::readPayload(255, 256) == QByteArray::fromHex("00FF0100"));
+    CHECK("DG4: readPayload(65535,125) = FF FF 00 7D",
+          ModbusDiagnostics::readPayload(65535, 125) == QByteArray::fromHex("FFFF007D"));
+    CHECK("DG4: readPayload(0x1234,0x5678) = 12 34 56 78（大端交叉验证）",
+          ModbusDiagnostics::readPayload(0x1234, 0x5678) == QByteArray::fromHex("12345678"));
+    {   // 数量为 0 也不应崩溃（界面已限制 ≥1，但纯函数应健壮）
+        // 注意：QByteArray::fromHex("00000000") 会得到「空」QByteArray（Qt 把全 0 视为空），
+        // 所以这里逐字节校验，不能用 fromHex 做期望值。
+        // 期望：地址 10 = 0x000A，数量 0 = 0x0000 → 00 0A 00 00
+        const QByteArray z = ModbusDiagnostics::readPayload(10, 0);
+        CHECK("DG4: readPayload 数量为 0 时长度仍为 4", z.size() == 4);
+        CHECK("DG4: readPayload(10,0) 字节序正确（地址 00 0A + 数量 00 00）",
+              static_cast<quint8>(z.at(0)) == 0x00 && static_cast<quint8>(z.at(1)) == 0x0A
+              && static_cast<quint8>(z.at(2)) == 0x00 && static_cast<quint8>(z.at(3)) == 0x00);
+    }
+    {   // 越界值被截断到一字节（不产生多字节溢出）
+        const QByteArray o = ModbusDiagnostics::readPayload(0x1FFFF, 1);
+        CHECK("DG4: 超范围地址被截断为低 16 位（FF FF）", o.left(2) == QByteArray::fromHex("FFFF"));
+    }
+
+
+    {   // 构造 → 解析 往返一致
+        const int addrs[] = { 0, 1, 255, 256, 4096, 65535 };
+        bool allRoundTrip = true;
+        for (int a : addrs) {
+            const QByteArray d = ModbusDiagnostics::readPayload(a, 125);
+            const int parsedAddr = (static_cast<quint8>(d.at(0)) << 8) | static_cast<quint8>(d.at(1));
+            const int parsedCount = (static_cast<quint8>(d.at(2)) << 8) | static_cast<quint8>(d.at(3));
+            if (parsedAddr != a || parsedCount != 125)
+                allRoundTrip = false;
+        }
+        CHECK("DG4: 地址往返解析一致（大端无歧义）", allRoundTrip);
+    }
+}
+
+// ---- DG5: 功能码合法性 ----
+static void testDiagFunctionCodeValidation()
+{
+    printf("\n=== ModbusDiagnostics DG5 功能码合法性 ===\n");
+    CHECK("DG5: FC01 合法", ModbusDiagnostics::isValidFunctionCode(0x01));
+    CHECK("DG5: FC03 合法", ModbusDiagnostics::isValidFunctionCode(0x03));
+    CHECK("DG5: FC10 合法", ModbusDiagnostics::isValidFunctionCode(0x10));
+    CHECK("DG5: FC7F 合法（上边界）", ModbusDiagnostics::isValidFunctionCode(0x7F));
+    CHECK("DG5: FC00 非法（保留）", !ModbusDiagnostics::isValidFunctionCode(0x00));
+    CHECK("DG5: FC80 非法（异常响应标志位，非请求码）",
+          !ModbusDiagnostics::isValidFunctionCode(0x80));
+    CHECK("DG5: FCFF 非法", !ModbusDiagnostics::isValidFunctionCode(0xFF));
+    CHECK("DG5: 负数非法", !ModbusDiagnostics::isValidFunctionCode(-1));
+    CHECK("DG5: 超大值非法", !ModbusDiagnostics::isValidFunctionCode(999));
+
+    const int tableCodes[] = { 0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,
+                               0x0B,0x0C,0x0F,0x10,0x11,0x16,0x17,0x18,0x2B };
+    bool allValid = true;
+    for (int c : tableCodes)
+        if (!ModbusDiagnostics::isValidFunctionCode(c))
+            allValid = false;
+    CHECK("DG5: 功能码速查表 17 项全部合法", allValid);
+}
+
+// ---- DG6: 扫描区间校验 ----
+static void testDiagScanRangeValidation()
+{
+    printf("\n=== ModbusDiagnostics DG6 扫描区间校验 ===\n");
+    int total = -1;
+    QString err;
+
+    CHECK("DG6: 1..1 合法（单地址）",
+          ModbusDiagnostics::validateScanRange(1, 1, &total, &err) && total == 1);
+    total = -1;
+    CHECK("DG6: 1..16 合法 → 共 16 个",
+          ModbusDiagnostics::validateScanRange(1, 16, &total, &err) && total == 16);
+    total = -1;
+    CHECK("DG6: 1..247 合法（Modbus 标准全范围）→ 共 247 个",
+          ModbusDiagnostics::validateScanRange(1, 247, &total, &err) && total == 247);
+    total = -1;
+    CHECK("DG6: 5..10 合法 → 共 6 个（含首尾）",
+          ModbusDiagnostics::validateScanRange(5, 10, &total, &err) && total == 6);
+    total = -1;
+    CHECK("DG6: 247..247 合法",
+          ModbusDiagnostics::validateScanRange(247, 247, &total, &err) && total == 1);
+    total = -1;
+    CHECK("DG6: 100..1 非法（结束<起始）",
+          !ModbusDiagnostics::validateScanRange(100, 1, &total, &err));
+    CHECK("DG6: 结束<起始时给出错误说明", err.contains(QStringLiteral("不小于")));
+    CHECK("DG6: 失败时 total 输出为 0", total == 0);
+
+    err.clear();
+    CHECK("DG6: 起始 0 非法（广播地址不可扫描）",
+          !ModbusDiagnostics::validateScanRange(0, 10, &total, &err));
+    CHECK("DG6: 起始 0 的错误说明提到广播", err.contains(QStringLiteral("广播")));
+    err.clear();
+    CHECK("DG6: 结束 0 非法", !ModbusDiagnostics::validateScanRange(1, 0, &total, &err));
+    err.clear();
+    CHECK("DG6: 起始 248 非法（超上界）",
+          !ModbusDiagnostics::validateScanRange(248, 248, &total, &err));
+    err.clear();
+    CHECK("DG6: 起始 -1 非法", !ModbusDiagnostics::validateScanRange(-1, 5, &total, &err));
+    err.clear();
+    CHECK("DG6: 结束 300 非法", !ModbusDiagnostics::validateScanRange(1, 300, &total, &err));
+    err.clear();
+    CHECK("DG6: 全部非法区间 total 均为 0",
+          !ModbusDiagnostics::validateScanRange(0, 0, &total, &err) && total == 0);
+
+    CHECK("DG6: 输出指针为 nullptr 时校验仍可用",
+          ModbusDiagnostics::validateScanRange(1, 10, nullptr, nullptr));
+}
+
+// ---- DG7: 探测功能码与寄存器表映射 ----
+static void testDiagProbeMapping()
+{
+    printf("\n=== ModbusDiagnostics DG7 探测功能码映射 ===\n");
+    const ModbusDiagnostics::ProbeOption *opts = ModbusDiagnostics::probeOptions();
+    const int n = ModbusDiagnostics::probeOptionCount();
+
+    CHECK("DG7: 探测选项非空", n > 0);
+    CHECK("DG7: 探测选项指针非空", opts != nullptr);
+    CHECK("DG7: 恰有 4 个探测功能码（03/01/04/02）", n == 4);
+
+    if (opts && n == 4) {
+        CHECK("DG7: 选项 0 = FC03 读保持寄存器",
+              opts[0].code == 0x03 && opts[0].type == QModbusDataUnit::HoldingRegisters);
+        CHECK("DG7: 选项 1 = FC01 读线圈",
+              opts[1].code == 0x01 && opts[1].type == QModbusDataUnit::Coils);
+        CHECK("DG7: 选项 2 = FC04 读输入寄存器",
+              opts[2].code == 0x04 && opts[2].type == QModbusDataUnit::InputRegisters);
+        CHECK("DG7: 选项 3 = FC02 读离散输入",
+              opts[3].code == 0x02 && opts[3].type == QModbusDataUnit::DiscreteInputs);
+        bool allLabeled = true;
+        for (int i = 0; i < n; ++i)
+            if (!opts[i].label || strlen(opts[i].label) == 0)
+                allLabeled = false;
+        CHECK("DG7: 所有选项都有非空标签", allLabeled);
+    }
+
+    CHECK("DG7: FC03 → HoldingRegisters",
+          ModbusDiagnostics::registerTypeForFunctionCode(0x03) == QModbusDataUnit::HoldingRegisters);
+    CHECK("DG7: FC01 → Coils",
+          ModbusDiagnostics::registerTypeForFunctionCode(0x01) == QModbusDataUnit::Coils);
+    CHECK("DG7: FC04 → InputRegisters",
+          ModbusDiagnostics::registerTypeForFunctionCode(0x04) == QModbusDataUnit::InputRegisters);
+    CHECK("DG7: FC02 → DiscreteInputs",
+          ModbusDiagnostics::registerTypeForFunctionCode(0x02) == QModbusDataUnit::DiscreteInputs);
+    CHECK("DG7: 未知功能码 → HoldingRegisters（界面默认）",
+          ModbusDiagnostics::registerTypeForFunctionCode(0x99) == QModbusDataUnit::HoldingRegisters);
+    CHECK("DG7: 写类功能码 FC06 → HoldingRegisters（不属探测集）",
+          ModbusDiagnostics::registerTypeForFunctionCode(0x06) == QModbusDataUnit::HoldingRegisters);
+
+    bool consistent = true;
+    for (int i = 0; i < n; ++i)
+        if (ModbusDiagnostics::registerTypeForFunctionCode(opts[i].code) != opts[i].type)
+            consistent = false;
+    CHECK("DG7: registerTypeForFunctionCode 与选项表一致", consistent);
+}
+
+// ---- DG8: 扫描生成轮询任务 ----
+static void testDiagPollTaskSeed()
+{
+    printf("\n=== ModbusDiagnostics DG8 扫描生成轮询任务 ===\n");
+    {
+        const ModbusDiagnostics::PollTaskSeed s =
+            ModbusDiagnostics::makePollTaskSeed(12, 0x03, 100, 10);
+        CHECK("DG8: id = 40000 + unit", s.id == 40012);
+        CHECK("DG8: 名称含从站号", s.name.contains(QStringLiteral("12")));
+        CHECK("DG8: serverAddress = unit", s.serverAddress == 12);
+        CHECK("DG8: registerType 随探测功能码（FC03）",
+              s.registerType == QModbusDataUnit::HoldingRegisters);
+        CHECK("DG8: startAddress 透传", s.startAddress == 100);
+        CHECK("DG8: quantity 透传", s.quantity == 10);
+        CHECK("DG8: intervalMs 默认 1000", s.intervalMs == 1000);
+        CHECK("DG8: alarmEnabled 默认关闭", !s.alarmEnabled);
+    }
+    {
+        const auto coils = ModbusDiagnostics::makePollTaskSeed(1, 0x01, 0, 8);
+        const auto inputs = ModbusDiagnostics::makePollTaskSeed(1, 0x04, 0, 8);
+        const auto discrete = ModbusDiagnostics::makePollTaskSeed(1, 0x02, 0, 8);
+        CHECK("DG8: FC01 生成的线圈任务",
+              coils.registerType == QModbusDataUnit::Coils && coils.quantity == 8);
+        CHECK("DG8: FC04 生成的输入寄存器任务",
+              inputs.registerType == QModbusDataUnit::InputRegisters);
+        CHECK("DG8: FC02 生成的离散输入任务",
+              discrete.registerType == QModbusDataUnit::DiscreteInputs);
+    }
+    {
+        const auto a = ModbusDiagnostics::makePollTaskSeed(7, 0x03, 0, 1);
+        const auto b = ModbusDiagnostics::makePollTaskSeed(7, 0x03, 0, 1);
+        CHECK("DG8: 同一从站 id 稳定可重现", a.id == b.id);
+        CHECK("DG8: 同一从站名称稳定可重现", a.name == b.name);
+    }
+    {
+        const auto a = ModbusDiagnostics::makePollTaskSeed(1, 0x03, 0, 1);
+        const auto b = ModbusDiagnostics::makePollTaskSeed(2, 0x03, 0, 1);
+        CHECK("DG8: 不同从站 id 不冲突", a.id != b.id);
+        CHECK("DG8: id 落在 40000+ 段", a.id >= 40001 && b.id >= 40001);
+    }
+    {
+        const auto lo = ModbusDiagnostics::makePollTaskSeed(1, 0x03, 0, 0);
+        CHECK("DG8: unit=1 正常", lo.serverAddress == 1);
+        CHECK("DG8: count=0 兜底为 1", lo.quantity == 1);
+        const auto hi = ModbusDiagnostics::makePollTaskSeed(247, 0x03, 65535, 125);
+        CHECK("DG8: unit=247 正常", hi.serverAddress == 247 && hi.id == 40247);
+        CHECK("DG8: 最大 startAddress/quantity 透传",
+              hi.startAddress == 65535 && hi.quantity == 125);
+        const auto neg = ModbusDiagnostics::makePollTaskSeed(5, 0x03, -10, -1);
+        CHECK("DG8: 负 startAddress 兜底为 0", neg.startAddress == 0);
+        CHECK("DG8: 负 quantity 兜底为 1", neg.quantity == 1);
+    }
+}
+
+// ---- DG9: 进度统计 ----
+static void testDiagScanProgress()
+{
+    printf("\n=== ModbusDiagnostics DG9 扫描进度文案 ===\n");
+    CHECK("DG9: 0/16/0 文案",
+          ModbusDiagnostics::scanProgressText(0, 16, 0)
+              == QStringLiteral("已扫描 0/16，发现 0 个在线从站"));
+    CHECK("DG9: 8/16/2 文案",
+          ModbusDiagnostics::scanProgressText(8, 16, 2)
+              == QStringLiteral("已扫描 8/16，发现 2 个在线从站"));
+    CHECK("DG9: 16/16/16 文案",
+          ModbusDiagnostics::scanProgressText(16, 16, 16)
+              == QStringLiteral("已扫描 16/16，发现 16 个在线从站"));
+    CHECK("DG9: 负数 found 被夹为 0",
+          ModbusDiagnostics::scanProgressText(1, 16, -5).contains(QStringLiteral("发现 0")));
+}
+// ---- PM1: JSON 往返无损 ----
+static void testPointModelJsonRoundTrip()
+{
+    printf("\n=== PointModel PM1 JSON 往返 ===\n");
+    QTemporaryDir dir;
+    CHECK("PM1: QTemporaryDir 可用", dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("points.json"));
+
+    const QVector<PointDefinition> src = pmtest::samplePoints();
+    auto modelPtr = pmtest::buildModel(src);
+    PointModel *model = modelPtr.get();
+
+    QString err;
+    CHECK("PM1: 导出 JSON 成功", model->exportToJson(path, &err));
+    CHECK("PM1: 导出无错误信息", err.isEmpty());
+    CHECK("PM1: 文件已生成", QFile::exists(path));
+
+    // 导入到全新实例
+    PointModel target;
+    int imported = -1;
+    QString err2;
+    CHECK("PM1: 导入 JSON 成功", target.importFromJson(path, false, &imported, &err2));
+    CHECK("PM1: 导入数量正确", imported == src.size());
+    CHECK("PM1: 导入后点位数正确", target.points().size() == src.size());
+
+    bool allMatch = true;
+    const QVector<PointDefinition> got = target.points();
+    for (int i = 0; i < src.size() && i < got.size(); ++i)
+        if (!pmtest::sameBusinessFields(src.at(i), got.at(i)))
+            allMatch = false;
+    CHECK("PM1: 全部字段往返无损（含四张寄存器表）", allMatch);
+
+    // 校验具体数值，避免"看起来对"的假阳性
+    if (got.size() >= 3) {
+        CHECK("PM1: 第0点 scale/offset 精确还原", qFuzzyCompare(got[0].scale, 1.0)
+              && qFuzzyCompare(got[0].offset, 0.0) && got[0].unit == QStringLiteral("°C"));
+        CHECK("PM1: 第1点 serverAddress 还原", got[1].serverAddress == 2);
+        CHECK("PM1: 第1点 archiveEnabled=false 还原", got[1].archiveEnabled == false);
+        CHECK("PM1: 第2点 archiveIntervalSec 还原", got[2].archiveIntervalSec == 15);
+        CHECK("PM1: Coils 类型点还原", got.last().registerType == QModbusDataUnit::Coils
+              && got.last().alarmHigh == 1.0);
+    }
+
+}
+
+// ---- PM2: CSV 往返无损 + BOM ----
+static void testPointModelCsvRoundTrip()
+{
+    printf("\n=== PointModel PM2 CSV 往返 ===\n");
+    QTemporaryDir dir;
+    CHECK("PM2: QTemporaryDir 可用", dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("points.csv"));
+
+    const QVector<PointDefinition> src = pmtest::samplePoints();
+    auto modelPtr = pmtest::buildModel(src);
+    PointModel *model = modelPtr.get();
+
+    QString err;
+    CHECK("PM2: 导出 CSV 成功", model->exportToCsv(path, &err));
+    const QByteArray raw = pmtest::readFile(path);
+    CHECK("PM2: 文件以 UTF-8 BOM 开头（Excel 友好）", raw.startsWith("\xEF\xBB\xBF"));
+
+    // 确认转义：°C 不含逗号/引号，不应被引号包裹；这一条顺带验证不会无脑加引号
+    CHECK("PM2: 普通字段未被多余包裹", raw.contains("°C"));
+
+    PointModel target;
+    int imported = -1;
+    QString err2;
+    CHECK("PM2: 导入 CSV 成功", target.importFromCsv(path, false, &imported, &err2));
+    CHECK("PM2: 导入数量正确", imported == src.size());
+    CHECK("PM2: BOM 未污染第一列（name 不含 BOM 残留）",
+          !target.points().isEmpty() && !target.points().first().name.startsWith(QChar(0xFEFF)));
+
+    bool allMatch = true;
+    const QVector<PointDefinition> got = target.points();
+    for (int i = 0; i < src.size() && i < got.size(); ++i)
+        if (!pmtest::sameBusinessFields(src.at(i), got.at(i)))
+            allMatch = false;
+    CHECK("PM2: 全部字段往返无损", allMatch);
+    CHECK("PM2: id 在导入时重新分配（不复用旧 id）", !got.isEmpty() && got.first().id != src.first().id);
+
+}
+
+// ---- PM3: 表头列自适应（乱序 / 缺列 / 大小写 / 空格）----
+static void testPointModelCsvHeaderAdaptivity()
+{
+    printf("\n=== PointModel PM3 CSV 表头自适应 ===\n");
+    QTemporaryDir dir;
+    CHECK("PM3: QTemporaryDir 可用", dir.isValid());
+
+    {   // 3.1 列顺序完全打乱
+        const QString path = dir.filePath(QStringLiteral("shuffled.csv"));
+        pmtest::writeFile(path,
+            "unit,dataType,address,name,scale,serverAddress,registerType,count\n"
+            "V,float32,20,乱序点,2.5,3,2,2\n");
+        PointModel m;
+        int imported = 0;
+        QString err;
+        CHECK("PM3: 乱序表头导入成功", m.importFromCsv(path, false, &imported, &err));
+        CHECK("PM3: 乱序表头导入 1 条", imported == 1);
+        if (!m.points().isEmpty()) {
+            const PointDefinition p = m.points().first();
+            CHECK("PM3: 列乱序仍正确映射 name", p.name == QStringLiteral("乱序点"));
+            CHECK("PM3: 列乱序仍正确映射 address", p.address == 20);
+            CHECK("PM3: 列乱序仍正确映射 unit", p.unit == QStringLiteral("V"));
+            CHECK("PM3: 列乱序仍正确映射 scale", qFuzzyCompare(p.scale, 2.5));
+            CHECK("PM3: 列乱序仍正确映射 dataType", p.dataType == QStringLiteral("float32"));
+            CHECK("PM3: 列乱序仍正确映射 serverAddress", p.serverAddress == 3);
+            CHECK("PM3: 列乱序仍正确映射 registerType（2=Coils，Qt 枚举）", p.registerType == QModbusDataUnit::Coils);
+            CHECK("PM3: 列乱序仍正确映射 count", p.count == 2);
+        }
+    }
+
+    {   // 3.2 表头大小写不敏感 + 带空格
+        const QString path = dir.filePath(QStringLiteral("case.csv"));
+        pmtest::writeFile(path,
+            "Name,ADDRESS , ServerAddress\n"
+            "空格点,7,5\n");
+        PointModel m;
+        int imported = 0;
+        QString err;
+        CHECK("PM3: 大小写/空格表头导入成功", m.importFromCsv(path, false, &imported, &err));
+        if (!m.points().isEmpty()) {
+            const PointDefinition p = m.points().first();
+            CHECK("PM3: 空格表头 address 正确（不因尾部空格错位）", p.address == 7);
+            CHECK("PM3: 空格表头 serverAddress 正确", p.serverAddress == 5);
+            CHECK("PM3: 空格表头 name 正确", p.name == QStringLiteral("空格点"));
+        }
+    }
+
+    {   // 3.3 缺列时用默认值，且不崩溃
+        const QString path = dir.filePath(QStringLiteral("missing.csv"));
+        pmtest::writeFile(path,
+            "name,address\n"
+            "缺列点,12\n");
+        PointModel m;
+        int imported = 0;
+        QString err;
+        CHECK("PM3: 缺列表头导入成功", m.importFromCsv(path, false, &imported, &err));
+        CHECK("PM3: 缺列仍导入 1 条", imported == 1);
+        if (!m.points().isEmpty()) {
+            const PointDefinition p = m.points().first();
+            CHECK("PM3: 缺列时 serverAddress 兜底为 1", p.serverAddress == 1);
+            CHECK("PM3: 缺列时 dataType 兜底为 uint16", p.dataType == QStringLiteral("uint16"));
+            CHECK("PM3: 缺列时 count 兜底为 1", p.count == 1);
+            CHECK("PM3: 缺列时 scale 兜底为 1.0", qFuzzyCompare(p.scale, 1.0));
+            CHECK("PM3: 缺列时 archiveEnabled 兜底为 true", p.archiveEnabled == true);
+            CHECK("PM3: 缺列时 alarmHigh 兜底为 65535", qFuzzyCompare(p.alarmHigh, 65535.0));
+        }
+    }
+
+    {   // 3.4 无表头（纯数据行）按导出顺序回退定位
+        const QString path = dir.filePath(QStringLiteral("noheader.csv"));
+        pmtest::writeFile(path,
+            "99,无表头点,2,3,30,2,uint16,1.5,-1.5,bar,0,100,1,15\n");
+        PointModel m;
+        int imported = 0;
+        QString err;
+        CHECK("PM3: 无表头 CSV 导入成功", m.importFromCsv(path, false, &imported, &err));
+        CHECK("PM3: 无表头按导出顺序解析 name", !m.points().isEmpty()
+              && m.points().first().name == QStringLiteral("无表头点"));
+        CHECK("PM3: 无表头按导出顺序解析 address", !m.points().isEmpty()
+              && m.points().first().address == 30);
+        CHECK("PM3: 无表头解析 unit", !m.points().isEmpty()
+              && m.points().first().unit == QStringLiteral("bar"));
+    }
+}
+
+// ---- PM4: CSV 转义往返（含逗号/引号/换行/中文）----
+static void testPointModelCsvEscaping()
+{
+    printf("\n=== PointModel PM4 CSV 转义往返 ===\n");
+    QTemporaryDir dir;
+    CHECK("PM4: QTemporaryDir 可用", dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("escape.csv"));
+
+    PointModel src;
+    const QString tricky = QStringLiteral("含,逗号\"引号\n换行");
+    PointDefinition a;
+    a.name = tricky;
+    a.address = 5;
+    a.dataType = QStringLiteral("uint16");
+    a.unit = QStringLiteral("Pa, kPa");   // 逗号 + 空格
+    a.scale = 0.1;
+    a.alarmHigh = 100.0;
+    src.addPoint(a);
+    PointDefinition b;
+    b.name = QStringLiteral("普通名称");
+    b.address = 6;
+    b.unit = QStringLiteral("℃");          // 非 ASCII
+    b.archiveEnabled = false;
+    b.archiveIntervalSec = 60;
+    src.addPoint(b);
+
+    QString err;
+    CHECK("PM4: 导出含特殊字符 CSV 成功", src.exportToCsv(path, &err));
+
+    const QByteArray raw = pmtest::readFile(path);
+    CHECK("PM4: 逗号字段被引号包裹", raw.contains("\"Pa, kPa\""));
+    // 平台换行差异（QTextStream 在 Windows 输出 \r\n、Linux 输出 \n）会让原始字节
+    // 断言不稳定，故这里只断言「结构性事实」：字段以引号包裹、内部引号成对转义。
+    // 内容层面的正确性由下方「名称完整还原」断言保证（那才是用户可见的结果）。
+    {
+        // 该行以 ", 表示 name 字段被引号包裹
+        const int at = raw.indexOf("\"含,");
+        CHECK("PM4: 含逗号的名称字段以引号包裹", at >= 0);
+        // 转义后的内部引号是 ""（两个连续引号）
+        const QByteArray dbl = QByteArray("\"\"");
+        const int q1 = raw.indexOf(dbl, at >= 0 ? at : 0);
+        CHECK("PM4: 内部引号成对转义为双引号", q1 > at);
+        // 引号字段内不应出现落单的单个引号（未转义）。
+        // 注意：闭引号后面紧跟分隔符 ','，在扫描里会被算作「前一个也是引号」之外的情况，
+        // 因此只检查「双引号出现在字段开头或结尾」这一对结构性位置。
+        const QByteArray dbl2 = QByteArray("\"\"");
+        bool badEscape = false;
+        int scan = at >= 0 ? at : 0;
+        while (true) {
+            const int p1 = raw.indexOf(dbl2, scan);
+            if (p1 < 0) break;
+            // 三连引号及以上不符合 csvEscape 规则（只允许 "" 转义 + 包裹引号）
+            if (raw.mid(p1, 3) == QByteArray("\"\"\"")) { badEscape = true; break; }
+            scan = p1 + 2;
+        }
+        CHECK("PM4: 无三连引号等非法转义形态", !badEscape);
+    }
+
+    PointModel target;
+    int imported = 0;
+    QString err2;
+    CHECK("PM4: 导入转义 CSV 成功", target.importFromCsv(path, false, &imported, &err2));
+    CHECK("PM4: 转义 CSV 导入 2 条（未被换行拆行）", imported == 2);
+
+    const QVector<PointDefinition> got = target.points();
+    if (got.size() >= 2) {
+        CHECK("PM4: 含逗号/引号/换行的名称完整还原", got[0].name == tricky);
+        CHECK("PM4: 含逗号+空格的单位还原", got[0].unit == QStringLiteral("Pa, kPa"));
+        CHECK("PM4: 非 ASCII 单位还原（℃）", got[1].unit == QStringLiteral("℃"));
+        CHECK("PM4: 简单名称还原", got[1].name == QStringLiteral("普通名称"));
+        CHECK("PM4: archiveEnabled=false 往返", got[1].archiveEnabled == false);
+        CHECK("PM4: archiveIntervalSec 往返", got[1].archiveIntervalSec == 60);
+    }
+
+    // 空单元格（非引号包裹的空值）不应导致错位
+    const QString path2 = dir.filePath(QStringLiteral("empty_cell.csv"));
+    pmtest::writeFile(path2,
+        "name,address,unit,scale\n"
+        "空单位,4,,2\n");
+    PointModel m2;
+    int imported2 = 0;
+    QString err3;
+    CHECK("PM4: 空单元格 CSV 导入成功", m2.importFromCsv(path2, false, &imported2, &err3));
+    CHECK("PM4: 空单元格仍导入 1 条", imported2 == 1);
+    if (!m2.points().isEmpty()) {
+        CHECK("PM4: 空单位解析为空串（不误取后列）", m2.points().first().unit.isEmpty());
+        CHECK("PM4: 空单位时 scale 仍正确（列未错位）", qFuzzyCompare(m2.points().first().scale, 2.0));
+    }
+}
+
+// ---- PM5: 原子性——导入失败绝不破坏现有点位（最高优先级）----
+static void testPointModelImportAtomicity()
+{
+    printf("\n=== PointModel PM5 导入原子性 ===\n");
+    QTemporaryDir dir;
+    CHECK("PM5: QTemporaryDir 可用", dir.isValid());
+
+    const QVector<PointDefinition> keep = pmtest::samplePoints();
+    const QString expectName = keep.first().name;
+
+    {   // 5.1 JSON 语法错误（覆盖模式）
+        auto owner = pmtest::buildModel(keep);
+        PointModel &m = *owner;
+        const QString path = dir.filePath(QStringLiteral("broken.json"));
+        pmtest::writeFile(path, "{ this is not valid json ");
+        int imported = -1;
+        QString err;
+        CHECK("PM5: 非法 JSON 导入失败（返回 false）", !m.importFromJson(path, false, &imported, &err));
+        CHECK("PM5: 非法 JSON 给出错误信息", !err.isEmpty());
+        CHECK("PM5: 非法 JSON 未破坏现有点位（原子性）", m.points().size() == keep.size());
+        CHECK("PM5: 非法 JSON 未改动点位内容", !m.points().isEmpty()
+              && m.points().first().name == expectName);
+    }
+
+    {   // 5.2 JSON 顶层不是数组
+        auto owner = pmtest::buildModel(keep);
+        PointModel &m = *owner;
+        const QString path = dir.filePath(QStringLiteral("obj.json"));
+        pmtest::writeFile(path, "{ \"name\": \"x\" }");
+        int imported = -1;
+        QString err;
+        CHECK("PM5: 非数组 JSON 导入失败", !m.importFromJson(path, false, &imported, &err));
+        CHECK("PM5: 非数组 JSON 未破坏现有点位", m.points().size() == keep.size());
+    }
+
+    {   // 5.3 文件不存在
+        auto owner = pmtest::buildModel(keep);
+        PointModel &m = *owner;
+        int imported = -1;
+        QString err;
+        CHECK("PM5: 不存在的文件导入失败", !m.importFromJson(dir.filePath("nope.json"), false, &imported, &err));
+        CHECK("PM5: 不存在的 CSV 导入失败", !m.importFromCsv(dir.filePath("nope.csv"), false, &imported, &err));
+        CHECK("PM5: 文件缺失未破坏现有点位", m.points().size() == keep.size());
+    }
+
+    {   // 5.4 CSV 只有表头、无数据行（全部行被跳过 → count==0 → 返回 false）
+        auto owner = pmtest::buildModel(keep);
+        PointModel &m = *owner;
+        const QString path = dir.filePath(QStringLiteral("headeronly.csv"));
+        pmtest::writeFile(path, "name,address,serverAddress,registerType,dataType\n");
+        int imported = -1;
+        QString err;
+        const bool ok = m.importFromCsv(path, false, &imported, &err);
+        CHECK("PM5: 仅有表头的 CSV 返回失败（无有效点位）", !ok);
+        CHECK("PM5: 仅有表头时现有点点未被清空（原子性）", m.points().size() == keep.size());
+        CHECK("PM5: 仅有表头时点位内容完好", !m.points().isEmpty()
+              && m.points().first().name == expectName);
+    }
+
+    {   // 5.5 有内容但 name/address 皆无效的行（行本身非空 → 进入解析 → 无有效点位）
+        auto owner = pmtest::buildModel(keep);
+        PointModel &m = *owner;
+        const QString path = dir.filePath(QStringLiteral("allinvalid.csv"));
+        // 列有内容（scale/unit），但 name 与 address 全空 → 每行都被判为无效行
+        pmtest::writeFile(path,
+            "name,address,unit,scale\n"
+            ",,V,1\n"
+            ",,A,2\n");
+        int imported = -1;
+        QString err;
+        const bool ok = m.importFromCsv(path, false, &imported, &err);
+        CHECK("PM5: 全无效行 CSV 返回失败", !ok);
+        CHECK("PM5: 全无效行时 imported 置 0", imported == 0);
+        CHECK("PM5: 全无效行时现有点点未被清空（原子性）", m.points().size() == keep.size());
+        CHECK("PM5: 全无效行时点位内容完好", !m.points().isEmpty()
+              && m.points().first().name == expectName);
+        CHECK("PM5: 全无效行时错误信息提示检查表头", err.contains(QStringLiteral("表头")));
+    }
+
+    {   // 5.5b 完全是空行/空单元格（无任何内容）→ 视为「无内容可导入」，返回 true 但不改动数据
+        auto owner = pmtest::buildModel(keep);
+        PointModel &m = *owner;
+        const QString path = dir.filePath(QStringLiteral("blankrows.csv"));
+        pmtest::writeFile(path, ",,,\n,,\n");
+        int imported = -1;
+        QString err;
+        const bool ok = m.importFromCsv(path, false, &imported, &err);
+        CHECK("PM5: 纯空行 CSV 返回 true（无内容可导入，非错误）", ok);
+        CHECK("PM5: 纯空行 imported 为 0", imported == 0);
+        CHECK("PM5: 纯空行不改动现有点点", m.points().size() == keep.size());
+    }
+
+    {   // 5.6 混合：部分有效行 → 成功导入且只丢无效行
+        PointModel m;
+        const QString path = dir.filePath(QStringLiteral("mixed.csv"));
+        pmtest::writeFile(path,
+            "name,address\n"
+            "有效A,1\n"
+            ",,\n"
+            "有效B,2\n");
+        int imported = 0;
+        QString err;
+        CHECK("PM5: 部分有效行导入成功", m.importFromCsv(path, false, &imported, &err));
+        CHECK("PM5: 只导入有效行（2 条）", imported == 2);
+        CHECK("PM5: 有效行内容正确", m.points().size() == 2
+              && m.points().at(0).name == QStringLiteral("有效A")
+              && m.points().at(1).name == QStringLiteral("有效B"));
+    }
+}
+
+// ---- PM6: 追加 / 覆盖语义 ----
+static void testPointModelAppendOverwrite()
+{
+    printf("\n=== PointModel PM6 追加 / 覆盖 ===\n");
+    QTemporaryDir dir;
+    CHECK("PM6: QTemporaryDir 可用", dir.isValid());
+
+    const QString srcPath = dir.filePath(QStringLiteral("src.csv"));
+    {
+        PointModel src;
+        PointDefinition a; a.name = QStringLiteral("导入A"); a.address = 1; src.addPoint(a);
+        PointDefinition b; b.name = QStringLiteral("导入B"); b.address = 2; src.addPoint(b);
+        QString err;
+        CHECK("PM6: 生成源 CSV 成功", src.exportToCsv(srcPath, &err));
+    }
+
+    {   // 追加
+        PointModel m;
+        PointDefinition own; own.name = QStringLiteral("原有X"); own.address = 100;
+        m.addPoint(own);
+        int imported = 0;
+        QString err;
+        CHECK("PM6: 追加模式导入成功", m.importFromCsv(srcPath, true, &imported, &err));
+        CHECK("PM6: 追加导入 2 条", imported == 2);
+        CHECK("PM6: 追加后原有点位仍在（共 3）", m.points().size() == 3);
+        CHECK("PM6: 追加后首项仍是原有点位", m.points().first().name == QStringLiteral("原有X"));
+        CHECK("PM6: 追加分配了新 id（与原有不冲突）",
+              m.points().at(1).id != m.points().first().id);
+    }
+
+    {   // 覆盖
+        PointModel m;
+        for (int i = 0; i < 5; ++i) {
+            PointDefinition own; own.name = QStringLiteral("旧%1").arg(i); own.address = i;
+            m.addPoint(own);
+        }
+        int imported = 0;
+        QString err;
+        CHECK("PM6: 覆盖模式导入成功", m.importFromCsv(srcPath, false, &imported, &err));
+        CHECK("PM6: 覆盖后仅剩导入的 2 条", m.points().size() == 2);
+        CHECK("PM6: 覆盖后旧点位已清除", m.points().first().name == QStringLiteral("导入A"));
+        CHECK("PM6: 覆盖后 currentValues 同步为 2 条", m.currentValues().size() == 2);
+    }
+
+    {   // JSON 追加/覆盖语义与 CSV 一致
+        const QString jsonPath = dir.filePath(QStringLiteral("src.json"));
+        PointModel src;
+        PointDefinition a; a.name = QStringLiteral("J导入A"); a.address = 1; src.addPoint(a);
+        QString err;
+        src.exportToJson(jsonPath, &err);
+
+        PointModel m;
+        PointDefinition own; own.name = QStringLiteral("原有J"); own.address = 50; m.addPoint(own);
+        int imported = 0;
+        CHECK("PM6: JSON 追加成功", m.importFromJson(jsonPath, true, &imported, &err));
+        CHECK("PM6: JSON 追加后共 2 条", m.points().size() == 2);
+
+        PointModel m2;
+        for (int i = 0; i < 4; ++i) { PointDefinition o; o.name = QStringLiteral("旧J%1").arg(i); m2.addPoint(o); }
+        CHECK("PM6: JSON 覆盖成功", m2.importFromJson(jsonPath, false, &imported, &err));
+        CHECK("PM6: JSON 覆盖后仅 1 条", m2.points().size() == 1);
+    }
+
+    {   // Invalid 类型（枚举值 0）无法往返 —— 记录为已知缺陷
+        // 根因：CSV/JSON 用 static_cast<int>(RegisterType) 存储，Invalid=0；
+        //       导入端把 0 视为「非法值」拒绝解析并回落 HoldingRegisters。
+        // 影响面小：正常流程不会创建 Invalid 点位（UI 只会选四张表），但手工编辑的 CSV 可能出现 0。
+        auto owner = pmtest::buildModel(pmtest::samplePoints());
+        PointModel &m = *owner;
+        PointDefinition bad;
+        bad.name = QStringLiteral("非法类型点");
+        bad.registerType = QModbusDataUnit::Invalid;
+        bad.address = 77;
+        m.addPoint(bad);
+        QString err;
+        const QString jpath = dir.filePath(QStringLiteral("invalid.json"));
+        m.exportToJson(jpath, &err);
+        auto owner2 = pmtest::buildModel(pmtest::samplePoints());
+        PointModel &m2 = *owner2;
+        int imported = 0;
+        m2.importFromJson(jpath, false, &imported, &err);
+        CHECK_ISSUE("PM6: Invalid 寄存器类型无法往返（导出 0 → 导入回落 HoldingRegisters）",
+                    !m2.points().isEmpty()
+                    && m2.points().last().registerType == QModbusDataUnit::Invalid);
+    }
+}
+
+// ---- PM7: registerType / 布尔 token 多写法兼容 ----
+static void testPointModelTokenCompatibility()
+{
+    printf("\n=== PointModel PM7 token 多写法兼容 ===\n");
+    QTemporaryDir dir;
+    CHECK("PM7: QTemporaryDir 可用", dir.isValid());
+
+    {   // registerType 数字 / 英文 / 中文三种写法
+        const QString path = dir.filePath(QStringLiteral("rt.csv"));
+        pmtest::writeFile(path,
+            "name,address,registerType\n"
+            "数字0,1,0\n"
+            "数字1,2,1\n"
+            "数字2,3,2\n"
+            "数字3,4,3\n"
+            "数字4,13,4\n"
+            "英文holding,5,holding\n"
+            "英文input,6,input\n"
+            "英文discrete,7,discrete\n"
+            "英文coil,8,coil\n"
+            "中文保持,9,保持寄存器\n"
+            "中文输入,10,输入寄存器\n"
+            "中文离散,11,离散输入\n"
+            "中文线圈,12,线圈\n");
+        PointModel m;
+        int imported = 0;
+        QString err;
+        CHECK("PM7: registerType 多写法导入成功", m.importFromCsv(path, false, &imported, &err));
+        CHECK("PM7: 导入 13 条", imported == 13);
+
+        QVector<QModbusDataUnit::RegisterType> got;
+        for (const PointDefinition &p : m.points())
+            got.append(p.registerType);
+
+        auto at = [&got](int i) { return i < got.size() ? got.at(i) : QModbusDataUnit::HoldingRegisters; };
+        // 数字形式严格等于 QModbusDataUnit::RegisterType 真实枚举值：
+        // Invalid=0, DiscreteInputs=1, Coils=2, InputRegisters=3, HoldingRegisters=4
+        // 这是导出/导入对称的前提（导出写的就是这些值）。
+        CHECK("PM7: 数字 0 (Invalid) 拒绝解析 → 回落 HoldingRegisters", at(0) == QModbusDataUnit::HoldingRegisters);
+        CHECK("PM7: 数字 1 → DiscreteInputs（Qt 枚举）", at(1) == QModbusDataUnit::DiscreteInputs);
+        CHECK("PM7: 数字 2 → Coils（Qt 枚举，非 InputRegisters）", at(2) == QModbusDataUnit::Coils);
+        CHECK("PM7: 数字 3 → InputRegisters（Qt 枚举）", at(3) == QModbusDataUnit::InputRegisters);
+        CHECK("PM7: 数字 4 → HoldingRegisters（Qt 枚举）", at(4) == QModbusDataUnit::HoldingRegisters);
+        CHECK("PM7: 英文 holding → HoldingRegisters", at(5) == QModbusDataUnit::HoldingRegisters);
+        CHECK("PM7: 英文 input → InputRegisters", at(6) == QModbusDataUnit::InputRegisters);
+        CHECK("PM7: 英文 discrete → DiscreteInputs", at(7) == QModbusDataUnit::DiscreteInputs);
+        CHECK("PM7: 英文 coil → Coils", at(8) == QModbusDataUnit::Coils);
+        CHECK("PM7: 中文 保持寄存器 → HoldingRegisters", at(9) == QModbusDataUnit::HoldingRegisters);
+        CHECK("PM7: 中文 输入寄存器 → InputRegisters", at(10) == QModbusDataUnit::InputRegisters);
+        CHECK("PM7: 中文 离散输入 → DiscreteInputs", at(11) == QModbusDataUnit::DiscreteInputs);
+        CHECK("PM7: 中文 线圈 → Coils", at(12) == QModbusDataUnit::Coils);
+
+        // 非法 registerType 不应崩溃，且应回退为 HoldingRegisters
+        const QString bad = dir.filePath(QStringLiteral("rt_bad.csv"));
+        pmtest::writeFile(bad, "name,address,registerType\n坏值,1,not_a_type\n");
+        PointModel m2;
+        int imported2 = 0;
+        QString err2;
+        CHECK("PM7: 非法 registerType 不崩溃且导入成功", m2.importFromCsv(bad, false, &imported2, &err2));
+        CHECK("PM7: 非法 registerType 回退 HoldingRegisters", !m2.points().isEmpty()
+              && m2.points().first().registerType == QModbusDataUnit::HoldingRegisters);
+    }
+
+    {   // archiveEnabled 多写法
+        const QString path = dir.filePath(QStringLiteral("bool.csv"));
+        pmtest::writeFile(path,
+            "name,address,archiveEnabled\n"
+            "b1,1,1\n" "b2,2,true\n" "b3,3,yes\n" "b4,4,y\n" "b5,5,是\n" "b6,6,on\n"
+            "b7,7,0\n" "b8,8,false\n" "b9,9,no\n" "b10,10,n\n" "b11,11,否\n" "b12,12,off\n");
+        PointModel m;
+        int imported = 0;
+        QString err;
+        CHECK("PM7: archiveEnabled 多写法导入成功", m.importFromCsv(path, false, &imported, &err));
+        CHECK("PM7: 导入 12 条", imported == 12);
+        if (m.points().size() == 12) {
+            bool truthy = true, falsy = true;
+            for (int i = 0; i < 6; ++i)  truthy = truthy && m.points().at(i).archiveEnabled;
+            for (int i = 6; i < 12; ++i) falsy = falsy && !m.points().at(i).archiveEnabled;
+            CHECK("PM7: 1/true/yes/y/是/on 均解析为真", truthy);
+            CHECK("PM7: 0/false/no/n/否/off 均解析为假", falsy);
+        }
+    }
+
+    {   // importAuto 按扩展名分派 + 未知扩展名回退
+        const QString csvPath = dir.filePath(QStringLiteral("auto.csv"));
+        const QString jsonPath = dir.filePath(QStringLiteral("auto.json"));
+        const QString noExt = dir.filePath(QStringLiteral("auto_noext"));
+        const QString unknown = dir.filePath(QStringLiteral("auto.dat"));
+        PointModel src;
+        PointDefinition a; a.name = QStringLiteral("自动A"); a.address = 1; src.addPoint(a);
+        QString err;
+        src.exportToCsv(csvPath, &err);
+        src.exportToJson(jsonPath, &err);
+        QFile::remove(noExt); QFile::remove(unknown);
+        QFile::copy(csvPath, noExt);
+        QFile::copy(jsonPath, unknown);
+
+        PointModel m1, m2, m3, m4;
+        int n1 = 0, n2 = 0, n3 = 0, n4 = 0;
+        CHECK("PM7: importAuto 识别 .csv", m1.importAuto(csvPath, false, &n1, &err) && n1 == 1);
+        CHECK("PM7: importAuto 识别 .json", m2.importAuto(jsonPath, false, &n2, &err) && n2 == 1);
+        CHECK("PM7: importAuto 无扩展名回退 CSV", m3.importAuto(noExt, false, &n3, &err) && n3 == 1);
+        CHECK("PM7: importAuto 未知扩展名先试 JSON", m4.importAuto(unknown, false, &n4, &err) && n4 == 1);
+    }
+}
+
+// ---- PM8: 边界与健壮性（空文件 / 仅表头 / 大批量 / 超范围数值）----
+static void testPointModelEdgeCases()
+{
+    printf("\n=== PointModel PM8 边界与健壮性 ===\n");
+    QTemporaryDir dir;
+    CHECK("PM8: QTemporaryDir 可用", dir.isValid());
+
+    {   // 空文件
+        const QString path = dir.filePath(QStringLiteral("empty.csv"));
+        pmtest::writeFile(path, "");
+        PointModel m;
+        int imported = -1;
+        QString err;
+        const bool ok = m.importFromCsv(path, false, &imported, &err);
+        CHECK("PM8: 空 CSV 不崩溃且返回 true（无行可导）", ok);
+        CHECK("PM8: 空 CSV 导入数为 0", imported == 0);
+        CHECK("PM8: 空 CSV 后点位数仍为 0", m.points().isEmpty());
+    }
+
+    {   // 只有 BOM
+        const QString path = dir.filePath(QStringLiteral("bomonly.csv"));
+        pmtest::writeFile(path, "", true);
+        PointModel m;
+        int imported = -1;
+        QString err;
+        CHECK("PM8: 仅 BOM 的 CSV 不崩溃", m.importFromCsv(path, false, &imported, &err));
+        CHECK("PM8: 仅 BOM 导入数为 0", imported == 0);
+    }
+
+    {   // 只有空白行
+        const QString path = dir.filePath(QStringLiteral("blank.csv"));
+        pmtest::writeFile(path, "\n\n   \n,\n");
+        PointModel m;
+        int imported = -1;
+        QString err;
+        m.importFromCsv(path, false, &imported, &err);
+        CHECK("PM8: 空白行 CSV 导入数为 0", imported == 0);
+    }
+
+    {   // 数值越界/非法时兜底，不产生异常值
+        const QString path = dir.filePath(QStringLiteral("weird.csv"));
+        pmtest::writeFile(path,
+            "name,address,count,scale,alarmLow,alarmHigh,archiveIntervalSec,serverAddress\n"
+            "零count,1,0,0,0,0,0,0\n"
+            "负count,2,-5,-1,-10,5,-3,-7\n"
+            "高版本,3,1,1,0,65535,999999,999\n");
+        PointModel m;
+        int imported = 0;
+        QString err;
+        CHECK("PM8: 越界数值 CSV 导入成功", m.importFromCsv(path, false, &imported, &err));
+        CHECK("PM8: 越界数值仍导入 3 条", imported == 3);
+        if (m.points().size() == 3) {
+            CHECK("PM8: count=0 被兜底为 1", m.points().at(0).count == 1);
+            CHECK("PM8: count=-5 被兜底为 1", m.points().at(1).count == 1);
+            CHECK("PM8: alarmHigh<=alarmLow 时兜底 65535", qFuzzyCompare(m.points().at(0).alarmHigh, 65535.0));
+            CHECK("PM8: archiveIntervalSec<=0 时兜底 5", m.points().at(0).archiveIntervalSec == 5);
+            CHECK("PM8: serverAddress<=0 时兜底 1", m.points().at(0).serverAddress == 1);
+            CHECK("PM8: 负 serverAddress 被兜底为 1", m.points().at(1).serverAddress == 1);
+        }
+    }
+
+    {   // 数值格式容错（科学计数/前后空格/空值）
+        const QString path = dir.filePath(QStringLiteral("numfmt.csv"));
+        pmtest::writeFile(path,
+            "name,address,scale,offset\n"
+            "科学,1,1e-3, 2.5 \n"
+            "空scale,2,,3\n");
+        PointModel m;
+        int imported = 0;
+        QString err;
+        CHECK("PM8: 数值格式容错导入成功", m.importFromCsv(path, false, &imported, &err));
+        if (m.points().size() == 2) {
+            CHECK("PM8: 科学计数法 scale 解析", qFuzzyCompare(m.points().at(0).scale, 0.001));
+            CHECK("PM8: 带空格 offset 解析", qFuzzyCompare(m.points().at(0).offset, 2.5));
+            CHECK("PM8: 空 scale 兜底 1.0", qFuzzyCompare(m.points().at(1).scale, 1.0));
+            CHECK("PM8: 空 scale 未串到 offset 列", qFuzzyCompare(m.points().at(1).offset, 3.0));
+        }
+    }
+
+    {   // 大批量：1000 点导入导出往返
+        const QString path = dir.filePath(QStringLiteral("big.csv"));
+        PointModel src;
+        for (int i = 0; i < 1000; ++i) {
+            PointDefinition p;
+            p.name = QStringLiteral("批量点%1").arg(i);
+            p.address = i;
+            p.count = (i % 4) + 1;
+            p.dataType = (i % 2) ? QStringLiteral("int16") : QStringLiteral("uint16");
+            p.scale = 1.0 + (i % 7) * 0.1;
+            p.unit = QStringLiteral("u%1").arg(i % 5);
+            p.archiveEnabled = (i % 3 != 0);
+            p.archiveIntervalSec = (i % 10) + 1;
+            src.addPoint(p);
+        }
+        QElapsedTimer timer;
+        timer.start();
+        QString err;
+        CHECK("PM8: 1000 点导出成功", src.exportToCsv(path, &err));
+        PointModel target;
+        int imported = 0;
+        CHECK("PM8: 1000 点导入成功", target.importFromCsv(path, false, &imported, &err));
+        CHECK("PM8: 导入数量为 1000", imported == 1000);
+        CHECK("PM8: 1000 点往返数量一致", target.points().size() == 1000);
+        const qint64 ms = timer.elapsed();
+
+        bool match = target.points().size() == 1000;
+        for (int i = 0; match && i < 1000; ++i)
+            if (!pmtest::sameBusinessFields(src.points().at(i), target.points().at(i)))
+                match = false;
+        CHECK("PM8: 1000 点全部字段往返无损", match);
+        // 性能只做宽松护栏（CI 机器波动大），不做硬性时间断言
+        CHECK("PM8: 1000 点往返无性能塌陷（宽松护栏 <5000ms）", ms < 5000);
+
+        QElapsedTimer t2; t2.start();
+        int n = 0;
+        target.importFromCsv(path, false, &n, &err);
+        CHECK("PM8: 1000 点覆盖导入无性能塌陷（宽松护栏 <5000ms）", t2.elapsed() < 5000);
+    }
+
+    {   // 导出到不可写路径
+        PointModel m;
+        PointDefinition a; a.name = QStringLiteral("x"); m.addPoint(a);
+        QString err;
+        const QString bad = dir.filePath(QStringLiteral("no_such_dir/sub/out.csv"));
+        CHECK("PM8: 导出到不存在目录返回 false", !m.exportToCsv(bad, &err));
+        CHECK("PM8: 导出失败给出错误信息", !err.isEmpty());
+    }
+
+    {   // 空模型导出
+        PointModel empty;
+        const QString path = dir.filePath(QStringLiteral("empty_export.csv"));
+        QString err;
+        CHECK("PM8: 空模型导出成功", empty.exportToCsv(path, &err));
+        const QByteArray raw = pmtest::readFile(path);
+        CHECK("PM8: 空模型导出仅含 BOM+表头", raw.contains("id,name,"));
+    }
+}
+
+// ---- PM9: importAuto 回退策略与失败原子性 ----
+static void testPointModelImportAutoFallback()
+{
+    printf("\n=== PointModel PM9 importAuto 回退策略 ===\n");
+    QTemporaryDir dir;
+    CHECK("PM9: QTemporaryDir 可用", dir.isValid());
+
+    // 未知扩展名 + CSV 内容 → 应回退尝试 CSV
+    const QString path = dir.filePath(QStringLiteral("weird.dat"));
+    pmtest::writeFile(path, "name,address\n回退点,88\n");
+    PointModel m;
+    int imported = 0;
+    QString err;
+    CHECK("PM9: 未知扩展名+CSV 内容回退成功", m.importAuto(path, false, &imported, &err));
+    CHECK("PM9: 回退后导入 1 条", imported == 1);
+    CHECK("PM9: 回退后内容正确", !m.points().isEmpty()
+          && m.points().first().name == QStringLiteral("回退点")
+          && m.points().first().address == 88);
+
+    // 未知扩展名 + 完全无法解析的内容 → 应失败并给出错误
+    const QString bad = dir.filePath(QStringLiteral("garbage.dat"));
+    pmtest::writeFile(bad, "\x01\x02\x03binary\xff");
+    PointModel m2;
+    int n2 = 0;
+    QString err2;
+    CHECK("PM9: 未知扩展名+垃圾内容导入失败", !m2.importAuto(bad, false, &n2, &err2));
+    CHECK("PM9: 失败时给出错误信息", !err2.isEmpty());
+
+    // importAuto 先试 JSON 会先 clear（覆盖模式），此处验证不崩溃并记录实际行为
+    auto owner3 = pmtest::buildModel(pmtest::samplePoints());
+    PointModel &m3 = *owner3;
+    const int before = m3.points().size();
+    int n3 = 0;
+    QString err3;
+    m3.importAuto(bad, false, &n3, &err3);
+    CHECK("PM9: 未知扩展名+垃圾内容后不崩溃", m3.points().size() >= 0);
+    CHECK("PM9: importAuto 覆盖模式失败后现有点位完整保留（原子性）",
+          m3.points().size() == before);
+    CHECK("PM9: importAuto 失败后点位内容未变", !m3.points().isEmpty()
+          && m3.points().first().name == pmtest::samplePoints().first().name);
+}
+
 int main(int argc, char *argv[])
 {
     QCoreApplication app(argc, argv);
@@ -982,6 +2184,28 @@ int main(int argc, char *argv[])
     testHistoryData();
     testBatchTaskManager();
     testDataParser();
+
+    // Modbus 调试工具纯逻辑（原 RawRequestDialog / ScannerDialog 内部逻辑）
+    testDiagParseHexBytes();
+    testDiagHexFormatting();
+    testDiagExceptionNames();
+    testDiagPayloadBuilding();
+    testDiagFunctionCodeValidation();
+    testDiagScanRangeValidation();
+    testDiagProbeMapping();
+    testDiagPollTaskSeed();
+    testDiagScanProgress();
+
+    // PointModel 点表管理 + CSV/JSON 导入导出（此前无覆盖）
+    testPointModelJsonRoundTrip();
+    testPointModelCsvRoundTrip();
+    testPointModelCsvHeaderAdaptivity();
+    testPointModelCsvEscaping();
+    testPointModelImportAtomicity();
+    testPointModelAppendOverwrite();
+    testPointModelTokenCompatibility();
+    testPointModelEdgeCases();
+    testPointModelImportAutoFallback();
 
     printf("\n==== 汇总 ====\n");
     printf("PASS: %d  FAIL: %d  已确认已知问题: %d\n", g_passed, g_failed, g_issuesConfirmed);

@@ -25,7 +25,9 @@ SOURCES += \
     ../src/devicemanager.cpp \
     ../src/historydata.cpp \
     ../src/batchtaskmanager.cpp \
-    ../src/dataparser.cpp
+    ../src/dataparser.cpp \
+    ../src/pointmodel.cpp \
+    ../src/modbusdiagnostics.cpp
 
 HEADERS += \
     ../header/alarmmanager.h \
@@ -38,4 +40,6 @@ HEADERS += \
     ../header/devicemanager.h \
     ../header/historydata.h \
     ../header/batchtaskmanager.h \
-    ../header/dataparser.h
+    ../header/dataparser.h \
+    ../header/pointmodel.h \
+    ../header/modbusdiagnostics.h
