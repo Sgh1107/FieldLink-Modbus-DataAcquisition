@@ -100,12 +100,17 @@ jobs:
 
       - name: Run tests under Valgrind
         run: |
+          # -s 打印每条错误的完整堆栈：缺失时 CI 只能看到 "ERROR SUMMARY: N errors"，
+          #    无法定位来源（2026-10 曾因此只能靠日志时间戳反推是 DataExporter）。
+          # --undef-value-errors=yes 显式声明检查未初始化值（默认即开，此处明示意图）。
           valgrind --tool=memcheck \
                    --leak-check=full \
                    --show-leak-kinds=definite,indirect \
                    --errors-for-leak-kinds=definite,indirect \
                    --track-origins=yes \
+                   --undef-value-errors=yes \
                    --num-callers=25 \
                    --error-exitcode=1 \
+                   -s \
                    ./build/vg/fieldlink_tests
           echo "Valgrind: no definite/indirect leaks, no invalid memory access"

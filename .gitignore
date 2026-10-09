@@ -10,3 +10,5 @@ fieldlink.pro.user*
 .qm
 .workbuddy
 MODBUS_CROSS_VALIDATION.md
+
+logs_*
