@@ -86,24 +86,32 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qt6-base-dev libqt6sql6-sqlite \
             libqt6serialport6-dev libqt6serialbus6-dev g++ make valgrind
+          # Valgrind 需要 Qt 的调试符号才能把堆栈里的 ??? 还原成函数名。
+          # Ubuntu 的 dbgsym 包不在默认源里，需先启用 ddebs 源，否则装不上。
+          sudo apt-get install -y --no-install-recommends gnupg ddebs || true
+          codename=$(lsb_release -cs)
+          echo "deb http://ddebs.ubuntu.com/ ${codename} main" | sudo tee /etc/apt/sources.list.d/ddebs.list
+          sudo apt-get update
+          sudo apt-get install -y qt6-base-dev-dbgsym || \
+            echo "::warning::未能安装 dbgsym，Qt 内部堆栈仍会显示 ???"
 
       - name: Configure (qmake6, debug + 调试信息)
         run: |
           mkdir -p build/vg
           cd build/vg
-          # 必须用 debug 配置：默认 release 是 -O2 且无 -g，
-          # Valgrind 拿到的堆栈会全部显示 ???（2026-10 连续两次踩坑：
-          # 报 8 个 Conditional jump 却看不到任何文件与行号，无法定位）。
-          # CONFIG+=debug 会带上 -g -O0，是 Valgrind 的正确前提。
-          qmake6 ../../tests/tests.pro CONFIG+=debug "QMAKE_CXXFLAGS+=-g -gdwarf-4"
+          # 说明：qmake 的 "QMAKE_CXXFLAGS+=-g" 是追加而非覆盖，之前已能带上 -g；
+          # 堆栈仍显示 ??? 的真正原因是静态链接的 Qt 库自身没有调试信息
+          #（靠上面安装 dbgsym 解决），而非我们代码缺少 -g。
+          # 保留 release 优化不做成 debug：-O2 会内联并让 Valgrind 堆栈更易读，
+          # 且能检查真实发布形态的代码路径。
+          qmake6 ../../tests/tests.pro "QMAKE_CXXFLAGS+=-g -gdwarf-4"
 
       - name: Build tests (debug info)
         run: |
           cd build/vg
           make -j"$(nproc)"
-          # 自检：确认二进制确实带调试信息，否则 Valgrind 堆栈会退化成 ???，
-          # 届时只剩 "ERROR SUMMARY: N errors" 无法定位。二进制可能落在 release/ 或子目录，
-          # 故用 find 定位而非写死路径。
+          # 自检：我们自己的二进制必须带调试信息（Qt 库的符号靠上面的 dbgsym 包）。
+          # 二进制可能落在 release/ 或子目录，故用 find 定位而非写死路径。
           BIN=$(find . -name fieldlink_tests -type f -perm -u+x | head -1)
           if [ -z "$BIN" ]; then
             echo "::error::未找到 fieldlink_tests 可执行文件"
@@ -111,18 +119,24 @@ jobs:
           fi
           echo "binary: $BIN"
           if readelf -S "$BIN" | grep -q debug_info; then
-            echo "debug info present"
+            echo "our debug info: present"
           else
             echo "::error::二进制缺少 .debug_info，Valgrind 无法给出堆栈"
             exit 1
           fi
+          # 顺带确认 Qt 调试符号是否装上（决定 Qt 内部堆栈能否符号化）
+          if ls /usr/lib/debug/.build-id/*/*.debug 2>/dev/null | head -1 | grep -q .; then
+            echo "Qt dbgsym: present"
+          else
+            echo "::warning::未检测到 Qt dbgsym，Qt 内部堆栈可能仍显示 ???"
 
       - name: Run tests under Valgrind
         run: |
-          # -s 打印每条错误的完整堆栈：缺失时 CI 只能看到 "ERROR SUMMARY: N errors"，
-          #    无法定位来源（2026-10 曾因此只能靠日志时间戳反推）。
+          # -s 打印每条错误的完整堆栈：缺失时 CI 只能看到 "ERROR SUMMARY: N errors"。
           # --undef-value-errors=yes 显式声明检查未初始化值（默认即开，此处明示意图）。
           # --read-var-info=yes 让 Valgrind 能报告「哪个变量未初始化」。
+          # --demangle=yes 保证 C++ 符号名可读（否则函数名显示成 _Z 开头的乱码）。
+          # 追加 --trace-children=no，避免测试里启动的子进程干扰归因。
           valgrind --tool=memcheck \
                    --leak-check=full \
                    --show-leak-kinds=definite,indirect \
@@ -130,6 +144,8 @@ jobs:
                    --track-origins=yes \
                    --undef-value-errors=yes \
                    --read-var-info=yes \
+                   --demangle=yes \
+                   --trace-children=no \
                    --num-callers=25 \
                    --error-exitcode=1 \
                    -s \
