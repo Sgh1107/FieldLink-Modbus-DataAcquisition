@@ -34,7 +34,7 @@
 - ✅ **内置模拟从站**：一键起停 Modbus TCP 模拟设备（独立 Python 进程，互验协议），配合正弦温度/随机游走数据源，联调测试无需任何外部工具
 - ✅ **完备安全体系**：用户/角色/权限三级模型，密码与 API Token 均为**加盐 SHA256** 存储（每用户独立随机盐，旧无盐哈希登录时透明升级），敏感操作权限校验；安全默认——远程 API 未配置 Token 时锁定、默认账号首次登录强制改密、MQTT broker 密码混淆存储不明文落盘、写操作审计留痕
 - ✅ **高可靠运行**：自动重连 + 心跳保活 + 连续失败告警（ReliabilityManager），全局崩溃捕获与日志记录（CrashLogger），适合无人值守长期运行
-- ✅ **CI 自动回归**：GitHub Actions（Qt 6）每次 push/PR 自动构建并运行测试套件，并额外用 **ASan/LSan + Valgrind** 做内存泄漏与非法访问检查
+- ✅ **CI 自动回归**：GitHub Actions（Qt 6）每次 push/PR 自动构建并运行测试套件，并用 **ASan + UBSan + LeakSanitizer** 检查内存泄漏、非法访问与未定义行为
 - ✅ **脚本与插件扩展**：内置 QJSEngine 脚本控制台（可加载脚本文件、注册全局对象），标准 Qt 插件接口（数据回调 + 连接状态回调 + 读写设置），二次开发友好
 - ✅ **设备模板/点表管理**：寄存器点表支持数据类型（uint16/int16/uint32/int32/float32/ascii）、字节序（ABCD/DCBA/BADC/CDAB）、缩放/偏移/工程单位换算
 - ✅ **Modbus 调试工具**：原始功能码/报文发送窗（基于 `sendRawRequest`，覆盖 FC07/08/0B/0C/11/16(22)/17(23)/18(24)/2B·0E 等 Qt SerialBus 未封装功能，支持循环发送与异常码解析）+ **总线扫描器**（区间扫描在线从站、可一键生成轮询任务）
@@ -100,8 +100,12 @@ mingw32-make -j8        # Linux 下使用 make -j8
 单元/集成测试套件位于 `tests/`（`qmake tests.pro && mingw32-make` 构建，运行
 `fieldlink_tests.exe`，退出码 0 = 全部通过），覆盖报警条件、加盐哈希、权限模型、
 MQTT（QoS0/QoS1 线缆级验证）等核心逻辑；GitHub Actions（Qt 6）在每次 push/PR 时自动回归，
-并并行跑 **ASan + LeakSanitizer** 与 **Valgrind Memcheck** 两个内存检查作业（泄漏/非法读写即构建失败，
+并并行跑一个 **ASan + UBSan + LeakSanitizer** 内存检查作业（泄漏/越界/释放后使用/未定义行为即构建失败，
 内存检查仅在 Linux 上可行，MinGW 无 libasan）。
+
+> 曾并行跑过 Valgrind Memcheck，因其报告的未初始化值告警经核对全部落在
+> Qt 共享库内（本项目二进制仅 532KB，报错地址却在 0x930156F~0x98C398F），
+> 且安装 Qt dbgsym 后堆栈仍无法符号化，判定为 Qt 自身误报，已移除该作业。
 完整功能使用说明见 **`doc/USAGE.md`**（含模拟脚本联调、功能搭配方案与 FAQ）。
 
 ### 快速上手流程
@@ -198,7 +202,7 @@ FieldLink-Modbus-DataAcquisition/
 ├── deploy/                   # Windows 发布打包脚本（package_windows.ps1）
 ├── slave/                    # 测试用模拟服务端：Modbus 从站模拟器 / MQTT 测试 broker
 ├── tests/                    # 单元/集成测试套件（无 GUI，465 项断言）
-├── .github/workflows/        # CI：Qt 6 自动构建 + 测试回归 + ASan/Valgrind 内存泄漏检查
+├── .github/workflows/        # CI：Qt 6 自动构建 + 测试回归 + ASan/UBSan 内存与未定义行为检查
 ├── doc/                      # USAGE 使用手册 / MQTT 指南 / Code Review 报告 / AI 集成设计
 └── build/                    # 构建输出目录（Makefile 由 qmake 自动生成）
 ```

@@ -85,9 +85,14 @@ bash tools/run_tests.sh env      # 只做环境体检 + 覆盖率统计
 4. 统计源码覆盖率盲区并提示。
 
 > **CI 已覆盖的部分**：`.github/workflows/tests.yml` 在 Ubuntu 上跑
-> 单测 + ASan/LeakSanitizer + Valgrind Memcheck 三个作业，泄漏/非法读写即构建失败。
-> 但**只测 `tests/` 里的 10 个模块**，GUI 主程序完全没有内存检查。
+> 单测 + ASan/UBSan/LeakSanitizer 两个作业，泄漏/越界/未定义行为即构建失败。
+> 但**只测 `tests/` 里的模块**，GUI 主程序完全没有内存检查。
 > → 见第五层建议：补一个 GUI 冒烟 + 主程序 ASan 构建。
+>
+> 注：2026-10 曾并行跑 Valgrind Memcheck，其报告的 8 条「条件跳转依赖未初始化值」
+> 经核对确认全部落在 Qt 共享库内（报错地址 0x930156F~0x98C398F，而测试二进制仅
+> 532KB），安装 Qt dbgsym 后堆栈仍全部显示 `???` 无法符号化，且泄漏汇总始终为 0，
+> 判定为 Qt 自身误报且无可操作性，已移除该作业。
 
 ---
 
