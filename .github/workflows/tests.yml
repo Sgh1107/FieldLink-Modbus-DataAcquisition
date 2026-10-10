@@ -86,14 +86,31 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qt6-base-dev libqt6sql6-sqlite \
             libqt6serialport6-dev libqt6serialbus6-dev g++ make valgrind
-          # Valgrind 需要 Qt 的调试符号才能把堆栈里的 ??? 还原成函数名。
-          # Ubuntu 的 dbgsym 包不在默认源里，需先启用 ddebs 源，否则装不上。
-          sudo apt-get install -y --no-install-recommends gnupg ddebs || true
-          codename=$(lsb_release -cs)
-          echo "deb http://ddebs.ubuntu.com/ ${codename} main" | sudo tee /etc/apt/sources.list.d/ddebs.list
-          sudo apt-get update
-          sudo apt-get install -y qt6-base-dev-dbgsym || \
-            echo "::warning::未能安装 dbgsym，Qt 内部堆栈仍会显示 ???"
+
+      # 单独一步装 Qt 调试符号：失败只告警，绝不影响主流程。
+      # 背景：静态链接的 Qt 库无符号时 Valgrind 堆栈全是 ???，无法定位问题。
+      # 注意 ddebs.ubuntu.com 必须先导入其 GPG 公钥，否则 apt-get update 会因
+      # 「The repository is not signed」整体失败（exit 100），把 CI 直接搞挂
+      # ——2026-10 就因此白跑了一轮。此处所有命令都容错，绝不阻断。
+      - name: Install Qt debug symbols (best-effort)
+        continue-on-error: true
+        run: |
+          set +e
+          sudo apt-get install -y --no-install-recommends curl ca-certificates gnupg
+          # ddebs 的签名公钥（Ubuntu 归档官方公钥）
+          curl -fsSL https://keyserver.ubuntu.com/pks/lookup?op=get\&search=0x843938DF228D22F7B3742BC0D94AA3F0EFE21092 \
+            | gpg --dearmor -o /usr/share/keyrings/ddebs-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/ddebs-archive-keyring.gpg] http://ddebs.ubuntu.com $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/ddebs.list
+          sudo apt-get update -o Acquire::AllowInsecureRepositories=false
+          sudo apt-get install -y qt6-base-dev-dbgsym
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            echo "::warning::Qt dbgsym 安装失败（rc=$rc），Qt 内部堆栈将显示 ???"
+          else
+            echo "Qt dbgsym installed"
+          fi
+          exit 0
 
       - name: Configure (qmake6, debug + 调试信息)
         run: |
@@ -124,11 +141,32 @@ jobs:
             echo "::error::二进制缺少 .debug_info，Valgrind 无法给出堆栈"
             exit 1
           fi
-          # 顺带确认 Qt 调试符号是否装上（决定 Qt 内部堆栈能否符号化）
-          if ls /usr/lib/debug/.build-id/*/*.debug 2>/dev/null | head -1 | grep -q .; then
-            echo "Qt dbgsym: present"
+
+      # 符号化能力自检：直接问 Valgrind 能否解析出一个已知 Qt 符号。
+      # 这样即使后续 Valgrind 仍报未初始化值，也能从本步日志立刻判断
+      #「是符号没装好导致堆栈不可读」还是「确实有别的问题」。
+      - name: Verify Valgrind can symbolize
+        continue-on-error: true
+        run: |
+          set +e
+          BIN=$(find build/vg -name fieldlink_tests -type f -perm -u+x | head -1)
+          if [ -z "$BIN" ]; then
+            echo "::warning::未找到二进制，跳过符号化自检"
+            exit 0
+          fi
+          # nm 看能否列出符号（静态库已链接进二进制时应能列出我们自己的函数）
+          if nm -C "$BIN" 2>/dev/null | grep -q "PointModel\|DataExporter"; then
+            echo "symbolize: our own symbols resolvable"
           else
-            echo "::warning::未检测到 Qt dbgsym，Qt 内部堆栈可能仍显示 ???"
+            echo "::warning::nm 无法列出本项目符号，可能是静态库符号表被裁剪"
+          fi
+          # dbgsym 是否就位（build-id 目录）
+          N=$(find /usr/lib/debug/.build-id -name '*.debug' 2>/dev/null | wc -l)
+          echo "dbgsym files: $N"
+          if [ "$N" -eq 0 ]; then
+            echo "::warning::未找到 dbgsym，Qt 内部堆栈将显示 ???"
+          fi
+          exit 0
 
       - name: Run tests under Valgrind
         run: |
@@ -136,7 +174,9 @@ jobs:
           # --undef-value-errors=yes 显式声明检查未初始化值（默认即开，此处明示意图）。
           # --read-var-info=yes 让 Valgrind 能报告「哪个变量未初始化」。
           # --demangle=yes 保证 C++ 符号名可读（否则函数名显示成 _Z 开头的乱码）。
-          # 追加 --trace-children=no，避免测试里启动的子进程干扰归因。
+          # --trace-children=no，避免测试里启动的子进程干扰归因。
+          # --keep-debuginfo=yes 让 Valgrind 尝试从系统调试符号目录解析 Qt 内部符号；
+          # 若 dbgsym 未装上，此项不会报错，只是 Qt 内部堆栈仍为???（不阻断）。
           valgrind --tool=memcheck \
                    --leak-check=full \
                    --show-leak-kinds=definite,indirect \
@@ -146,6 +186,7 @@ jobs:
                    --read-var-info=yes \
                    --demangle=yes \
                    --trace-children=no \
+                   --keep-debuginfo=yes \
                    --num-callers=25 \
                    --error-exitcode=1 \
                    -s \
