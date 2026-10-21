@@ -64,8 +64,18 @@ signals:
 private:
     struct DeviceEntry {
         DeviceConfig config;
-        QModbusClient *client;
+        QModbusClient *client = nullptr;
     };
+
+    // P2-3：加载时对缺键/越界值做归一（回落 DeviceConfig 结构体默认值）
+    static void sanitizeConfig(DeviceConfig &cfg);
+    // P2-11：判断影响「链路」的参数是否发生变化
+    static bool connectionParamsChanged(const DeviceConfig &a, const DeviceConfig &b);
+    // 按当前配置创建 client 并接好信号（不建立连接）
+    void createClient(DeviceEntry &entry);
+    // 断开并释放 client（释放前先把 entry.client 置空，使旧 client 的迟到信号被忽略）
+    void destroyClient(DeviceEntry &entry);
+
     QVector<DeviceEntry> m_devices;
     int m_nextId;
 };
