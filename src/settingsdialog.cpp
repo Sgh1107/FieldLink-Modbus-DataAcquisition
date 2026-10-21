@@ -57,17 +57,49 @@ SettingsDialog::SettingsDialog(QWidget *parent) :
     ui->retriesSpinner->setValue(m_settings.numberOfRetries);
 
     connect(ui->applyButton, &QPushButton::clicked, [this]() {
-        m_settings.parity = ui->parityCombo->currentIndex();
-        if (m_settings.parity > 0)
-            m_settings.parity++;
+        // 校验位必须用显式映射表，不能用"下标 + 1"。
+        // 下拉框顺序是 No/Even/Odd/Space/Mark，而 QSerialPort::Parity 枚举是
+        // No=0, Odd=1, Even=2, Space=3, Mark=4 —— 靠算术映射会让
+        // "Odd" 变成 SpaceParity、"Mark" 变成非法值 5（现场通信参数静默错误）。
+        m_settings.parity = parityFromComboIndex(ui->parityCombo->currentIndex());
         m_settings.baud = ui->baudCombo->currentText().toInt();
         m_settings.dataBits = ui->dataBitsCombo->currentText().toInt();
         m_settings.stopBits = ui->stopBitsCombo->currentText().toInt();
-        m_settings.responseTime = ui->timeoutSpinner->value();
+        // 超时必须为正：QModbusClient::setTimeout(-1) 会让内部 QTimer::start(-1)
+        // 无法启动（Qt 报 "Timers cannot have negative intervals"），
+        // 结果是请求永不超时，定时读取静默停摆。
+        m_settings.responseTime = qMax(1, ui->timeoutSpinner->value());
         m_settings.numberOfRetries = ui->retriesSpinner->value();
 
         hide();
     });
+}
+
+// 下拉框下标 → QSerialPort::Parity 枚举值。
+// 下拉框顺序（settingsdialog.ui）：No, Even, Odd, Space, Mark
+int SettingsDialog::parityFromComboIndex(int index)
+{
+    switch (index) {
+    case 0: return static_cast<int>(QSerialPort::NoParity);
+    case 1: return static_cast<int>(QSerialPort::EvenParity);
+    case 2: return static_cast<int>(QSerialPort::OddParity);
+    case 3: return static_cast<int>(QSerialPort::SpaceParity);
+    case 4: return static_cast<int>(QSerialPort::MarkParity);
+    default: return static_cast<int>(QSerialPort::NoParity);
+    }
+}
+
+// QSerialPort::Parity 枚举值 → 下拉框下标（反向映射）。
+int SettingsDialog::comboIndexFromParity(int parity)
+{
+    switch (parity) {
+    case static_cast<int>(QSerialPort::NoParity):   return 0;
+    case static_cast<int>(QSerialPort::EvenParity):  return 1;
+    case static_cast<int>(QSerialPort::OddParity):   return 2;
+    case static_cast<int>(QSerialPort::SpaceParity): return 3;
+    case static_cast<int>(QSerialPort::MarkParity):  return 4;
+    default: return 0;
+    }
 }
 
 SettingsDialog::~SettingsDialog()
@@ -83,11 +115,11 @@ SettingsDialog::Settings SettingsDialog::settings() const
 void SettingsDialog::setSettings(const Settings &s)
 {
     m_settings = s;
-    ui->parityCombo->setCurrentIndex(m_settings.parity > 0 ? m_settings.parity - 1 : 0);
+    ui->parityCombo->setCurrentIndex(comboIndexFromParity(m_settings.parity));
     ui->baudCombo->setCurrentText(QString::number(m_settings.baud));
     ui->dataBitsCombo->setCurrentText(QString::number(m_settings.dataBits));
     ui->stopBitsCombo->setCurrentText(QString::number(m_settings.stopBits));
-    ui->timeoutSpinner->setValue(m_settings.responseTime);
+    ui->timeoutSpinner->setValue(qMax(1, m_settings.responseTime));
     ui->retriesSpinner->setValue(m_settings.numberOfRetries);
 }
 

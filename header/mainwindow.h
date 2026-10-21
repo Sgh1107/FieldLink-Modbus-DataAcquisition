@@ -8,11 +8,15 @@
 #include <QTranslator>
 #include <QJsonObject>
 #include <QMap>
+#include <QHash>
+#include <QSet>
+#include <functional>
 
 QT_BEGIN_NAMESPACE
 
 class QModbusClient;
 class QModbusReply;
+class QListWidgetItem;
 
 namespace Ui {
 class MainWindow;
@@ -47,6 +51,12 @@ class DeviceSimulatorPanel;
 
 struct PollTask;
 struct BatchTask;
+
+// 读取结果刷新模式随请求下发的属性名。
+// true = 按地址原地刷新既有行（定时读取）；false = 追加新行（手动读取）。
+// 不能用共享成员标志：标志在「发送时写、回包时读」，回包异步，
+// 期间会被另一次请求改写，导致定时读与手动读并发时模式串扰。
+static const char *const kReadInPlaceProperty = "fieldlink.readInPlace";
 
 class MainWindow : public QMainWindow
 {
@@ -117,13 +127,23 @@ private slots:
     void saveProfile();
     void loadProfile();
     QJsonObject buildRemoteStatus() const;
-    QJsonObject executeRemoteRead(int serverAddress, int registerType, int startAddress, int count);
-    QJsonObject executeRemoteWrite(int serverAddress, int registerType, int startAddress, const QVector<quint16> &values);
     void publishMqttTelemetry(int serverAddress, int registerType, int startAddress, const QVector<quint16> &values);
     void publishMqttStatus(bool connected);
     void askReconnectAfterRemoteClose();   // 对端主动断开：弹窗询问用户是否重连
 
 private:
+    // 远程读/写：异步执行，完成后通过 callback 回传结果。
+    // 不使用嵌套事件循环（会造成 use-after-free 与 GUI 冻结），详见实现处注释。
+    // 注意：这两个方法必须放在普通 private: 段而不是 private slots: 段 ——
+    // moc 会为槽函数生成元对象调用代码，而 moc 无法正确解析
+    // std::function<void(const QJsonObject&)> 这类参数类型（会把 const 放到错误位置），
+    // 导致编译错误。它们本来就不是槽函数，不需要出现在元对象里。
+    void executeRemoteRead(int serverAddress, int registerType, int startAddress, int count,
+                           const std::function<void(const QJsonObject &)> &callback);
+    void executeRemoteWrite(int serverAddress, int registerType, int startAddress,
+                            const QVector<quint16> &values,
+                            const std::function<void(const QJsonObject &)> &callback);
+
     Ui::MainWindow *ui;
     QModbusReply *lastRequest;
     QModbusClient *modbusDevice;
@@ -155,12 +175,17 @@ private:
     DeviceSimulatorPanel *m_deviceSimulatorPanel = nullptr;   // 模拟设备面板
     class QTimer *m_autoReadTimer = nullptr;       // 实时读取定时轮询
     bool m_autoReadBusy = false;                   // 定时读取在途保护：上一 tick 未完成则跳过
-    bool m_readUpdatesInPlace = false;             // true=定时读取按地址原地刷新行；false=手动读取追加
+    int m_pendingReadRequests = 0;                 // 在途读请求计数（分段读时准确判断是否仍有请求未回）
     class QLabel *m_autoReadIndicator = nullptr;   // 定时读取常驻状态指示（状态栏右侧）
     QMap<int, int> m_pointChartSeriesMap;
     QMap<int, int> m_pointDashboardGaugeMap;
-    int m_lastModbusState = -1;        // 上一次 Modbus 连接状态（识别"曾连接后意外断线"）
+    int m_lastModbusState = -1;        // 上一次 Modbus 连接状态（调试用）
+    bool m_hadRealConnection = false;  // 本次连接周期内是否真正连上过（识别"连上后意外断线"）
     bool m_userDisconnecting = false;  // 用户主动断开标记（抑制对端断开弹窗）
+    bool m_shuttingDown = false;       // 析构中标志：置位后所有回调立即返回（防止空指针解引用）
+    // 「读取结果」列表的 地址 → 行 映射（原地刷新用）。
+    // 线性查找是 O(值数 × 行数)，高频率大范围读取时列表查找成为瓶颈。
+    QHash<int, QListWidgetItem *> m_readRowsByAddr;
 };
 
 #endif // MAINWINDOW_H

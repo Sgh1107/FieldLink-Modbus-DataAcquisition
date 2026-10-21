@@ -34,6 +34,7 @@
 using QModbusRtuSerialClient = QModbusRtuSerialMaster;
 #endif
 #include <QStandardItemModel>
+#include <QStandardPaths>
 #include <QStatusBar>
 #include <QLabel>
 #include <QDateTime>
@@ -192,14 +193,21 @@ MainWindow::~MainWindow()
         m_templateManager->saveToFile(QCoreApplication::applicationDirPath() + "/templates.json");
     m_appSettings.sync();
 
-    delete m_chart;
-    m_chart = nullptr;
-    delete m_dashboard;
-    m_dashboard = nullptr;
+    // 关闭标志：置位后所有回调立即返回。
+    // delete modbusDevice 会触发在途 QModbusReply 的 finished() →
+    // readReady() → PointModel::pointValueUpdated → lambda 里 m_chart->addDataPoint()。
+    // 若此时 m_chart 已被置空 → 段错误。析构期间必须先切断回调链。
+    m_shuttingDown = true;
 
     if (modbusDevice)
         modbusDevice->disconnectDevice();
     delete modbusDevice;
+    modbusDevice = nullptr;
+
+    delete m_chart;
+    m_chart = nullptr;
+    delete m_dashboard;
+    m_dashboard = nullptr;
 
     saveSettings();
 
@@ -327,12 +335,23 @@ void MainWindow::attemptModbusConnection(bool manual)
 
 void MainWindow::onStateChanged(int state)
 {
-    bool connected = (state != QModbusDevice::UnconnectedState);
-    // 上一次状态是否为"已连接"（用于区分"连接失败"与"连上后被对端断开"）
-    const bool wasConnected = (m_lastModbusState == QModbusDevice::ConnectedState);
+    // 只有真正处于 ConnectedState 才算"已连接"。
+    // 之前用 `state != UnconnectedState`，把 Connecting / Closing 也当成了已连接：
+    //   - 断开过程中状态胶囊仍显示绿色、断开按钮仍可用；
+    //   - ConnectingState 也会调用 notifySuccess()，把连续失败计数清零，
+    //     导致 ReliabilityManager 的「连续通信失败 N 次」告警永远不会触发。
+    const bool connected = (state == QModbusDevice::ConnectedState);
+    const bool connecting = (state == QModbusDevice::ConnectingState);
+    // 上一次状态（保留用于调试与兼容判断）
     m_lastModbusState = state;
 
-    ui->actionConnect->setEnabled(!connected);
+    // "曾真正连上过"标志：独立于状态序列维护。
+    // 不能依赖 m_lastModbusState == ConnectedState —— 断开时 Qt 会先发
+    // ClosingState 再发 UnconnectedState，前者会把"曾连接过"的信息冲掉。
+    if (connected)
+        m_hadRealConnection = true;
+
+    ui->actionConnect->setEnabled(!connected && !connecting);
     ui->actionDisconnect->setEnabled(connected);
 
     // 设备断开时自动取消「定时读取」，避免空转报错
@@ -356,19 +375,23 @@ void MainWindow::onStateChanged(int state)
     }
     if (m_reliabilityManager) {
         if (connected) {
+            // 只有真正连上才记成功
             m_reliabilityManager->notifySuccess();
-        } else {
-            // 意外断线（此前已连接且非用户主动断开）＝对端主动断开/网络中断：
+        } else if (state == QModbusDevice::UnconnectedState) {
+            // 只有真正断开（UnconnectedState）才算一次通信失败。
+            // ClosingState（正在断开）不算 —— 否则一次断线会被计两次失败。
+            // 意外断线（此前确实连上过且非用户主动断开）＝对端主动断开/网络中断：
             // 先暂停自动重连循环，弹窗交给用户决定是否重连
-            const bool unexpected = wasConnected && !m_userDisconnecting;
+            const bool unexpected = m_hadRealConnection && !m_userDisconnecting;
             if (unexpected)
                 m_reliabilityManager->setUserIntentConnected(false);
             m_reliabilityManager->notifyDisconnected();
             if (unexpected)
                 askReconnectAfterRemoteClose();
+            m_hadRealConnection = false;   // 本轮断开流程已处理完毕
+            m_userDisconnecting = false;   // 恢复默认
         }
     }
-    m_userDisconnecting = false;   // 断开流程已处理完毕，恢复默认
     saveSettings();
 }
 
@@ -401,9 +424,8 @@ void MainWindow::on_readButton_clicked()
 {
     if (!modbusDevice)
         return;
-    m_readUpdatesInPlace = false;   // 手动读取：清空列表重新列出
     statusBar()->clearMessage();
-    sendReadRequests(true);   // 手动读取：先清空结果列表
+    sendReadRequests(true);   // 手动读取：先清空结果列表（刷新模式随请求下发）
 }
 
 /** @brief 发起分段读取
@@ -415,8 +437,10 @@ bool MainWindow::sendReadRequests(bool clearResult)
 {
     if (!modbusDevice)
         return false;
-    if (clearResult)
+    if (clearResult) {
         ui->readValue->clear();
+        m_readRowsByAddr.clear();   // 列表被清空，地址→行映射必须同步清空
+    }
 
     // 分段读取
     const auto req = readRequest();
@@ -446,10 +470,17 @@ bool MainWindow::sendReadRequests(bool clearResult)
                    .arg(seg.registerType()).arg(seg.startAddress()).arg(seg.valueCount()));
         if (auto *reply = modbusDevice->sendReadRequest(seg, ui->serverEdit->value())) {
             sent = true;
-            if (!reply->isFinished())
+            if (!reply->isFinished()) {
+                // 刷新模式必须随请求走，不能用共享成员标志：
+                // 标志在「发送时写入、回包时读取」，而回包是异步的，
+                // 期间可能被另一次请求改写 —— 定时读与手动读并发时模式串扰，
+                // 导致定时读被当成手动读而不断追加行（列表无限膨胀）。
+                reply->setProperty(kReadInPlaceProperty, !clearResult);
+                ++m_pendingReadRequests;
                 connect(reply, &QModbusReply::finished, this, &MainWindow::readReady);
-            else
+            } else {
                 delete reply; // 广播回复会立即返回
+            }
         } else {
             statusBar()->showMessage(tr("Read error: ") + modbusDevice->errorString(), 5000);
         }
@@ -463,12 +494,17 @@ void MainWindow::readReady()
     if (!reply)
         return;
 
+    // 取出该请求自己的刷新模式（发送时随 reply 一起保存）
+    const bool inPlace = reply->property(kReadInPlaceProperty).toBool();
+
     if (reply->error() == QModbusDevice::NoError) {
         const QModbusDataUnit unit = reply->result();
         ui->readValue->setUpdatesEnabled(false);
         QListWidgetItem *lastItem = nullptr;
         QVector<quint16> raw;
         raw.reserve(static_cast<int>(unit.valueCount()));
+        // 本次响应覆盖的地址集合：用于清理上一轮遗留的、不再被读取的旧行
+        QSet<int> seenAddrs;
         for (uint i = 0; i < unit.valueCount(); i++) {
             const int addr = unit.startAddress() + static_cast<int>(i);
             const quint16 val = unit.value(i);
@@ -476,17 +512,14 @@ void MainWindow::readReady()
                                      .arg(QString::number(val,
                                           unit.registerType() <= QModbusDataUnit::Coils ? 10 : 16));
             raw.append(val);
+            seenAddrs.insert(addr);
 
             QListWidgetItem *item = nullptr;
-            if (m_readUpdatesInPlace) {
-                // 定时读取：按地址匹配既有行，原地刷新数值，不追加新记录
-                for (int r = 0; r < ui->readValue->count(); ++r) {
-                    QListWidgetItem *row = ui->readValue->item(r);
-                    if (row->data(Qt::UserRole).toInt() == addr) {
-                        item = row;
-                        break;
-                    }
-                }
+            if (inPlace) {
+                // 定时读取：按地址匹配既有行，原地刷新数值，不追加新记录。
+                // 用哈希表做地址→行 映射：线性查找是 O(值数 × 行数)，
+                // 读 125 个值且列表 500 行时每 tick 6 万次比较，位区 2000 个线圈时更甚。
+                item = m_readRowsByAddr.value(addr, nullptr);
                 if (item) {
                     item->setText(entry);
                     continue;   // 行数与顺序保持不变
@@ -497,8 +530,27 @@ void MainWindow::readReady()
             item = new QListWidgetItem(entry);
             item->setData(Qt::UserRole, addr);
             ui->readValue->addItem(item);
+            if (inPlace)
+                m_readRowsByAddr.insert(addr, item);
             lastItem = item;
         }
+
+        // 清理本轮未覆盖的旧行：用户改了读取起始地址后，旧地址的行会永久滞留，
+        // 列表只增不减最终膨胀到无法使用。
+        if (inPlace && !m_readRowsByAddr.isEmpty()) {
+            const QList<int> stale = m_readRowsByAddr.keys().toList();
+            for (int addr : stale) {
+                if (seenAddrs.contains(addr))
+                    continue;
+                QListWidgetItem *row = m_readRowsByAddr.take(addr);
+                if (row) {
+                    const int rowIndex = ui->readValue->row(row);
+                    if (rowIndex >= 0)
+                        ui->readValue->takeItem(rowIndex);
+                }
+            }
+        }
+
         ui->readValue->setUpdatesEnabled(true);
         if (lastItem)
             ui->readValue->scrollToItem(lastItem, QAbstractItemView::PositionAtBottom);
@@ -543,7 +595,11 @@ void MainWindow::readReady()
         logMessage(QStringLiteral("READ-ERR %1 code=0x%2").arg(reply->errorString()).arg(reply->error(), -1, 16));
     }
 
-    m_autoReadBusy = false;   // 本 tick 的读取已结束（成功或失败），允许下一个 tick
+    // 在途计数递减：分段读时第一段回包就清 busy 会让下一 tick 提前发请求，
+    // 其余分段仍在途 → 请求堆积。用计数而非布尔量才准确。
+    if (m_pendingReadRequests > 0)
+        --m_pendingReadRequests;
+    m_autoReadBusy = (m_pendingReadRequests > 0);
     reply->deleteLater();
 }
 
@@ -595,14 +651,15 @@ void MainWindow::onAutoReadTimeout()
         ui->autoReadCheck->setChecked(false);
         return;
     }
-    if (m_autoReadBusy)
+    if (m_autoReadBusy || m_pendingReadRequests > 0)
         return;   // 在途保护：跳过本 tick
 
-    m_readUpdatesInPlace = true;   // 定时读取：按地址原地刷新既有行，不追加新记录
+    // 定时读取：按地址原地刷新既有行，不追加新记录
+    // （刷新模式随请求下发，见 sendReadRequests 中 reply->setProperty）
     if (!sendReadRequests(false))
         m_autoReadBusy = false;   // 一条都没发出去（如设备繁忙），下一 tick 重试
     else
-        m_autoReadBusy = true;    // readReady 回调里复位
+        m_autoReadBusy = true;    // readReady 回调里按在途计数复位
 }
 
 void MainWindow::on_writeButton_clicked()
@@ -617,11 +674,24 @@ void MainWindow::on_writeButton_clicked()
 
     QModbusDataUnit writeUnit = writeRequest();
     QModbusDataUnit::RegisterType table = writeUnit.registerType();
+
+    // 越界保护：writeAddress 最大 65535、writeSize 是可编辑下拉框（用户可输入任意数量），
+    // 二者之和可能超出 65536 的地址空间。此前直接按 i + startAddress 索引 65536 大小的
+    // 缓存 → Release 构建（Q_ASSERT 被编译掉）静默越界读，把堆外垃圾值写给从站。
+    const int start = writeUnit.startAddress();
+    const int count = static_cast<int>(writeUnit.valueCount());
+    if (count <= 0 || start < 0 || start + count > 65536) {
+        statusBar()->showMessage(tr("Write range exceeds the Modbus address space (0~65535)"), 5000);
+        logMessage(QStringLiteral("WRITE 越界被拒绝：addr=%1 count=%2").arg(start).arg(count), 3);
+        return;
+    }
+
     for (uint i = 0; i < writeUnit.valueCount(); i++) {
+        const int absolute = start + static_cast<int>(i);
         if (table == QModbusDataUnit::Coils)
-            writeUnit.setValue(i, writeModel->m_coils[i + writeUnit.startAddress()]);
+            writeUnit.setValue(i, writeModel->m_coils[absolute]);
         else
-            writeUnit.setValue(i, writeModel->m_holdingRegisters[i + writeUnit.startAddress()]);
+            writeUnit.setValue(i, writeModel->m_holdingRegisters[absolute]);
     }
 
     // 分段写入
@@ -755,7 +825,13 @@ void MainWindow::logMessage(const QString &line, int level) const
 
     const QString dir = QCoreApplication::applicationDirPath() + "/logs";
     QDir logDir(dir);
-    logDir.mkpath(".");
+    // mkpath 只做一次：每次日志都做一次文件系统查询，
+    // 在定时读取（100ms 一次）时是每秒 10+ 次 CreateFile/FindFirstFile，GUI 线程抖动明显。
+    static bool logDirEnsured = false;
+    if (!logDirEnsured) {
+        logDir.mkpath(".");
+        logDirEnsured = true;
+    }
 
     static QDate lastCleanupDate;
     const QDate today = QDate::currentDate();
@@ -776,6 +852,7 @@ void MainWindow::logMessage(const QString &line, int level) const
         QTextStream s(&f);
         s.setGenerateByteOrderMark(false);
         s << QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss.zzz ") << tag << line << "\n";
+        s.flush();
         f.close();
     }
 }
@@ -808,9 +885,17 @@ QModbusDataUnit MainWindow::readRequest() const
         static_cast<QModbusDataUnit::RegisterType> (ui->writeTable->currentData().toInt());
 
     int startAddress = ui->readAddress->value();
-    int numberOfEntries = ui->readSize->currentText().toInt();
+    bool ok = false;
+    int numberOfEntries = ui->readSize->currentText().toInt(&ok);
+    if (!ok) numberOfEntries = 0;
     if (startAddress < 0) startAddress = 0;
+    // 上限保护：readSize 是可编辑下拉框，用户可输入任意数量。
+    // 不加限制时输入 100000 会切成 800 段一次性向设备发出 800 个读请求，
+    // 把现场从站打爆（请求排队堆积、超时、丢包）。
+    const int limit = (table == QModbusDataUnit::Coils || table == QModbusDataUnit::DiscreteInputs)
+                          ? 2000 : 125;
     if (numberOfEntries < 0) numberOfEntries = 0;
+    if (numberOfEntries > limit) numberOfEntries = limit;
     return QModbusDataUnit(table, startAddress, numberOfEntries);
 }
 
@@ -820,9 +905,15 @@ QModbusDataUnit MainWindow::writeRequest() const
         static_cast<QModbusDataUnit::RegisterType> (ui->writeTable->currentData().toInt());
 
     int startAddress = ui->writeAddress->value();
-    int numberOfEntries = ui->writeSize->currentText().toInt();
+    bool ok = false;
+    int numberOfEntries = ui->writeSize->currentText().toInt(&ok);
+    if (!ok) numberOfEntries = 0;
     if (startAddress < 0) startAddress = 0;
+    // 单次写入上限（Modbus 规范：保持寄存器 ≤123，位区 ≤2000）
+    const int limit = (table == QModbusDataUnit::Coils || table == QModbusDataUnit::DiscreteInputs)
+                          ? 2000 : 123;
     if (numberOfEntries < 0) numberOfEntries = 0;
+    if (numberOfEntries > limit) numberOfEntries = limit;
     return QModbusDataUnit(table, startAddress, numberOfEntries);
 }
 
@@ -839,17 +930,33 @@ void MainWindow::initAdvancedFeatures()
     m_chart->resize(600, 400);
     m_deviceManager = new DeviceManager(this);
     m_templateManager = new DeviceTemplateManager(this);
+    // 必须在这里加载模板：析构时会无条件把模板写回 templates.json。
+    // 若启动时不加载，内存里模板为空 → 重启后再退出就把磁盘上的模板覆盖成 []，
+    // 用户资产被应用自身清空且无任何提示。
+    m_templateManager->loadFromFile(QCoreApplication::applicationDirPath() + "/templates.json");
     m_scriptEngine = new ScriptEngine(this);
     m_remoteServer = new RemoteServer(this);
     m_remoteServer->setStatusProvider([this]() { return buildRemoteStatus(); });
-    m_remoteServer->setReadHandler([this](int serverAddress, int registerType, int startAddress, int count) {
-        return executeRemoteRead(serverAddress, registerType, startAddress, count);
+    m_remoteServer->setReadHandler([this](int serverAddress, int registerType, int startAddress, int count,
+                                           const RemoteServer::ResponseCallback &callback) {
+        executeRemoteRead(serverAddress, registerType, startAddress, count, callback);
     });
-    m_remoteServer->setWriteHandler([this](int serverAddress, int registerType, int startAddress, const QVector<quint16> &values) {
-        return executeRemoteWrite(serverAddress, registerType, startAddress, values);
+    m_remoteServer->setWriteHandler([this](int serverAddress, int registerType, int startAddress,
+                                            const QVector<quint16> &values,
+                                            const RemoteServer::ResponseCallback &callback) {
+        executeRemoteWrite(serverAddress, registerType, startAddress, values, callback);
     });
     m_historyData = new HistoryData(this);
-    m_historyData->openDatabase(QCoreApplication::applicationDirPath() + "/history.db");
+    // 历史库必须放在可写目录：装到 C:\Program Files 下程序目录不可写，
+    // openDatabase 会失败 → 历史归档静默失效且界面无任何提示。
+    const QString historyPath = m_appSettings.value(
+        "history/dbPath",
+        QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/history.db").toString();
+    if (!m_historyData->openDatabase(historyPath)) {
+        const QString err = m_historyData->lastError();
+        logMessage(QStringLiteral("历史数据库打开失败：%1（历史归档不可用）").arg(err), 3);
+        statusBar()->showMessage(tr("Cannot open history database: %1").arg(err), 8000);
+    }
     m_pluginManager = new PluginManager(this);
     m_pluginManager->setPluginDirectory(QCoreApplication::applicationDirPath() + "/plugins");
     m_alarmManager = new AlarmManager(this);
@@ -928,9 +1035,12 @@ void MainWindow::initAdvancedFeatures()
         m_pointModel->saveToFile(pointFile);
     }
     connect(m_pointModel, &PointModel::pointValueUpdated, this, [this](const PointDefinition &point, const PointValue &value) {
-        if (m_pointChartSeriesMap.contains(point.id))
+        // 析构期间 m_chart / m_dashboard 可能已被删除 → 必须判空
+        if (m_shuttingDown)
+            return;
+        if (m_chart && m_pointChartSeriesMap.contains(point.id))
             m_chart->addDataPoint(m_pointChartSeriesMap.value(point.id), value.value);
-        if (m_pointDashboardGaugeMap.contains(point.id))
+        if (m_dashboard && m_pointDashboardGaugeMap.contains(point.id))
             m_dashboard->updateGaugeValue(m_pointDashboardGaugeMap.value(point.id), value.value);
     });
     m_verificationManager = new VerificationManager(this);

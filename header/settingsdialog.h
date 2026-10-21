@@ -37,6 +37,12 @@ public:
     void saveToQSettings(QSettings &qs) const;
 
 private:
+    // 校验位下拉框与 QSerialPort::Parity 枚举的显式双向映射。
+    // 不能用"下标 + 1"：下拉框顺序是 No/Even/Odd/Space/Mark，
+    // 而枚举是 No=0/Odd=1/Even=2/Space=3/Mark=4，算术映射会错位。
+    static int parityFromComboIndex(int index);
+    static int comboIndexFromParity(int parity);
+
     Settings m_settings;
     Ui::SettingsDialog *ui;
 };

@@ -16,6 +16,7 @@
 #include "reliabilitymanager.h"
 #include "securitymanager.h"
 #include "pointmodel.h"
+#include "dataparser.h"   // ByteOrder / byteOrderFromToken（模板字节序透传）
 #include "verificationmanager.h"
 #include "deliverymanager.h"
 #include "logviewer.h"
@@ -409,102 +410,121 @@ QJsonObject MainWindow::buildRemoteStatus() const
     return status;
 }
 
-QJsonObject MainWindow::executeRemoteRead(int serverAddress, int registerType, int startAddress, int count)
+// 远程读（异步）。
+// 不再使用嵌套 QEventLoop 等待 Modbus 应答 —— 那会导致：
+//   1) 客户端在等待期间断开 → socket 在嵌套循环中被销毁 → 回写响应时 use-after-free；
+//   2) 嵌套循环接管 GUI 事件循环 → 界面冻结；新请求还会重入形成递归。
+// 现在改为：发请求 → 在 reply->finished 回调里组装结果 → 通过 callback 回给服务器。
+void MainWindow::executeRemoteRead(int serverAddress, int registerType, int startAddress, int count,
+                                   const std::function<void(const QJsonObject &)> &callback)
 {
-    QJsonObject response;
-    if (!modbusDevice || modbusDevice->state() != QModbusDevice::ConnectedState)
-        return QJsonObject{{"success", false}, {"error", "Modbus device not connected"}};
+    if (!modbusDevice || modbusDevice->state() != QModbusDevice::ConnectedState) {
+        callback(QJsonObject{{"success", false}, {"error", "Modbus device not connected"}});
+        return;
+    }
 
     QModbusDataUnit unit(static_cast<QModbusDataUnit::RegisterType>(registerType), startAddress, count);
     QModbusReply *reply = modbusDevice->sendReadRequest(unit, serverAddress);
-    if (!reply)
-        return QJsonObject{{"success", false}, {"error", modbusDevice->errorString()}};
+    if (!reply) {
+        callback(QJsonObject{{"success", false}, {"error", modbusDevice->errorString()}});
+        return;
+    }
 
-    QEventLoop loop;
-    QTimer timeout;
-    timeout.setSingleShot(true);
-    connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
-    if (!reply->isFinished())
-        connect(reply, &QModbusReply::finished, &loop, &QEventLoop::quit);
-    timeout.start(m_settingsDialog->settings().responseTime + 1000);
-    if (!reply->isFinished())
-        loop.exec();
-
-    if (!reply->isFinished()) {
+    // 超时兜底：QModbusClient 自身也有超时，但这里再加一层，
+    // 保证 reply 一定会被回收，不会永远挂着一个在途请求。
+    auto *timeout = new QTimer(reply);
+    timeout->setSingleShot(true);
+    connect(timeout, &QTimer::timeout, reply, [reply, callback]() {
         reply->deleteLater();
-        m_reliabilityManager->notifyFailure(QStringLiteral("remote read timeout"));
-        return QJsonObject{{"success", false}, {"error", "Read timeout"}};
-    }
+        callback(QJsonObject{{"success", false}, {"error", "Read timeout"}});
+    });
+    timeout->start(m_settingsDialog->settings().responseTime + 1000);
 
-    if (reply->error() != QModbusDevice::NoError) {
-        const QString err = reply->errorString();
+    connect(reply, &QModbusReply::finished, this, [this, reply, timeout, serverAddress,
+                                                    registerType, startAddress, callback]() {
+        timeout->stop();
+        if (reply->error() != QModbusDevice::NoError) {
+            const QString err = reply->errorString();
+            reply->deleteLater();
+            m_reliabilityManager->notifyFailure(err);
+            callback(QJsonObject{{"success", false}, {"error", err}});
+            return;
+        }
+
+        QJsonArray values;
+        const QModbusDataUnit result = reply->result();
+        QVector<quint16> raw;
+        for (uint i = 0; i < result.valueCount(); ++i) {
+            values.append(static_cast<int>(result.value(i)));
+            raw.append(result.value(i));
+        }
         reply->deleteLater();
-        m_reliabilityManager->notifyFailure(err);
-        return QJsonObject{{"success", false}, {"error", err}};
-    }
-
-    QJsonArray values;
-    const QModbusDataUnit result = reply->result();
-    QVector<quint16> raw;
-    for (uint i = 0; i < result.valueCount(); ++i) {
-        values.append(static_cast<int>(result.value(i)));
-        raw.append(result.value(i));
-    }
-    reply->deleteLater();
-    m_reliabilityManager->notifySuccess();
-    m_historyData->addRecord(serverAddress, static_cast<QModbusDataUnit::RegisterType>(registerType), startAddress, raw);
-    response["success"] = true;
-    response["serverAddress"] = serverAddress;
-    response["registerType"] = registerType;
-    response["registerTypeName"] = registerTypeName(registerType);
-    response["startAddress"] = startAddress;
-    response["count"] = static_cast<int>(values.size());
-    response["values"] = values;
-    response["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODateWithMs);
-    return response;
+        m_reliabilityManager->notifySuccess();
+        m_historyData->addRecord(serverAddress, static_cast<QModbusDataUnit::RegisterType>(registerType),
+                                  startAddress, raw);
+        QJsonObject response;
+        response["success"] = true;
+        response["serverAddress"] = serverAddress;
+        response["registerType"] = registerType;
+        response["registerTypeName"] = registerTypeName(registerType);
+        response["startAddress"] = startAddress;
+        response["count"] = static_cast<int>(values.size());
+        response["values"] = values;
+        response["timestamp"] = QDateTime::currentDateTime().toString(Qt::ISODateWithMs);
+        callback(response);
+    });
 }
 
-QJsonObject MainWindow::executeRemoteWrite(int serverAddress, int registerType, int startAddress, const QVector<quint16> &values)
+// 远程写（异步）—— 同上，不使用嵌套事件循环。
+void MainWindow::executeRemoteWrite(int serverAddress, int registerType, int startAddress,
+                                    const QVector<quint16> &values,
+                                    const std::function<void(const QJsonObject &)> &callback)
 {
-    if (!modbusDevice || modbusDevice->state() != QModbusDevice::ConnectedState)
-        return QJsonObject{{"success", false}, {"error", "Modbus device not connected"}};
+    if (!modbusDevice || modbusDevice->state() != QModbusDevice::ConnectedState) {
+        callback(QJsonObject{{"success", false}, {"error", "Modbus device not connected"}});
+        return;
+    }
 
     QModbusDataUnit unit(static_cast<QModbusDataUnit::RegisterType>(registerType), startAddress, values.size());
     for (int i = 0; i < values.size(); ++i)
         unit.setValue(i, values[i]);
 
     QModbusReply *reply = modbusDevice->sendWriteRequest(unit, serverAddress);
-    if (!reply)
-        return QJsonObject{{"success", false}, {"error", modbusDevice->errorString()}};
-
-    QEventLoop loop;
-    QTimer timeout;
-    timeout.setSingleShot(true);
-    connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
-    if (!reply->isFinished())
-        connect(reply, &QModbusReply::finished, &loop, &QEventLoop::quit);
-    timeout.start(m_settingsDialog->settings().responseTime + 1000);
-    if (!reply->isFinished())
-        loop.exec();
-
-    if (!reply->isFinished()) {
-        reply->deleteLater();
-        m_reliabilityManager->notifyFailure(QStringLiteral("remote write timeout"));
-        return QJsonObject{{"success", false}, {"error", "Write timeout"}};
+    if (!reply) {
+        callback(QJsonObject{{"success", false}, {"error", modbusDevice->errorString()}});
+        return;
     }
 
-    if (reply->error() != QModbusDevice::NoError) {
-        const QString err = reply->errorString();
+    auto *timeout = new QTimer(reply);
+    timeout->setSingleShot(true);
+    connect(timeout, &QTimer::timeout, reply, [reply, callback]() {
         reply->deleteLater();
-        m_reliabilityManager->notifyFailure(err);
-        return QJsonObject{{"success", false}, {"error", err}};
-    }
+        callback(QJsonObject{{"success", false}, {"error", "Write timeout"}});
+    });
+    timeout->start(m_settingsDialog->settings().responseTime + 1000);
 
-    reply->deleteLater();
-    m_reliabilityManager->notifySuccess();
-    if (m_securityManager)
-        m_securityManager->audit(QStringLiteral("remote"), QStringLiteral("WRITE"), QStringLiteral("server=%1 type=%2 addr=%3 count=%4").arg(serverAddress).arg(registerType).arg(startAddress).arg(values.size()));
-    return QJsonObject{{"success", true}, {"serverAddress", serverAddress}, {"registerType", registerType}, {"startAddress", startAddress}, {"count", values.size()}, {"timestamp", QDateTime::currentDateTime().toString(Qt::ISODateWithMs)}};
+    connect(reply, &QModbusReply::finished, this, [this, reply, timeout, serverAddress,
+                                                    registerType, startAddress, values, callback]() {
+        timeout->stop();
+        if (reply->error() != QModbusDevice::NoError) {
+            const QString err = reply->errorString();
+            reply->deleteLater();
+            m_reliabilityManager->notifyFailure(err);
+            callback(QJsonObject{{"success", false}, {"error", err}});
+            return;
+        }
+
+        reply->deleteLater();
+        m_reliabilityManager->notifySuccess();
+        if (m_securityManager)
+            m_securityManager->audit(QStringLiteral("remote"), QStringLiteral("WRITE"),
+                QStringLiteral("server=%1 type=%2 addr=%3 count=%4")
+                    .arg(serverAddress).arg(registerType).arg(startAddress).arg(values.size()));
+        callback(QJsonObject{{"success", true}, {"serverAddress", serverAddress},
+                             {"registerType", registerType}, {"startAddress", startAddress},
+                             {"count", values.size()},
+                             {"timestamp", QDateTime::currentDateTime().toString(Qt::ISODateWithMs)}});
+    });
 }
 
 void MainWindow::showLogViewer()
@@ -806,7 +826,7 @@ void MainWindow::showDeviceManager()
     connect(pollBtn, &QPushButton::clicked, &dialog, [&]() {
         const int id = selectedDeviceId(); if (!id) return;
         const auto d = m_deviceManager->deviceConfig(id);
-        PollTask task; task.id = 10000 + d.id; task.name = d.name; task.serverAddress = d.serverAddress;
+        PollTask task; task.id = 100000 + d.id; task.name = d.name; task.serverAddress = d.serverAddress;
         task.registerType = currentUiRegisterType(ui);
         task.startAddress = ui->readAddress->value(); task.quantity = ui->readSize->currentText().toInt(); task.intervalMs = d.pollIntervalMs;
         task.enabled = true; task.alarmEnabled = true; task.alarmMin = 0; task.alarmMax = 65535;
@@ -1004,6 +1024,18 @@ void MainWindow::showTemplateManager()
             point.address = reg.address;
             point.count = reg.count;
             point.dataType = dataTypeForRegisterCount(reg.dataType, reg.count);
+            // 透传模板的字节序：之前模板里配置的 byteOrder 在生成点位时被丢弃，
+            // 导致 DCBA/BADC/CDAB 设备的 32 位数据被按 ABCD 解码（错值且质量码仍为 Good）。
+            {
+                bool boOk = false;
+                const ByteOrder bo = DataParser::byteOrderFromToken(reg.byteOrder, &boOk);
+                point.byteOrder = bo;   // 缺失或无法识别时回退 ABCD（Modbus 标准）
+                if (!reg.byteOrder.trimmed().isEmpty() && !boOk)
+                    qWarning("模板 '%s' 的寄存器 '%s' 字节序 '%s' 无法识别，按 ABCD 处理",
+                             tmpl.name.toUtf8().constData(),
+                             reg.name.toUtf8().constData(),
+                             reg.byteOrder.toUtf8().constData());
+            }
             point.scale = reg.scale;
             point.offset = reg.offset;
             point.unit = reg.unit;
@@ -1024,7 +1056,16 @@ void MainWindow::showTemplateManager()
         for (int i = 0; i < tmpl.registers.size(); ++i) {
             const auto &reg = tmpl.registers[i];
             PollTask task;
-            task.id = 20000 + tmpl.id * 1000 + i;
+            // 轮询任务 id 分段约定（各段互不重叠，避免 addTask 按同 id 视为更新
+            // 而静默覆盖先添加的任务）：
+            //   1        : 默认任务
+            //   100000+  : 设备派生        （设备数 < 100000）
+            //   1000000+ : 模板派生        （模板数 < 1000，每模板寄存器数 < 1000）
+            //   10000000+: 点位派生        （点位数 < 10000000）
+            //   20000000+: 扫描器派生      （从站地址 < 10000000）
+            // 原公式 20000 + tmpl.id * 1000 + i 在模板数 ≥10 或
+            // 单模板寄存器数 ≥1000 时会溢出到 30000 段与点位任务撞车。
+            task.id = 1000000 + tmpl.id * 1000 + i;
             task.name = QStringLiteral("%1.%2").arg(tmpl.name, reg.name);
             task.serverAddress = serverAddress;
             task.registerType = reg.registerType;
@@ -1441,9 +1482,13 @@ void MainWindow::showHistoryQuery()
     layout->addWidget(table);
 
     QVector<HistoryRecord> records;
+    // 单次查询的显示上限：query() 不带 LIMIT 时会把整个时间范围读进内存，
+    // 再逐行 new QTableWidgetItem（7 列）→ 几十万行时界面直接卡死。
+    constexpr int kMaxDisplayRows = 5000;
     auto refresh = [&]() {
         const int regType = typeEdit->currentIndex() == 0 ? -1 : static_cast<int>(registerTypeFromComboIndex(typeEdit->currentIndex() - 1));
-        records = m_historyData->query(fromEdit->dateTime(), toEdit->dateTime(), serverEdit->value(), regType, addrEdit->value());
+        records = m_historyData->query(fromEdit->dateTime(), toEdit->dateTime(), serverEdit->value(),
+                                       regType, addrEdit->value(), kMaxDisplayRows, 0);
         table->setRowCount(records.size());
         for (int row = 0; row < records.size(); ++row) {
             const auto &r = records[row];
@@ -1453,7 +1498,11 @@ void MainWindow::showHistoryQuery()
             for (int col = 0; col < cells.size(); ++col)
                 table->setItem(row, col, new QTableWidgetItem(cells[col]));
         }
-        statusBar()->showMessage(QString("历史查询完成：%1 条").arg(records.size()), 3000);
+        if (records.size() >= kMaxDisplayRows)
+            statusBar()->showMessage(QString("历史查询完成：显示前 %1 条（结果已截断，请缩小时间范围）")
+                                          .arg(records.size()), 5000);
+        else
+            statusBar()->showMessage(QString("历史查询完成：%1 条").arg(records.size()), 3000);
     };
 
     auto *buttons = new QHBoxLayout();
@@ -1512,6 +1561,11 @@ void MainWindow::showPointManager()
     table->setEditTriggers(QAbstractItemView::NoEditTriggers);
     layout->addWidget(table);
 
+    // 点位值刷新的节流定时器（200ms）：
+    // 避免"每个点位值更新都整表重建"造成的 UI 风暴。
+    auto *valueRefreshTimer = new QTimer(&dialog);
+    valueRefreshTimer->setSingleShot(true);
+
     auto refresh = [&]() {
         const auto points = m_pointModel->points();
         table->setRowCount(points.size());
@@ -1537,7 +1591,12 @@ void MainWindow::showPointManager()
         auto *regType = new QComboBox(&editor); regType->addItems({"Coils", "Discrete Inputs", "Input Registers", "Holding Registers"}); regType->setCurrentIndex(isNew ? currentUiRegisterComboIndex(ui) : comboIndexFromRegisterType(static_cast<int>(point.registerType)));
         auto *address = new QSpinBox(&editor); address->setRange(0, 65535); address->setValue(isNew ? ui->readAddress->value() : point.address);
         auto *count = new QSpinBox(&editor); count->setRange(1, 125); count->setValue(isNew ? qMax(1, ui->readSize->currentText().toInt()) : point.count);
-        auto *dataType = new QComboBox(&editor); dataType->setEditable(true); dataType->addItems({"uint16", "int16", "uint32", "int32", "float32"}); dataType->setCurrentText(isNew ? "uint16" : point.dataType);
+        auto *dataType = new QComboBox(&editor); dataType->setEditable(true); dataType->addItems({"uint16", "int16", "uint32", "int32", "float32", "uint64", "int64", "float64", "ascii"}); dataType->setCurrentText(isNew ? "uint16" : point.dataType);
+        // 字节序（仅对 32/64 位类型有意义）：必须让用户能配置，
+        // 否则 DCBA/BADC/CDAB 设备的 32 位数据只能按 ABCD 解码（数值错误）。
+        auto *byteOrder = new QComboBox(&editor);
+        byteOrder->addItems({"ABCD (大端)", "DCBA (小端)", "BADC", "CDAB"});
+        byteOrder->setCurrentIndex(static_cast<int>(point.byteOrder));
         auto *scale = new QDoubleSpinBox(&editor); scale->setRange(-999999999, 999999999); scale->setDecimals(6); scale->setValue(isNew ? 1.0 : point.scale);
         auto *offset = new QDoubleSpinBox(&editor); offset->setRange(-999999999, 999999999); offset->setDecimals(6); offset->setValue(isNew ? 0.0 : point.offset);
         auto *unit = new QLineEdit(isNew ? QString() : point.unit, &editor);
@@ -1545,13 +1604,13 @@ void MainWindow::showPointManager()
         auto *alarmHigh = new QDoubleSpinBox(&editor); alarmHigh->setRange(-999999999, 999999999); alarmHigh->setDecimals(3); alarmHigh->setValue(isNew ? 65535.0 : point.alarmHigh);
         auto *archiveEnabled = new QCheckBox(&editor); archiveEnabled->setChecked(isNew ? true : point.archiveEnabled);
         auto *archiveInterval = new QSpinBox(&editor); archiveInterval->setRange(1, 86400); archiveInterval->setValue(isNew ? 5 : point.archiveIntervalSec);
-        form->addRow("名称", name); form->addRow("从站地址", server); form->addRow("寄存器类型", regType); form->addRow("地址", address); form->addRow("数量", count); form->addRow("数据类型", dataType); form->addRow("系数", scale); form->addRow("偏移", offset); form->addRow("单位", unit); form->addRow("报警下限", alarmLow); form->addRow("报警上限", alarmHigh); form->addRow("是否归档", archiveEnabled); form->addRow("归档周期(s)", archiveInterval);
+        form->addRow("名称", name); form->addRow("从站地址", server); form->addRow("寄存器类型", regType); form->addRow("地址", address); form->addRow("数量", count); form->addRow("数据类型", dataType); form->addRow("字节序", byteOrder); form->addRow("系数", scale); form->addRow("偏移", offset); form->addRow("单位", unit); form->addRow("报警下限", alarmLow); form->addRow("报警上限", alarmHigh); form->addRow("是否归档", archiveEnabled); form->addRow("归档周期(s)", archiveInterval);
         auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &editor);
         form->addRow(buttons);
         connect(buttons, &QDialogButtonBox::accepted, &editor, &QDialog::accept);
         connect(buttons, &QDialogButtonBox::rejected, &editor, &QDialog::reject);
         if (editor.exec() != QDialog::Accepted) return;
-        point.name = name->text(); point.serverAddress = server->value(); point.registerType = registerTypeFromComboIndex(regType->currentIndex()); point.address = address->value(); point.count = count->value(); point.dataType = dataType->currentText(); point.scale = scale->value(); point.offset = offset->value(); point.unit = unit->text(); point.alarmLow = alarmLow->value(); point.alarmHigh = alarmHigh->value(); point.archiveEnabled = archiveEnabled->isChecked(); point.archiveIntervalSec = archiveInterval->value();
+        point.name = name->text(); point.serverAddress = server->value(); point.registerType = registerTypeFromComboIndex(regType->currentIndex()); point.address = address->value(); point.count = count->value(); point.dataType = dataType->currentText(); point.byteOrder = static_cast<ByteOrder>(byteOrder->currentIndex()); point.scale = scale->value(); point.offset = offset->value(); point.unit = unit->text(); point.alarmLow = alarmLow->value(); point.alarmHigh = alarmHigh->value(); point.archiveEnabled = archiveEnabled->isChecked(); point.archiveIntervalSec = archiveInterval->value();
         if (isNew) m_pointModel->addPoint(point); else m_pointModel->updatePoint(point);
         m_pointModel->saveToFile(pointFilePath()); refresh();
     };
@@ -1573,12 +1632,41 @@ void MainWindow::showPointManager()
     });
     connect(exportBtn, &QPushButton::clicked, &dialog, [&]() { exportPointsInteractive(&dialog, m_pointModel); });
     connect(templateBtn, &QPushButton::clicked, &dialog, [&]() { showTemplateManager(); refresh(); });
-    connect(pollBtn, &QPushButton::clicked, &dialog, [&]() { const int id = selectedPointId(); if (!id) return; const auto p = m_pointModel->point(id); PollTask task{30000 + p.id, QStringLiteral("点位.%1").arg(p.name), p.serverAddress, p.registerType, p.address, p.count, qMax(100, p.archiveIntervalSec * 1000), true, true, p.alarmLow, p.alarmHigh}; m_pollManager->removeTask(task.id); m_pollManager->addTask(task); statusBar()->showMessage("点位轮询任务已生成", 3000); });
+    connect(pollBtn, &QPushButton::clicked, &dialog, [&]() { const int id = selectedPointId(); if (!id) return; const auto p = m_pointModel->point(id); PollTask task{10000000 + p.id, QStringLiteral("点位.%1").arg(p.name), p.serverAddress, p.registerType, p.address, p.count, qMax(100, p.archiveIntervalSec * 1000), true, true, p.alarmLow, p.alarmHigh}; m_pollManager->removeTask(task.id); m_pollManager->addTask(task); statusBar()->showMessage("点位轮询任务已生成", 3000); });
     connect(alarmBtn, &QPushButton::clicked, &dialog, [&]() { const int id = selectedPointId(); if (!id) return; const auto p = m_pointModel->point(id); AlarmRule r{}; r.name = p.name + " 上下限报警"; r.enabled = true; r.serverAddress = p.serverAddress; r.registerType = static_cast<int>(p.registerType); r.address = p.address; r.condition = AlarmCondition::OutOfRange; r.threshold1 = p.alarmLow; r.threshold2 = p.alarmHigh; r.severity = AlarmSeverity::Warning; r.message = p.name + " 超出上下限"; r.debounceMs = 0; m_alarmManager->addRule(r); statusBar()->showMessage("点位报警规则已绑定", 3000); });
     connect(chartBtn, &QPushButton::clicked, &dialog, [&]() { const int id = selectedPointId(); if (id) { const int series = m_chart->addSeries(m_pointModel->point(id).name, QColor::fromHsv((id * 37) % 360, 180, 220), 500); m_pointChartSeriesMap.insert(id, series); m_chart->show(); m_chart->raise(); statusBar()->showMessage("点位已动态绑定趋势曲线", 3000); } });
     connect(dashboardBtn, &QPushButton::clicked, &dialog, [&]() { const int id = selectedPointId(); if (!id) return; const auto p = m_pointModel->point(id); GaugeConfig g; g.name = p.name; g.unit = p.unit; g.minValue = p.alarmLow; g.maxValue = p.alarmHigh; g.warningThreshold = p.alarmHigh * 0.8; g.criticalThreshold = p.alarmHigh; g.currentValue = currentPointValue(m_pointModel, id).value; g.normalColor = QColor(46, 204, 113); g.warningColor = QColor(241, 196, 15); g.criticalColor = QColor(231, 76, 60); const int gauge = m_dashboard->addGauge(g); m_pointDashboardGaugeMap.insert(id, gauge); m_dashboard->show(); m_dashboard->raise(); statusBar()->showMessage("点位已动态绑定仪表盘", 3000); });
     connect(archiveBtn, &QPushButton::clicked, &dialog, [&]() { const int id = selectedPointId(); if (id) editPoint(m_pointModel->point(id), false); });
-    connect(m_pointModel, &PointModel::pointValueUpdated, &dialog, [&](const PointDefinition &, const PointValue &) { refresh(); });
+    connect(m_pointModel, &PointModel::pointValueUpdated, &dialog,
+            [&](const PointDefinition &, const PointValue &) {
+        // 每次点位值更新就整表重建会造成 UI 风暴：
+        // 一次读回命中 M 个点位 → M 次 refresh() → 每次都 setRowCount +
+        // 逐格 new QTableWidgetItem（17 列），复杂度 O(M × P × 17)。
+        // 100 个点位 + 100ms 定时读时 CPU 打满、界面几乎无法操作。
+        // 改为 200ms 节流。
+        if (!valueRefreshTimer->isActive())
+            valueRefreshTimer->start(200);
+    });
+    // 节流到期后只更新"当前值/质量码"两列，不重建整表
+    connect(valueRefreshTimer, &QTimer::timeout, &dialog, [&]() {
+        const auto values = m_pointModel->currentValues();
+        for (int row = 0; row < table->rowCount(); ++row) {
+            QTableWidgetItem *idItem = table->item(row, 0);
+            if (!idItem) continue;
+            const int pointId = idItem->text().toInt();
+            const PointValue *found = nullptr;
+            for (const auto &v : values) {
+                if (v.pointId == pointId) { found = &v; break; }
+            }
+            const QString valueText = (found && found->timestamp.isValid())
+                                          ? QString::number(found->value, 'f', 3) : QStringLiteral("--");
+            const QString qualityText = found ? pointQualityName(found->quality) : QStringLiteral("--");
+            if (QTableWidgetItem *it = table->item(row, 15)) it->setText(valueText);
+            else table->setItem(row, 15, new QTableWidgetItem(valueText));
+            if (QTableWidgetItem *it = table->item(row, 16)) it->setText(qualityText);
+            else table->setItem(row, 16, new QTableWidgetItem(qualityText));
+        }
+    });
     refresh(); dialog.exec();
 }
 
