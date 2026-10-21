@@ -16,6 +16,9 @@ DEPENDPATH += $$PWD/../header
 
 SOURCES += \
     master_tests.cpp \
+    review_tests.cpp \
+    test_alarm_export_history.cpp \
+    test_security_config.cpp \
     ../src/alarmmanager.cpp \
     ../src/securitymanager.cpp \
     ../src/reliabilitymanager.cpp \
@@ -27,7 +30,9 @@ SOURCES += \
     ../src/batchtaskmanager.cpp \
     ../src/dataparser.cpp \
     ../src/pointmodel.cpp \
-    ../src/modbusdiagnostics.cpp
+    ../src/modbusdiagnostics.cpp \
+    ../src/configprofile.cpp \
+    ../src/remoteserver.cpp
 
 HEADERS += \
     ../header/alarmmanager.h \
@@ -42,4 +47,6 @@ HEADERS += \
     ../header/batchtaskmanager.h \
     ../header/dataparser.h \
     ../header/pointmodel.h \
-    ../header/modbusdiagnostics.h
+    ../header/modbusdiagnostics.h \
+    ../header/configprofile.h \
+    ../header/remoteserver.h

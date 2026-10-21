@@ -48,9 +48,25 @@ static int g_failed = 0;
 static int g_passed = 0;
 static int g_issuesConfirmed = 0;
 
+// 第二轮 code review 缺陷复现（定义在 review_tests.cpp）
+void runReviewTests();
+// 报警/导出/历史 的修复回归（定义在 test_alarm_export_history.cpp）
+void runAlarmExportHistoryTests();
+// 安全/配置 的修复回归（定义在 test_security_config.cpp）
+void runSecurityConfigTests();
+
+// 全局开关：为 true 时跳过"依赖真实时间等待"的慢速用例。
+// 慢速用例必须等真实的连接超时/重连定时器（数秒到数十秒），
+// 放在 CI 的 PR 快速门禁里会显著拖慢反馈；用 --fast 参数可只跑快速用例。
+// 定义在 master_tests.cpp，其它测试文件 extern 引用。
+bool g_skipSlowTests = false;
+
+// 用法说明：name 允许传 const char* 字面量或 QString（部分用例用 .arg() 拼接）。
+// 统一转成 UTF-8 字节再打印，避免把 QString 直接传给 printf 的 %s（类型不匹配）。
 #define CHECK(name, ...) do { \
-    if ((__VA_ARGS__)) { printf("  [PASS] %s\n", name); ++g_passed; } \
-    else { printf("  [FAIL] %s  (at %s:%d)\n", name, __FILE__, __LINE__); ++g_failed; } \
+    const QByteArray _name = QString(name).toUtf8(); \
+    if ((__VA_ARGS__)) { printf("  [PASS] %s\n", _name.constData()); ++g_passed; } \
+    else { printf("  [FAIL] %s  (at %s:%d)\n", _name.constData(), __FILE__, __LINE__); ++g_failed; } \
 } while (0)
 
 // 已知问题复核：行为复现则确认问题存在（计入 g_issuesConfirmed，不计失败）
@@ -263,11 +279,14 @@ static void testAlarmManager()
     am.checkValue(1, 4, 5, 150.0);          // 触发
     const int countAfterFirst = triggeredCount;
     am.checkValue(1, 4, 5, 50.0);           // 清除
-    am.checkValue(1, 4, 5, 150.0);          // 去抖窗口内再触发 → 抑制
-    CHECK("去抖窗口内再触发被抑制", triggeredCount == countAfterFirst
-          && am.activeAlarmCount() == 0);
+    am.checkValue(1, 4, 5, 150.0);          // 去抖窗口内再触发 → 抑制"事件"
+    // P1-11 修复：去抖只抑制事件，不再抑制"激活状态"。
+    // 之前 continue 会连状态一起跳过 → 条件持续成立但 activeAlarmCount()==0，
+    // 界面显示"无报警"（漏报），且窗口越长漏报越久。
+    CHECK("去抖窗口内再触发被抑制（事件不新增）", triggeredCount == countAfterFirst);
+    CHECK("P1-11: 去抖窗口内激活状态仍同步（不再漏报）", am.activeAlarmCount() == 1);
     waitMs(2100);
-    am.checkValue(1, 4, 5, 150.0);          // 去抖窗口过后 → 再次触发
+    am.checkValue(1, 4, 5, 150.0);          // 去抖窗口过后 → 补发被抑制的事件
     CHECK("去抖窗口过后正常触发", triggeredCount == countAfterFirst + 1);
 
     // 确认与历史
@@ -310,9 +329,13 @@ static void testSecurityManager()
     // 默认用户 admin/admin123（保留可用，但 S2 修复后必须先改密）
     CHECK("S2: 默认账号 admin/admin123 可登录", sm.login(QStringLiteral("admin"), QStringLiteral("admin123")));
     CHECK("S2 修复：默认账号标记强制改密", sm.mustChangePassword(QStringLiteral("admin")));
-    CHECK("admin 拥有通配权限", sm.hasPermission(QStringLiteral("local.write")));
+    // P2-41 修复：强制改密期间禁止一切业务权限（此前只由 UI 层拦截，
+    // 其它调用方可直接调 login() 绕过改密流程）。
+    // admin 角色本身拥有通配权限 "*"，但门禁优先 —— 改密后才放行。
+    CHECK("P2-41: 强制改密期间业务权限被拒绝", !sm.hasPermission(QStringLiteral("local.write")));
     sm.changePassword(QStringLiteral("admin"), QStringLiteral("Str0ng!Pass"));
     CHECK("S2 修复：改密后清除强制改密标记", !sm.mustChangePassword(QStringLiteral("admin")));
+    CHECK("P2-41: 改密后恢复通配权限", sm.hasPermission(QStringLiteral("local.write")));
     sm.logout();
     CHECK("S2 修复：改密后新密码可登录", sm.login(QStringLiteral("admin"), QStringLiteral("Str0ng!Pass")));
     sm.logout();
@@ -488,8 +511,9 @@ static void testMqttClient()
     waitMs(200);
 
     // 连接阶段失败后的自动重连兜底：先对一个"无服务"端口发起连接（必失败），
-    // 失败后应进入 5 秒重连循环；期间把目标换到真实 broker，重连应自动成功
-    {
+    // 失败后应进入 5 秒重连循环；期间把目标换到真实 broker，重连应自动成功。
+    // 该用例需等待真实的 refused 延迟 + 5s 重连周期，合计约 10 秒 → 属慢速用例。
+    if (!g_skipSlowTests) {
         broker.rejectAuth = false;   // 恢复上面的认证拒绝测试切换的模式
         QTcpServer probe;
         CHECK("重连测试探针监听", probe.listen(QHostAddress::LocalHost));
@@ -523,6 +547,8 @@ static void testMqttClient()
         CHECK("连接阶段失败后自动重连成功", retryConnected >= 1 && retryClient.isConnectedToBroker());
         retryClient.disconnectFromBroker();
         waitMs(200);
+    } else {
+        printf("  [SKIP] MQTT 断线重连兜底（慢速用例，需等待真实 refused 延迟 + 5s 重连周期）\n");
     }
 
     Q_UNUSED(errors); Q_UNUSED(disconnectedSeen);
@@ -850,9 +876,15 @@ static void testDataParser()
     const auto f64d = DataParser::fromFloat64(1.0, BO::LittleEndian_DCBA);
     CHECK("D1 fromFloat64(DCBA) 生成", f64d[0] == 0x0000 && f64d[1] == 0x0000 && f64d[2] == 0x0000 && f64d[3] == 0xF03F);
 
-    // ---- ASCII（按实现语义验证：寄存器高/低字节按大端取值）----
+    // ---- ASCII ----
+    // 修正后语义：字节序描述的是"多寄存器数值的分组方式"，对 8 位字符流没有意义。
+    // toAsciiString 一律按 Modbus wire 顺序（寄存器内高字节在前）逐字节还原，
+    // 不再因 DCBA/BADC 交换字节内高低位，也不再丢弃非 ASCII 字节。
     CHECK("ASCII ABCD", DataParser::toAsciiString({0x4142}, BO::BigEndian_ABCD) == QStringLiteral("AB"));
-    CHECK("ASCII DCBA 交换", DataParser::toAsciiString({0x4142}, BO::LittleEndian_DCBA) == QStringLiteral("BA"));
+    CHECK("ASCII DCBA 不再交换字节内高低位",
+          DataParser::toAsciiString({0x4142}, BO::LittleEndian_DCBA) == QStringLiteral("AB"));
+    CHECK("ASCII 保留非 ASCII 字节（不丢弃）",
+          DataParser::toAsciiString({0xE4B8}, BO::BigEndian_ABCD).size() == 2);
     const auto asciiRegs = DataParser::fromAsciiString(QStringLiteral("ABCD"), BO::BigEndian_ABCD);
     const QVector<quint16> asciiExpected = {0x4142, 0x4344};
     CHECK("fromAsciiString 回环", asciiRegs == asciiExpected);
@@ -1362,7 +1394,9 @@ static void testDiagPollTaskSeed()
     {
         const ModbusDiagnostics::PollTaskSeed s =
             ModbusDiagnostics::makePollTaskSeed(12, 0x03, 100, 10);
-        CHECK("DG8: id = 40000 + unit", s.id == 40012);
+        // 轮询任务 id 分段：20000000+ 为扫描器派生段
+        // （原先是 40000+ ，会与点位派生段 30000+ 在点位数多时撞车）
+        CHECK("DG8: id = 20000000 + unit", s.id == 20000012);
         CHECK("DG8: 名称含从站号", s.name.contains(QStringLiteral("12")));
         CHECK("DG8: serverAddress = unit", s.serverAddress == 12);
         CHECK("DG8: registerType 随探测功能码（FC03）",
@@ -1393,14 +1427,14 @@ static void testDiagPollTaskSeed()
         const auto a = ModbusDiagnostics::makePollTaskSeed(1, 0x03, 0, 1);
         const auto b = ModbusDiagnostics::makePollTaskSeed(2, 0x03, 0, 1);
         CHECK("DG8: 不同从站 id 不冲突", a.id != b.id);
-        CHECK("DG8: id 落在 40000+ 段", a.id >= 40001 && b.id >= 40001);
+        CHECK("DG8: id 落在 20000000+ 段", a.id >= 20000001 && b.id >= 20000001);
     }
     {
         const auto lo = ModbusDiagnostics::makePollTaskSeed(1, 0x03, 0, 0);
         CHECK("DG8: unit=1 正常", lo.serverAddress == 1);
         CHECK("DG8: count=0 兜底为 1", lo.quantity == 1);
         const auto hi = ModbusDiagnostics::makePollTaskSeed(247, 0x03, 65535, 125);
-        CHECK("DG8: unit=247 正常", hi.serverAddress == 247 && hi.id == 40247);
+        CHECK("DG8: unit=247 正常", hi.serverAddress == 247 && hi.id == 20000247);
         CHECK("DG8: 最大 startAddress/quantity 透传",
               hi.startAddress == 65535 && hi.quantity == 125);
         const auto neg = ModbusDiagnostics::makePollTaskSeed(5, 0x03, -10, -1);
@@ -2171,6 +2205,15 @@ int main(int argc, char *argv[])
     QCoreApplication app(argc, argv);
     printf("==== FieldLink master 测试套件 ====\n");
 
+    // --fast：跳过依赖真实时间等待的慢速用例（MQTT 连接超时/重连时序等）。
+    // 默认（全量）用于本地开发与 nightly；CI 的 PR 快速门禁用 --fast。
+    for (int i = 1; i < argc; ++i) {
+        if (qstrcmp(argv[i], "--fast") == 0) {
+            g_skipSlowTests = true;
+            printf("  (--fast：跳过依赖真实超时的慢速用例)\n");
+        }
+    }
+
     testAlarmManager();
     testAlarmBitGuard();
     testSecurityManager();
@@ -2206,6 +2249,15 @@ int main(int argc, char *argv[])
     testPointModelTokenCompatibility();
     testPointModelEdgeCases();
     testPointModelImportAutoFallback();
+
+    // 第二轮 code review 的缺陷复现（doc/CODE_REVIEW_2.md）
+    runReviewTests();
+
+    // 报警/导出/历史 的修复回归
+    runAlarmExportHistoryTests();
+
+    // 安全/配置 的修复回归
+    runSecurityConfigTests();
 
     printf("\n==== 汇总 ====\n");
     printf("PASS: %d  FAIL: %d  已确认已知问题: %d\n", g_passed, g_failed, g_issuesConfirmed);
