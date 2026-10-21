@@ -4,7 +4,8 @@
 # ----------------------------------------------------------------------------
 # 用法：
 #   bash tools/run_tests.sh              # 全部层级
-#   bash tools/run_tests.sh unit         # 只跑单元/集成测试（最快，~1 分钟）
+#   bash tools/run_tests.sh unit         # 只跑单元/集成测试（最快，~30 秒）
+#   bash tools/run_tests.sh unit fast    # 只跑快速用例（跳过依赖真实超时的慢速用例，~30 秒）
 #   bash tools/run_tests.sh slave        # 只跑模拟从站协议自检
 #   bash tools/run_tests.sh build        # 只做主程序编译验证
 #   bash tools/run_tests.sh clean        # 清理构建产物
@@ -79,10 +80,14 @@ do_build() {
 # 层级 2：单元/集成测试（无 GUI，退出码 0 = 全通过）
 # ---------------------------------------------------------------------------
 do_unit() {
-  hr; printf "${CYA}[2/4] 单元 / 集成测试（158 项断言）${RST}\n"; hr
+  hr
+  local mode="全量"
+  local extra=""
+  if [[ "${2:-}" == "fast" ]]; then mode="快速（跳过慢速用例）"; extra="--fast"; fi
+  printf "${CYA}[2/4] 单元 / 集成测试（%s）${RST}\n" "$mode"; hr
   local exe="$BUILD/verify_tests/release/fieldlink_tests.exe"
   [[ -x "$exe" ]] || { bad "测试二进制不存在，请先运行: bash tools/run_tests.sh build"; return 1; }
-  ( cd "$(dirname "$exe")" && ./fieldlink_tests.exe >unit.log 2>&1 )
+  ( cd "$(dirname "$exe")" && ./fieldlink_tests.exe $extra >unit.log 2>&1 )
   local rc=$?
   cat "$(dirname "$exe")/unit.log" | sed 's/^/  /'
   if [[ $rc -eq 0 ]]; then ok "退出码 0 → 全部通过"
@@ -134,12 +139,12 @@ do_clean(){
 
 case "${1:-all}" in
   build) do_build ;;
-  unit)  do_build && do_unit ;;
+  unit)  do_build && do_unit "$2" ;;
   slave) do_slave ;;
   env)   do_env ;;
   clean) do_clean ;;
-  all)   do_build && do_unit && do_slave && do_env ;;
-  *)     printf "用法: bash tools/run_tests.sh [all|build|unit|slave|env|clean]\n"; exit 2 ;;
+  all)   do_build && do_unit "$2" && do_slave && do_env ;;
+  *)     printf "用法: bash tools/run_tests.sh [all|build|unit|slave|env|clean] [fast]\n"; exit 2 ;;
 esac
 
 hr

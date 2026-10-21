@@ -7,9 +7,14 @@ on:
   workflow_dispatch:
 
 jobs:
-  # ---- 常规单元/集成测试（原生构建，最快）----
+  # =====================================================================
+  # 1) 快速测试 —— PR 主门禁
+  #    只跑不依赖真实时间等待的用例（--fast），反馈快。
+  #    依赖真实超时的 MQTT 协议时序用例见 qt6-slow-tests。
+  # =====================================================================
   qt6-tests:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,23 +36,123 @@ jobs:
           cd build/tests
           make -j"$(nproc)"
 
-      - name: Run tests
-        run: ./build/tests/fieldlink_tests
+      - name: Run tests (fast)
+        run: ./build/tests/fieldlink_tests --fast
 
-  # ---- 内存检查（ASan + LeakSanitizer + UBSan）----
-  # 说明：内存检查只在 Linux 上可行（MinGW/Windows 无 libasan）。
+  # =====================================================================
+  # 2) 完整测试 —— 含依赖真实超时的 MQTT 协议时序用例
+  #    这些用例必须等真实的连接超时(10s)与重连周期(5s)，
+  #    单个用例需 3~26 秒，放在 PR 快速门禁里会拖慢反馈，故单独成作业。
+  #    作业并行执行，不增加整体墙钟时间。
+  # =====================================================================
+  qt6-slow-tests:
+    name: Full test suite (incl. MQTT timing)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Qt 6 (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qt6-base-dev libqt6sql6-sqlite \
+            libqt6serialport6-dev libqt6serialbus6-dev g++ make
+
+      - name: Configure (qmake6)
+        run: |
+          mkdir -p build/slow
+          cd build/slow
+          qmake6 ../../tests/tests.pro
+
+      - name: Build tests
+        run: |
+          cd build/slow
+          make -j"$(nproc)"
+
+      - name: Run full test suite
+        run: ./build/slow/fieldlink_tests
+
+  # =====================================================================
+  # 3) 主程序构建 —— 关键补漏
+  #    此前 CI 只构建测试工程，而测试工程不包含 GUI 相关的 17 个源文件
+  #    （mainwindow / mainwindow_advanced / dashboard / scriptengine /
+  #      pluginmanager / devicetemplate / …），即 CI 从不编译用户实际运行的程序。
+  #    后果：主程序侧的编译错误（含 moc 对头文件签名的解析问题）可以完全
+  #    绕过 CI 合入。本作业把主程序纳入构建门禁。
+  # =====================================================================
+  qt6-app-build:
+    name: Build the GUI application
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Qt 6 (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qt6-base-dev qt6-base-dev-tools \
+            qt6-declarative-dev qt6-l10n-tools \
+            libqt6sql6-sqlite libqt6serialport6-dev libqt6serialbus6-dev \
+            g++ make
+
+      - name: Configure (qmake6)
+        run: |
+          mkdir -p build/app
+          cd build/app
+          qmake6 ../../fieldlink.pro
+
+      - name: Build application
+        run: |
+          cd build/app
+          make -j"$(nproc)"
+
+      - name: Verify binary
+        run: |
+          test -x build/app/fieldlink || test -x build/app/release/fieldlink
+          ls -la build/app/fieldlink* build/app/release/fieldlink* 2>/dev/null || true
+
+  # =====================================================================
+  # 4) 模拟从站协议自检 —— 无需 Qt，几秒完成
+  #    slave/modbus_tcp_simulator.py 是整个测试故事的依赖（手工联调、
+  #    现场联调都依赖它），但 CI 此前从未验证过它本身是否可用。
+  # =====================================================================
+  slave-selftest:
+    name: Modbus slave simulator self-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run slave protocol self-test
+        run: python slave/modbus_tcp_simulator.py --selftest
+
+  # =====================================================================
+  # 5) 内存检查（ASan + LeakSanitizer + UBSan）
+  #    说明：内存检查只在 Linux 上可行（MinGW/Windows 无 libasan）。
   #       被测对象是 tests/ 下的无 GUI 测试套件。
   #
-  # 2026-10：曾并行跑一个 Valgrind 作业，因其报告的 8 条
+  #    2026-10：曾并行跑一个 Valgrind 作业，因其报告的 8 条
   #「Conditional jump depends on uninitialised value」经地址范围核对确认
-  # 全部落在 Qt 共享库内（报错地址 0x930156F~0x98C398F，而本项目二进制
-  # 仅 532KB），且安装 Qt dbgsym 后堆栈仍无法符号化（持续显示???），
-  # 属 Qt 自身在 Valgrind 下的已知误报、无可操作性，故已移除该作业。
-  # 内存检查能力改由 ASan（越界/释放后使用/泄漏）+ UBSan（未定义行为）承担。
+  #    全部落在 Qt 共享库内（报错地址 0x930156F~0x98C398F，而本项目二进制
+  #    仅 532KB），且安装 Qt dbgsym 后堆栈仍无法符号化（持续显示???），
+  #    属 Qt 自身在 Valgrind 下的已知误报、无可操作性，故已移除该作业。
+  #    内存检查能力改由 ASan（越界/释放后使用/泄漏）+ UBSan（未定义行为）承担。
+  #
+  #    这里跑 --fast：慢速用例在 ASan 下会慢 3~5 倍，而 ASan 的价值在于
+  #    捕获内存错误，不需要等待真实的网络超时。
+  # =====================================================================
   asan-leak:
     name: ASan + UBSan + LeakSanitizer
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -81,5 +186,5 @@ jobs:
           # UBSan 遇错即退出并返回非 0，配合 -fno-sanitize-recover=undefined
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: |
-          ./build/asan/fieldlink_tests
+          ./build/asan/fieldlink_tests --fast
           echo "ASan/UBSan/LSan: 内存泄漏、越界访问与未定义行为均未检出"

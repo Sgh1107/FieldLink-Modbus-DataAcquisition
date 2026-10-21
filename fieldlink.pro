@@ -1,9 +1,14 @@
-QT += serialbus serialport widgets network sql qml
-requires(qtConfig(combobox))
+# 模块依赖
+# 注意：QT += widgets 必须写在最前 —— qmake 的 requires(qtConfig(...)) 会到
+# 已加载模块的 config 头里找特性定义，顺序颠倒会报
+# "Project ERROR: Could not find feature combobox." 而构建失败。
+# qml 模块不能省：脚本引擎用的 QJSEngine 由 QtQml 提供（不是 QtCore）。
+QT += widgets qml
+QT += serialbus serialport network sql
 
 TARGET = fieldlink
 TEMPLATE = app
-CONFIG += c++11
+CONFIG += c++17
 
 # ---- 源码目录：头文件在 header/，源文件在 src/ ----
 INCLUDEPATH += $$PWD/header
