@@ -6,6 +6,9 @@
 #include <QString>
 #include <QDateTime>
 #include <QMap>
+#include <QHash>
+#include <QQueue>
+#include <QSet>
 
 enum class AlarmCondition {
     GreaterThan,
@@ -78,6 +81,12 @@ public:
     QVector<AlarmEvent> alarmHistory(int maxCount = 100) const;
     int activeAlarmCount() const;
 
+    // P2-67：报警历史条数上限。超过上限后自动丢弃最旧的事件，
+    // 避免长期运行时内存无界增长。setMaxHistory(<=0) 视为使用默认值。
+    int maxHistory() const;
+    void setMaxHistory(int maxCount);
+    static int defaultMaxHistory() { return 10000; }
+
 signals:
     void alarmTriggered(const AlarmEvent &event);
     void alarmCleared(int ruleId);
@@ -85,13 +94,25 @@ signals:
 
 private:
     bool evaluateCondition(const AlarmRule &rule, double value) const;
+    // 去抖判定：基准是"上次真正发出事件的时间"（m_lastTriggerTime），
+    // 而不是"上次尝试触发的时间"，被抑制的事件不会重置窗口。
+    bool isDebounced(const AlarmRule &rule, const QDateTime &now) const;
+    void emitTriggered(const AlarmRule &rule, double value, const QDateTime &now);
+    void appendHistory(const AlarmEvent &event);
+    // 规则增删改后重建地址索引（serverAddress -> (registerType,address) -> 规则 id 列表）
+    void rebuildIndex();
+    static quint64 addressKey(int registerType, int address);
 
-    QVector<AlarmRule> m_rules;
-    QVector<AlarmEvent> m_history;
+    QVector<int> m_ruleOrder;                            // 规则 id（保持添加顺序）
+    QHash<int, AlarmRule> m_ruleMap;                      // 规则 id -> 规则定义
+    QHash<int, QHash<quint64, QVector<int>>> m_addressIndex; // 从站 -> (类型,地址) -> 规则 id 列表
+    QQueue<AlarmEvent> m_history;                         // 环形队列：出队 O(1)，条数严格受上限约束
     QMap<int, bool> m_activeStates;
-    QMap<int, QDateTime> m_lastTriggerTime;
+    QMap<int, QDateTime> m_lastTriggerTime;               // 上次真正发出事件的时间（去抖基准）
+    QSet<int> m_pendingNotifications;                     // 事件被去抖抑制、尚未告知用户的规则
     int m_nextRuleId;
     qint64 m_nextEventId;
+    int m_maxHistory = 10000;
 };
 
 #endif // ALARMMANAGER_H

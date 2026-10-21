@@ -4,6 +4,7 @@
 #include <QObject>
 #include <QString>
 #include <QVector>
+#include <QQueue>
 #include <QModbusDataUnit>
 
 // 注意：所有字段必须带默认初值。
@@ -27,15 +28,23 @@ public:
     explicit DataExporter(QObject *parent = nullptr);
 
     void addRecord(const ExportRecord &record);
+    // P1-/R-EXPORT-1：maxRecords <= 0 表示"使用默认上限"，不再表示"不限制"。
+    // 超过硬上限时按硬上限截断，避免内存无界增长。
     void setMaxRecords(int maxRecords);
     int maxRecords() const;
-    bool exportToCsv(const QString &filePath) const;
+    static int defaultMaxRecords() { return 10000; }
+    static int hardMaxRecords() { return 1000000; }
+    // errorMessage 可为 nullptr（保持既有调用点不变）；导出失败时填入错误描述
+    bool exportToCsv(const QString &filePath, QString *errorMessage = nullptr) const;
     void clearRecords();
     int recordCount() const;
     QVector<ExportRecord> records() const;
 
 private:
-    QVector<ExportRecord> m_records;
+    void trimRecords();
+
+    // QQueue：环形缓冲，出队 O(1)，避免 QVector::removeFirst() 的整体前移开销
+    QQueue<ExportRecord> m_records;
     int m_maxRecords = 10000;
 };
 
