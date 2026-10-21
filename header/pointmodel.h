@@ -8,6 +8,8 @@
 #include <QJsonArray>
 #include <QModbusDataUnit>
 
+#include "dataparser.h"
+
 enum class DataQuality {
     Good = 0,
     Bad,
@@ -24,6 +26,10 @@ struct PointDefinition {
     int address = 0;
     int count = 1;
     QString dataType = QStringLiteral("uint16");
+    // 32 位及以上类型（uint32/int32/float32/uint64/int64/float64）的字节序。
+    // 缺省为 ABCD（Modbus 标准大端分组）。缺失该字段会导致 DCBA/BADC/CDAB
+    // 设备的 32 位数据被按 ABCD 解码 —— 数值错误但质量码仍为 Good（静默错误）。
+    ByteOrder byteOrder = ByteOrder::BigEndian_ABCD;
     double scale = 1.0;
     double offset = 0.0;
     QString unit;

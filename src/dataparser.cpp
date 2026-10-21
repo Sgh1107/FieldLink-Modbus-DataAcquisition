@@ -163,17 +163,55 @@ quint32 DataParser::toUInt32(quint16 regHi, quint16 regLo, ByteOrder order)
     return rawFromRegisters32(regHi, regLo, order);
 }
 
+quint64 DataParser::toUInt64(quint16 r0, quint16 r1, quint16 r2, quint16 r3, ByteOrder order)
+{
+    const quint8 wire[8] = {
+        static_cast<quint8>((r0 >> 8) & 0xFF), static_cast<quint8>(r0 & 0xFF),
+        static_cast<quint8>((r1 >> 8) & 0xFF), static_cast<quint8>(r1 & 0xFF),
+        static_cast<quint8>((r2 >> 8) & 0xFF), static_cast<quint8>(r2 & 0xFF),
+        static_cast<quint8>((r3 >> 8) & 0xFF), static_cast<quint8>(r3 & 0xFF)
+    };
+    return rawFromRegisters64(wire, order);
+}
+
+QVector<quint16> DataParser::fromUInt32(quint32 value, ByteOrder order)
+{
+    quint32 raw;
+    memcpy(&raw, &value, 4);
+    quint16 regHi = 0, regLo = 0;
+    registersFromRaw32(raw, order, regHi, regLo);
+    return {regHi, regLo};
+}
+
+// 按 Modbus wire 顺序还原原始字节：每个寄存器高字节在前。
+// 不套用数值字节序（字节序描述的是多寄存器数值的分组方式，对字节流无意义），
+// 也不做字符过滤 —— 字节原样保留，由调用方决定如何解释。
+QByteArray DataParser::toByteString(const QVector<quint16> &registers)
+{
+    QByteArray out;
+    out.reserve(registers.size() * 2);
+    for (quint16 reg : registers) {
+        out.append(static_cast<char>((reg >> 8) & 0xFF));
+        out.append(static_cast<char>(reg & 0xFF));
+    }
+    return out;
+}
+
 QString DataParser::toAsciiString(const QVector<quint16> &registers, ByteOrder order)
 {
+    // 字节序描述的是"多寄存器数值在 wire 上的分组方式"，对 8 位字符流没有意义。
+    // 之前在这里套用 DCBA/BADC 会交换寄存器内的高低字节（"AB" → "BA"），
+    // 并且只保留 0x20~0x7E 的可打印 ASCII，其余字节被无声丢弃
+    // （设备寄存器里存 UTF-8 中文时整个字符串会变成空串）。
+    // 现在按 Modbus wire 顺序（寄存器内高字节在前）逐字节还原，
+    // 非 ASCII 字节保留为 Latin-1 字符（原始字节不丢）。
+    Q_UNUSED(order);
     QString result;
     for (quint16 reg : registers) {
-        quint8 hi = (reg >> 8) & 0xFF;
-        quint8 lo = reg & 0xFF;
-        if (order == ByteOrder::LittleEndian_DCBA || order == ByteOrder::MidBigEndian_BADC) {
-            std::swap(hi, lo);
-        }
-        if (hi >= 0x20 && hi <= 0x7E) result += QChar(hi);
-        if (lo >= 0x20 && lo <= 0x7E) result += QChar(lo);
+        const quint8 hi = (reg >> 8) & 0xFF;
+        const quint8 lo = reg & 0xFF;
+        result += QChar(hi);
+        result += QChar(lo);
     }
     return result;
 }
@@ -212,14 +250,16 @@ QVector<quint16> DataParser::fromInt32(qint32 value, ByteOrder order)
 QVector<quint16> DataParser::fromAsciiString(const QString &str, ByteOrder order)
 {
     QVector<quint16> result;
+    // 与 toAsciiString 对称：字节序对 8 位字符流没有意义，不交换字节内高低位。
+    // 之前这里对 DCBA/BADC 交换，而 toAsciiString 也交换 —— 两者同时交换时
+    // 往返恰好自洽，但与真实设备按 wire 顺序存放的字符串不一致。
+    // 现在两边都不交换：始终按 Modbus wire 顺序（寄存器内高字节在前）。
+    Q_UNUSED(order);
     QByteArray ascii = str.toLatin1();
     for (int i = 0; i < ascii.size(); i += 2) {
-        quint8 hi = ascii.at(i);
-        quint8 lo = (i + 1 < ascii.size()) ? ascii.at(i + 1) : 0;
-        if (order == ByteOrder::LittleEndian_DCBA || order == ByteOrder::MidBigEndian_BADC) {
-            std::swap(hi, lo);
-        }
-        result.append((quint16(hi) << 8) | lo);
+        quint8 hi = static_cast<quint8>(ascii.at(i));
+        quint8 lo = (i + 1 < ascii.size()) ? static_cast<quint8>(ascii.at(i + 1)) : 0;
+        result.append(static_cast<quint16>((hi << 8) | lo));
     }
     return result;
 }
@@ -248,4 +288,38 @@ QStringList DataParser::byteOrderNames()
         byteOrderName(ByteOrder::MidBigEndian_BADC),
         byteOrderName(ByteOrder::MidLittleEndian_CDAB)
     };
+}
+
+// 字节序文本 → 枚举。
+// 接受 "ABCD"/"DCBA"/"BADC"/"CDAB"（不区分大小写），以及 byteOrderName() 里的完整文案。
+// 未知文本返回 false（调用方应回退到 ABCD 并给出提示），
+// 不能像 registerType 那样用 contains() 模糊匹配 —— "CDAB" 与 "DCBA" 互不为子串，
+// 但宽松匹配容易把拼写错误静默变成另一种字节序（数值错误且无提示）。
+ByteOrder DataParser::byteOrderFromToken(const QString &token, bool *ok)
+{
+    const QString t = token.trimmed().toUpper();
+    if (ok) *ok = true;
+    if (t.isEmpty())
+        return ByteOrder::BigEndian_ABCD;
+    if (t == "ABCD" || t.contains("BIG-ENDIAN") || t.contains("大端"))
+        return ByteOrder::BigEndian_ABCD;
+    if (t == "DCBA" || t.contains("LITTLE-ENDIAN") || t.contains("小端"))
+        return ByteOrder::LittleEndian_DCBA;
+    if (t == "BADC" || t.contains("MID-BIG-ENDIAN"))
+        return ByteOrder::MidBigEndian_BADC;
+    if (t == "CDAB" || t.contains("MID-LITTLE-ENDIAN"))
+        return ByteOrder::MidLittleEndian_CDAB;
+    if (ok) *ok = false;
+    return ByteOrder::BigEndian_ABCD;
+}
+
+QString DataParser::byteOrderToToken(ByteOrder order)
+{
+    switch (order) {
+    case ByteOrder::BigEndian_ABCD: return QStringLiteral("ABCD");
+    case ByteOrder::LittleEndian_DCBA: return QStringLiteral("DCBA");
+    case ByteOrder::MidBigEndian_BADC: return QStringLiteral("BADC");
+    case ByteOrder::MidLittleEndian_CDAB: return QStringLiteral("CDAB");
+    }
+    return QStringLiteral("ABCD");
 }
