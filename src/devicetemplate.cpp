@@ -1,5 +1,6 @@
 #include "devicetemplate.h"
 #include <QFile>
+#include <QSaveFile>
 #include <QJsonDocument>
 #include <QJsonArray>
 #include <QJsonObject>
@@ -114,12 +115,13 @@ bool DeviceTemplateManager::saveToFile(const QString &filePath) const
     }
 
     QJsonDocument doc(arr);
-    QFile file(filePath);
+    // QSaveFile 原子替换：直接用 QFile 会在 open(WriteOnly) 时立即截断原文件，
+    // 写到一半崩溃/断电就留下半截 JSON → 下次加载失败 → 模板全丢且无法恢复。
+    QSaveFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
         return false;
     file.write(doc.toJson(QJsonDocument::Indented));
-    file.close();
-    return true;
+    return file.commit();
 }
 
 bool DeviceTemplateManager::loadFromFile(const QString &filePath)
@@ -133,12 +135,17 @@ bool DeviceTemplateManager::loadFromFile(const QString &filePath)
 
     if (!doc.isArray()) return false;
 
-    m_templates.clear();
-    QJsonArray arr = doc.array();
-    for (const auto &val : arr) {
+    // 原子性：先解析到临时数组，全部成功后再整体替换。
+    // 否则解析中途出错会留下"清空了一半"的集合，而调用方失败时不回滚，
+    // 析构时又会把残缺集合写回磁盘 → 用户模板被永久截断。
+    QVector<DeviceTemplate> parsed;
+    int nextId = 1;
+    for (const auto &val : doc.array()) {
         DeviceTemplate tmpl = templateFromJson(val.toObject());
-        tmpl.id = m_nextId++;
-        m_templates.append(tmpl);
+        tmpl.id = nextId++;
+        parsed.append(tmpl);
     }
+    m_templates = parsed;
+    m_nextId = nextId;
     return true;
 }

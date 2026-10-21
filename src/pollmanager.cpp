@@ -19,9 +19,22 @@ PollManager::~PollManager()
 
 void PollManager::addTask(const PollTask &task)
 {
-    // PM1：任务 id 查重——同 id 视为更新，避免出现同 id 双定时器
+    // PM1：任务 id 查重——同 id 视为更新，避免出现同 id 双定时器。
+    // 注意：调用方用各自的算式生成 id（设备 10000+、模板 20000+、点位 30000+、
+    // 扫描 40000+），这些区段在规模增长后会互相重叠 → 后添加的任务静默覆盖先添加的，
+    // 用户看到"任务少了/轮询点位不对"且没有任何提示。
+    // 这里检测到冲突时给出明确告警，并分配一个不冲突的新 id。
     for (const auto &entry : m_timers) {
         if (entry.task.id == task.id) {
+            if (entry.task.name != task.name || entry.task.startAddress != task.startAddress
+                || entry.task.registerType != task.registerType) {
+                // qWarning 多参数形式走 printf 风格（%d/%s），不是 Qt 的 %1 占位符。
+                qWarning("PollManager: task id %d conflict (existing '%s' vs new '%s') - "
+                         "overwriting; task ids from different sources may collide",
+                         task.id,
+                         entry.task.name.toUtf8().constData(),
+                         task.name.toUtf8().constData());
+            }
             updateTask(task);
             return;
         }

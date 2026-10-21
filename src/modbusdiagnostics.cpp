@@ -1,4 +1,4 @@
-#include "modbusdiagnostics.h"
+﻿#include "modbusdiagnostics.h"
 
 #include <QRegularExpression>
 
@@ -154,7 +154,7 @@ bool validateScanRange(int startUnit, int endUnit, int *totalOut, QString *error
 PollTaskSeed makePollTaskSeed(int unit, int functionCode, int startAddress, int count)
 {
     PollTaskSeed seed;
-    seed.id = 40000 + unit;   // 稳定可重现：同一从站重复生成会覆盖同一条任务
+    seed.id = 20000000 + unit;   // 稳定可重现：同一从站重复生成会覆盖同一条任务
     seed.name = QStringLiteral("扫描生成-从站%1").arg(unit);
     seed.serverAddress = unit;
     seed.registerType = registerTypeForFunctionCode(functionCode);
