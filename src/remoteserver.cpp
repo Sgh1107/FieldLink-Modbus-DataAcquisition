@@ -2,6 +2,17 @@
 #include "securitymanager.h"
 #include <QJsonArray>
 #include <QHostAddress>
+#include <QPointer>
+
+namespace {
+// 单个请求允许的最大字节数（头 + body）：防止慢速连接持续灌数据耗尽内存
+constexpr int kMaxRequestBytes = 1024 * 1024;   // 1 MB
+// Modbus 协议上限：单次读最多 125 个寄存器（位区 2000）
+constexpr int kMaxReadRegisters = 125;
+constexpr int kMaxReadBits = 2000;
+constexpr int kMaxWriteRegisters = 123;
+constexpr int kMaxWriteBits = 2000;
+} // namespace
 
 RemoteServer::RemoteServer(QObject *parent)
     : QObject(parent)
@@ -23,7 +34,9 @@ bool RemoteServer::start(quint16 port)
     if (m_server->isListening())
         return true;
 
-    if (m_server->listen(QHostAddress::Any, port)) {
+    // 默认只监听本机回环地址：远程写接口暴露到整个局域网是典型的攻击面，
+    // 需要远程访问时应由用户显式选择监听所有网卡。
+    if (m_server->listen(QHostAddress::LocalHost, port)) {
         m_port = m_server->serverPort();
         return true;
     }
@@ -32,10 +45,15 @@ bool RemoteServer::start(quint16 port)
 
 void RemoteServer::stop()
 {
-    for (QTcpSocket *client : m_clients) {
-        client->disconnectFromHost();
-    }
+    // 必须真正删除 socket：它们是 m_server 的子对象，只 disconnectFromHost()
+    // 会让 socket 一直存活到 RemoteServer 析构，反复 start/stop 会累积 fd。
+    const QList<QTcpSocket*> clients = m_clients;
     m_clients.clear();
+    m_buffers.clear();
+    for (QTcpSocket *client : clients) {
+        client->disconnect(this);
+        client->deleteLater();
+    }
     m_server->close();
     m_port = 0;
 }
@@ -65,12 +83,12 @@ void RemoteServer::setStatusProvider(const std::function<QJsonObject()> &provide
     m_statusProvider = provider;
 }
 
-void RemoteServer::setReadHandler(const std::function<QJsonObject(int, int, int, int)> &handler)
+void RemoteServer::setReadHandler(const ReadHandler &handler)
 {
     m_readHandler = handler;
 }
 
-void RemoteServer::setWriteHandler(const std::function<QJsonObject(int, int, int, const QVector<quint16>&)> &handler)
+void RemoteServer::setWriteHandler(const WriteHandler &handler)
 {
     m_writeHandler = handler;
 }
@@ -91,8 +109,80 @@ void RemoteServer::onReadyRead()
     QTcpSocket *socket = qobject_cast<QTcpSocket*>(sender());
     if (!socket) return;
 
-    QByteArray data = socket->readAll();
-    processRequest(socket, data);
+    // 必须按连接累积缓冲：HTTP 请求的头与 body 可能分多包到达。
+    // 之前每次 readAll 后立即解析：第 1 包被当成完整请求（body 不全 → 400），
+    // 第 2 包没有请求行 → 404，客户端收到两个响应，真正的业务请求从未执行。
+    m_buffers[socket].append(socket->readAll());
+
+    // 缓冲上限：防止客户端持续灌数据导致内存耗尽
+    if (m_buffers.value(socket).size() > kMaxRequestBytes) {
+        sendJsonResponse(socket, 413, QJsonObject{{"error", "Request too large"}});
+        closeConnection(socket);
+        m_buffers.remove(socket);
+        return;
+    }
+
+    processBufferedRequests(socket);
+}
+
+// 从缓冲中切出完整请求并逐个处理。
+void RemoteServer::processBufferedRequests(QTcpSocket *socket)
+{
+    // 注意：不能把 m_buffers[socket] 的引用绑定在循环外。
+    // processRequest → sendJsonResponse → closeConnection 会关闭连接，
+    // 随后的 disconnected 信号会触发 onClientDisconnected → m_buffers.remove(socket)，
+    // 该引用随即悬垂（use-after-free）。
+    // 因此每轮循环都重新取引用，并在处理后用 QPointer 确认 socket 仍存活。
+    QPointer<QTcpSocket> guard(socket);
+
+    while (guard) {
+        QByteArray &buffer = m_buffers[socket];
+        const int headerEnd = buffer.indexOf("\r\n\r\n");
+        if (headerEnd < 0)
+            break;                       // 头未收全，等待更多数据
+
+        // 解析 Content-Length，决定 body 长度
+        int contentLength = 0;
+        {
+            const QByteArray head = buffer.left(headerEnd);
+            const QList<QByteArray> lines = head.split('\n');
+            for (const QByteArray &rawLine : lines) {
+                QByteArray line = rawLine;
+                if (line.endsWith('\r')) line.chop(1);
+                const int colon = line.indexOf(':');
+                if (colon <= 0)
+                    continue;
+                const QByteArray key = line.left(colon).trimmed().toLower();
+                if (key == "content-length") {
+                    bool ok = false;
+                    const int v = line.mid(colon + 1).trimmed().toInt(&ok);
+                    if (ok && v > 0)
+                        contentLength = v;
+                    break;
+                }
+            }
+        }
+        if (contentLength > kMaxRequestBytes) {
+            sendJsonResponse(socket, 413, QJsonObject{{"error", "Request body too large"}});
+            closeConnection(socket);
+            m_buffers.remove(socket);
+            return;
+        }
+
+        const int totalNeeded = headerEnd + 4 + contentLength;
+        if (buffer.size() < totalNeeded)
+            break;                       // body 未收全，等待更多数据
+
+        const QByteArray request = buffer.left(totalNeeded);
+        buffer.remove(0, totalNeeded);
+
+        processRequest(socket, request);
+
+        // processRequest 可能已关闭并销毁 socket（QPointer 变空），
+        // 此时 m_buffers 中的条目已被 onClientDisconnected 移除，不能再访问。
+        if (!guard)
+            break;
+    }
 }
 
 void RemoteServer::onClientDisconnected()
@@ -102,6 +192,7 @@ void RemoteServer::onClientDisconnected()
 
     emit clientDisconnected(socket->peerAddress().toString());
     m_clients.removeOne(socket);
+    m_buffers.remove(socket);
     socket->deleteLater();
 }
 
@@ -167,6 +258,12 @@ void RemoteServer::processRequest(QTcpSocket *socket, const QByteArray &data)
     QMap<QString, QString> headers;
     parseHttpRequest(data, method, path, headers, body);
 
+    // 剥离 query string：路径是精确白名单匹配，不剥离的话
+    // "GET /api/status?x=1" 会匹配不上而返回 404。
+    const int qmark = path.indexOf(QLatin1Char('?'));
+    if (qmark >= 0)
+        path = path.left(qmark);
+
     if (method == "OPTIONS") {
         sendJsonResponse(socket, 200, QJsonObject{{"status", "ok"}});
         return;
@@ -201,21 +298,59 @@ void RemoteServer::processRequest(QTcpSocket *socket, const QByteArray &data)
         const int registerType = obj["registerType"].toInt(0);
         const int startAddress = obj["startAddress"].toInt(0);
         const int count = obj["count"].toInt(1);
-        if (count <= 0) {
-            sendJsonResponse(socket, 400, QJsonObject{{"error", "count must be greater than 0"}});
+
+        // 参数白名单校验：Qt 6 的 QModbusDataUnit(type, int, quint16) 第三参是
+        // quint16，超范围会被静默截断（count=65536 → 0，2000000000 → 37888），
+        // 请求语义与实际执行完全不符。
+        if (registerType < 1 || registerType > 4) {
+            sendJsonResponse(socket, 400, QJsonObject{{"error", "registerType must be 1..4"}});
+            return;
+        }
+        if (startAddress < 0 || startAddress > 65535) {
+            sendJsonResponse(socket, 400, QJsonObject{{"error", "startAddress must be 0..65535"}});
+            return;
+        }
+        const bool isBit = (registerType == 1 || registerType == 2);   // Coils / DiscreteInputs
+        const int maxCount = isBit ? kMaxReadBits : kMaxReadRegisters;
+        if (count <= 0 || count > maxCount) {
+            sendJsonResponse(socket, 400,
+                             QJsonObject{{"error", QStringLiteral("count must be 1..%1").arg(maxCount)}});
             return;
         }
 
         emit readRequest(serverAddress, registerType, startAddress, count);
-        QJsonObject resp = m_readHandler
-            ? m_readHandler(serverAddress, registerType, startAddress, count)
-            : QJsonObject{{"status", "request_sent"}};
-        sendJsonResponse(socket, resp.value("success").toBool(true) ? 200 : 503, resp);
+        // 异步应答：handler 完成后才回调发响应。
+        // 用 QPointer 保护 socket —— 等待 Modbus 应答期间客户端可能断开，
+        // socket 会被 deleteLater 销毁，此时回调里绝不能再碰它。
+        QPointer<QTcpSocket> guard(socket);
+        const ResponseCallback finish = [this, guard](const QJsonObject &resp) {
+            if (!guard)
+                return;     // 客户端已断开：静默丢弃应答
+            sendJsonResponse(guard, resp.value("success").toBool(true) ? 200 : 503, resp);
+        };
+        if (m_readHandler) {
+            m_readHandler(serverAddress, registerType, startAddress, count, finish);
+        } else {
+            finish(QJsonObject{{"status", "request_sent"}});
+        }
     }
     else if (path == "/api/write" && method == "POST") {
-        const bool writeAllowed = m_securityManager
-            ? (m_securityManager->remoteWriteEnabled() && m_securityManager->isWriteAllowed(QStringLiteral("admin"), QStringLiteral("remote write")))
-            : m_remoteWriteEnabled;
+        // 鉴权：校验"角色权限"而非硬编码操作员名。
+        // 之前写死 QStringLiteral("admin")，与实际请求方身份无关 ——
+        // 任何持有 API Token 的客户端都能以 admin 身份写寄存器，
+        // availablePermissions() 里定义的 remote.write 权限从未被使用。
+        bool writeAllowed = m_remoteWriteEnabled;
+        if (m_securityManager) {
+            writeAllowed = m_securityManager->remoteWriteEnabled()
+                           && m_securityManager->hasPermission(QStringLiteral("remote.write"));
+            if (!writeAllowed && m_securityManager->currentUser().isEmpty()) {
+                // 远程 API 无登录态：退回到"令牌 + 写操作员白名单"模型，
+                // 但必须显式记录来源，不能冒充某个具体操作员。
+                writeAllowed = m_securityManager->remoteWriteEnabled()
+                               && m_securityManager->isWriteAllowed(QStringLiteral("remote"),
+                                                                    QStringLiteral("remote write"));
+            }
+        }
         if (!writeAllowed) {
             sendJsonResponse(socket, 403, QJsonObject{{"error", "Remote write disabled"}});
             return;
@@ -223,8 +358,28 @@ void RemoteServer::processRequest(QTcpSocket *socket, const QByteArray &data)
 
         QVector<quint16> values;
         QJsonArray arr = obj["values"].toArray();
-        for (const auto &v : arr)
-            values.append(static_cast<quint16>(v.toInt()));
+        // 逐值校验：越界/非数值必须拒绝，不能静默截断
+        // （65536 → 0、-1 → 65535、"abc" → 0 全部静默改写后还返回 success）。
+        for (const auto &v : arr) {
+            if (!v.isDouble()) {
+                sendJsonResponse(socket, 400,
+                                 QJsonObject{{"error", "values must all be integers"}});
+                return;
+            }
+            const double d = v.toDouble();
+            if (d != static_cast<double>(static_cast<qint64>(d))) {
+                sendJsonResponse(socket, 400,
+                                 QJsonObject{{"error", "values must all be integers"}});
+                return;
+            }
+            const qint64 iv = static_cast<qint64>(d);
+            if (iv < 0 || iv > 65535) {
+                sendJsonResponse(socket, 400,
+                                 QJsonObject{{"error", "values must be in range 0..65535"}});
+                return;
+            }
+            values.append(static_cast<quint16>(iv));
+        }
         if (values.isEmpty()) {
             sendJsonResponse(socket, 400, QJsonObject{{"error", "values must not be empty"}});
             return;
@@ -233,13 +388,36 @@ void RemoteServer::processRequest(QTcpSocket *socket, const QByteArray &data)
         const int serverAddress = obj["serverAddress"].toInt(1);
         const int registerType = obj["registerType"].toInt(0);
         const int startAddress = obj["startAddress"].toInt(0);
+        if (registerType < 1 || registerType > 4) {
+            sendJsonResponse(socket, 400, QJsonObject{{"error", "registerType must be 1..4"}});
+            return;
+        }
+        if (startAddress < 0 || startAddress > 65535) {
+            sendJsonResponse(socket, 400, QJsonObject{{"error", "startAddress must be 0..65535"}});
+            return;
+        }
+        const bool isBit = (registerType == 1 || registerType == 2);
+        const int maxValues = isBit ? kMaxWriteBits : kMaxWriteRegisters;
+        if (values.size() > maxValues) {
+            sendJsonResponse(socket, 400,
+                             QJsonObject{{"error", QStringLiteral("too many values (max %1)").arg(maxValues)}});
+            return;
+        }
+
         emit writeRequest(serverAddress, registerType, startAddress, values);
         if (m_securityManager)
             m_securityManager->audit(QStringLiteral("remote"), QStringLiteral("REMOTE_WRITE"), QStringLiteral("server=%1 type=%2 addr=%3 count=%4").arg(serverAddress).arg(registerType).arg(startAddress).arg(values.size()));
-        QJsonObject resp = m_writeHandler
-            ? m_writeHandler(serverAddress, registerType, startAddress, values)
-            : QJsonObject{{"status", "request_sent"}};
-        sendJsonResponse(socket, resp.value("success").toBool(true) ? 200 : 503, resp);
+        QPointer<QTcpSocket> guard(socket);
+        const ResponseCallback finish = [this, guard](const QJsonObject &resp) {
+            if (!guard)
+                return;
+            sendJsonResponse(guard, resp.value("success").toBool(true) ? 200 : 503, resp);
+        };
+        if (m_writeHandler) {
+            m_writeHandler(serverAddress, registerType, startAddress, values, finish);
+        } else {
+            finish(QJsonObject{{"status", "request_sent"}});
+        }
     }
     else if (knownPath) {
         sendJsonResponse(socket, 405, QJsonObject{{"error", "Method Not Allowed"}});
@@ -254,6 +432,9 @@ void RemoteServer::processRequest(QTcpSocket *socket, const QByteArray &data)
 
 void RemoteServer::sendJsonResponse(QTcpSocket *socket, int statusCode, const QJsonObject &body)
 {
+    if (!socket || socket->state() != QAbstractSocket::ConnectedState)
+        return;   // socket 可能已在嵌套事件循环中被销毁（use-after-free 防护）
+
     QByteArray jsonData = QJsonDocument(body).toJson(QJsonDocument::Compact);
 
     QString statusTextValue = statusText(statusCode);
@@ -271,6 +452,20 @@ void RemoteServer::sendJsonResponse(QTcpSocket *socket, int statusCode, const QJ
     socket->write(response.toUtf8());
     socket->write(jsonData);
     socket->flush();
+
+    // 响应声明了 Connection: close → 必须真的关闭，否则连接/句柄无限累积。
+    closeConnection(socket);
+}
+
+// 响应声明了 Connection: close 就必须真的关闭连接。
+// 之前只 write 不 close：HTTP/1.1 客户端会等服务端关闭 → 连接长期占用；
+// 攻击者只开连接不发数据即可堆积 QTcpSocket，耗尽句柄（资源耗尽 DoS）。
+void RemoteServer::closeConnection(QTcpSocket *socket)
+{
+    if (!socket)
+        return;
+    socket->flush();
+    socket->disconnectFromHost();
 }
 
 void RemoteServer::sendResponse(const QJsonObject &response)
