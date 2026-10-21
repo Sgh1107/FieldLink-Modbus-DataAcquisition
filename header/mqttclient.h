@@ -21,6 +21,7 @@
 #include <QJsonObject>
 #include <QByteArray>
 #include <QString>
+#include <QMap>
 
 class MqttClient : public QObject
 {
@@ -74,9 +75,11 @@ private:
     };
 
     void scheduleReconnect();
+    void startConnectAttempt();                    // 建连 + 启动连接超时的统一入口
     void sendConnect();
     void sendPingreq();
     void sendDisconnect();
+    void onPingResp();                             // 收到 PINGRESP：刷新看门狗时间戳
     void processBuffer();
     void handleConnack(const QByteArray &body);
     void handlePuback(const QByteArray &body);     // QoS1：收到 PUBACK 后移出待确认队列
@@ -89,6 +92,7 @@ private:
         QString topic;
         int payloadSize = 0;
         int retries = 0;
+        qint64 firstSentMs = 0;        // 首次发送时间戳：只有到期才允许带 DUP=1 重发
     };
 
     static QByteArray encodeRemainingLength(int length);
@@ -115,6 +119,8 @@ private:
     QTimer m_reconnectTimer;      // 断线后 5 秒重连
     QTimer m_retransmitTimer;     // QoS1 重发定时器
     QTimer m_connectTimeoutTimer; // 连接超时（10s 无 CONNACK → 断开重试）
+    qint64 m_lastPingRespMs = 0;  // 最近一次 PINGREQ/PINGRESP 时间戳（看门狗）
+    bool m_pingOutstanding = false; // 已发出 PINGREQ 且尚未收到 PINGRESP
 };
 
 #endif // MQTTCLIENT_H
