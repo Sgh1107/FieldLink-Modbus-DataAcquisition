@@ -33,8 +33,34 @@ import sys
 # 客户端 socket 接收超时时间（秒），用于定期检查运行标志
 CLIENT_SOCKET_TIMEOUT = 1.0
 
+def _configure_stdout() -> None:
+    """Windows 控制台默认是 GBK(936)，打印 UTF-8 报文时遇到无法编码的字符会抛
+    UnicodeEncodeError，异常从 handle_client 里抛出会直接杀掉该连接的处理线程
+    （表现为「broker 收到 PUBLISH 后既没打印、也没回 PUBACK、也没转发」）。
+    这里把错误策略改成 backslashreplace：中文仍按 GBK 正常显示，
+    无法编码的字符转成 \\uXXXX 打印，不再中断服务。"""
+    stream = sys.stdout
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is not None:
+        try:
+            reconfigure(errors="backslashreplace")
+        except (ValueError, OSError):
+            pass
+
+
+_configure_stdout()
+
+
 def log(message: str) -> None:
-    print(message, flush=True)
+    try:
+        print(message, flush=True)
+    except UnicodeEncodeError:
+        # 兜底：reconfigure 不可用时（stdout 被替换成自定义对象等）
+        payload = (message + "\n").encode("utf-8", errors="backslashreplace")
+        buffer = getattr(sys.stdout, "buffer", None)
+        if buffer is not None:
+            buffer.write(payload)
+            buffer.flush()
 
 
 class MiniBroker:
@@ -53,41 +79,61 @@ class MiniBroker:
 
     # ---------- MQTT 编解码辅助 ----------
     @staticmethod
-    def recv_exact(sock: socket.socket, size: int) -> bytes | None:
-        buf = b""
-        while len(buf) < size:
+    def parse_packet(buf: bytearray) -> tuple[int, int, bytes] | None:
+        """ 尝试从接收缓冲里切出一个完整控制包。
+
+        返回 (消费字节数, 类型|标志, 包体)；数据还不够时返回 None。
+        只读取 buf、不碰 socket，因此可以在任意时刻中断并保留已收到的半包。
+        """
+        if len(buf) < 2:
+            return None
+        remaining = 0
+        multiplier = 1
+        index = 1
+        while True:
+            if index >= len(buf):
+                return None                      # 长度字段还没收全
+            byte = buf[index]
+            remaining += (byte & 0x7F) * multiplier
+            multiplier *= 128
+            index += 1
+            if (byte & 0x80) == 0:
+                break
+            if multiplier > 128 ** 3:
+                return None                      # 超过 4 字节的畸形 varint
+        total = index + remaining
+        if len(buf) < total:
+            return None                          # 包体还没收全
+        return total, buf[0], bytes(buf[index:total])
+
+    @staticmethod
+    def recv_packet(sock: socket.socket, buf: bytearray) -> tuple[int, bytes] | None:
+        """ 读取一个 MQTT 控制包，返回 (类型|标志, 包体)；连接关闭返回 None。
+
+        超时（socket.timeout）会向上抛出，由调用方 continue，而不是当成 EOF ——
+        连接空闲一段时间是正常现象，旧的实现把超时当 EOF，导致任何客户端
+        只要 1 秒没发数据就会被 broker 主动断开（FieldLink 的 KeepAlive 默认 60 秒，
+        即每 30 秒才发一次 PINGREQ，必然被误踢）。
+
+        buf 是连接级的接收缓冲：超时中断时已收到的半包留在 buf 里，
+        下次调用继续解析，不会丢字节。
+        """
+        while True:
+            parsed = MiniBroker.parse_packet(buf)
+            if parsed is not None:
+                consumed, type_flags, body = parsed
+                del buf[:consumed]
+                return type_flags, body
             try:
-                chunk = sock.recv(size - len(buf))
+                chunk = sock.recv(65536)
+            except socket.timeout:
+                raise                            # 交给调用方 continue
             except (ConnectionError, OSError):
                 return None
             if not chunk:
-                return None
-            buf += chunk
-        return buf
-
-    @staticmethod
-    def recv_packet(sock: socket.socket) -> tuple[int, bytes] | None:
-        """ 读取一个 MQTT 控制包，返回 (类型|标志, 包体)；连接关闭返回 None """
-        first = MiniBroker.recv_exact(sock, 1)
-        if first is None:
-            log("RECV-EOF first-byte")
-            return None
-        type_flags = first[0]
-        remaining = 0
-        multiplier = 1
-        while True:
-            raw = MiniBroker.recv_exact(sock, 1)
-            if raw is None:
-                return None
-            byte = raw[0]
-            remaining += (byte & 0x7F) * multiplier
-            multiplier *= 128
-            if (byte & 0x80) == 0:
-                break
-        body = MiniBroker.recv_exact(sock, remaining)
-        if body is None or len(body) != remaining:
-            return None
-        return type_flags, body
+                log("RECV-EOF")
+                return None                      # 真正的连接关闭
+            buf.extend(chunk)
 
     @staticmethod
     def read_string(body: bytes, offset: int) -> tuple[str, int]:
@@ -104,14 +150,16 @@ class MiniBroker:
     def handle_client(self, sock: socket.socket, addr) -> None:
         client_id = "?"
         log(f"ACCEPT addr={addr[0]}:{addr[1]}")
-        # 设置 socket 超时，使 recv 不会永久阻塞
+        # 设置 socket 超时，使 recv 不会永久阻塞（用于定期检查 self.running）
         sock.settimeout(CLIENT_SOCKET_TIMEOUT)
+        # 连接级接收缓冲：超时中断时已收到的半包留在这里，下次接着解析
+        recv_buf = bytearray()
         try:
             while self.running:
                 try:
-                    packet = self.recv_packet(sock)
+                    packet = self.recv_packet(sock, recv_buf)
                 except socket.timeout:
-                    # 超时是为了检查运行标志，继续循环
+                    # 空闲超时是正常的：继续循环，不要断开连接
                     continue
                 except (ConnectionError, OSError):
                     break
