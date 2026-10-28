@@ -20,6 +20,9 @@ enum class DataQuality {
 
 struct PointDefinition {
     int id = 0;
+    // 0 = 主连接（界面顶部的单连接）；>0 = DeviceManager 中的设备 id。
+    // 点位/历史/报警必须带设备维度，否则两台同为从站 1 的设备会互相串数据。
+    int deviceId = 0;
     QString name;
     int serverAddress = 1;
     QModbusDataUnit::RegisterType registerType = QModbusDataUnit::HoldingRegisters;
@@ -37,6 +40,11 @@ struct PointDefinition {
     double alarmHigh = 65535.0;
     bool archiveEnabled = true;
     int archiveIntervalSec = 5;
+    // 归档死区（工程值）。0 = 每个归档周期都记录；>0 = 变化小于该值时不记录。
+    double archiveDeadband = 0.0;
+    // 采集周期。与归档周期解耦：此前点位轮询周期直接借用 archiveIntervalSec*1000，
+    // 想提高归档频率就不得不提高采集频率（或反之）。
+    int pollIntervalSec = 1;
 };
 
 struct PointValue {
@@ -60,8 +68,23 @@ public:
     PointDefinition point(int id) const;
 
     PointValue convertRawValue(const PointDefinition &point, const QVector<quint16> &rawValues) const;
-    void updateFromRaw(int serverAddress, QModbusDataUnit::RegisterType type, int startAddress, const QVector<quint16> &values);
+    // deviceId 放在末尾并带默认值：既有调用/测试保持兼容，默认仍为主连接。
+    void updateFromRaw(int serverAddress, QModbusDataUnit::RegisterType type, int startAddress,
+                       const QVector<quint16> &values, int deviceId = 0);
     QVector<PointValue> currentValues() const;
+    PointValue value(int pointId) const;
+
+    // ---------- 通信质量降级 ----------
+    // 轮询任务失败：把该任务关联的点位标为 Bad/Timeout。
+    void markPointsBad(const QVector<int> &pointIds, DataQuality quality, const QString &reason = QString());
+    // 兼容没有 pointIds 的手工任务：按设备+从站+寄存器类型+地址区间匹配点位。
+    void markRangeBad(int deviceId, int serverAddress, QModbusDataUnit::RegisterType type,
+                      int startAddress, int count, DataQuality quality, const QString &reason = QString());
+    // 设备断开：该设备下所有点位降级。
+    void markDeviceBad(int deviceId, DataQuality quality, const QString &reason = QString());
+    // 陈旧检测：超过 max(minTimeoutMs, 3×pollInterval) 未更新的点位置 Timeout。
+    // 返回本次降级的点位数。
+    int markStale(const QDateTime &now, int minTimeoutMs = 5000);
 
     bool saveToFile(const QString &filePath) const;
     bool loadFromFile(const QString &filePath);

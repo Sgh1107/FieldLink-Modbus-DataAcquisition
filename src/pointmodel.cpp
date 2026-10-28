@@ -128,9 +128,13 @@ PointValue PointModel::convertRawValue(const PointDefinition &point, const QVect
     return result;
 }
 
-void PointModel::updateFromRaw(int serverAddress, QModbusDataUnit::RegisterType type, int startAddress, const QVector<quint16> &values)
+void PointModel::updateFromRaw(int serverAddress, QModbusDataUnit::RegisterType type, int startAddress,
+                               const QVector<quint16> &values, int deviceId)
 {
     for (const auto &point : m_points) {
+        // 设备维度：主连接(0)与 DeviceManager 设备(>0)互不干扰
+        if (point.deviceId != deviceId)
+            continue;
         if (point.serverAddress != serverAddress || point.registerType != type)
             continue;
 
@@ -181,10 +185,103 @@ void PointModel::updateFromRaw(int serverAddress, QModbusDataUnit::RegisterType 
 
 QVector<PointValue> PointModel::currentValues() const { return m_values; }
 
+PointValue PointModel::value(int pointId) const
+{
+    for (const auto &v : m_values) {
+        if (v.pointId == pointId)
+            return v;
+    }
+    return PointValue();
+}
+
+void PointModel::markPointsBad(const QVector<int> &pointIds, DataQuality quality, const QString &reason)
+{
+    int affected = 0;
+    const QDateTime now = QDateTime::currentDateTime();
+    for (int pointId : pointIds) {
+        for (auto &v : m_values) {
+            if (v.pointId != pointId)
+                continue;
+            if (v.quality != quality)
+                emit pointQualityChanged(pointId, quality);
+            // 值保留最后一次有效读数，但时间戳推进到"降级时刻"：
+            // 既让界面能看出数据已不新鲜，也避免陈旧看门狗反复处理同一个点。
+            v.quality = quality;
+            v.timestamp = now;
+            ++affected;
+            break;
+        }
+    }
+    if (affected > 0 && !reason.isEmpty()) {
+        qWarning("PointModel: %d point(s) marked %d (%s)",
+                 affected, static_cast<int>(quality), qPrintable(reason));
+    }
+}
+
+void PointModel::markRangeBad(int deviceId, int serverAddress, QModbusDataUnit::RegisterType type,
+                              int startAddress, int count, DataQuality quality, const QString &reason)
+{
+    const int end = startAddress + qMax(0, count);
+    QVector<int> ids;
+    for (const auto &point : m_points) {
+        if (point.deviceId != deviceId || point.serverAddress != serverAddress || point.registerType != type)
+            continue;
+        // 与失败请求区间有交集即降级（点位可能跨多个寄存器）
+        if (point.address < end && point.address + point.count > startAddress)
+            ids.append(point.id);
+    }
+    markPointsBad(ids, quality, reason);
+}
+
+void PointModel::markDeviceBad(int deviceId, DataQuality quality, const QString &reason)
+{
+    QVector<int> ids;
+    for (const auto &point : m_points) {
+        if (point.deviceId == deviceId)
+            ids.append(point.id);
+    }
+    markPointsBad(ids, quality, reason);
+}
+
+int PointModel::markStale(const QDateTime &now, int minTimeoutMs)
+{
+    int staleCount = 0;
+    for (int i = 0; i < m_points.size(); ++i) {
+        const PointDefinition &point = m_points[i];
+        // Unknown = 从未采集过；Bad/Timeout = 已经降级过，不重复处理
+        if (point.id <= 0)
+            continue;
+        PointValue *v = nullptr;
+        for (auto &candidate : m_values) {
+            if (candidate.pointId == point.id) { v = &candidate; break; }
+        }
+        if (!v || !v->timestamp.isValid())
+            continue;
+        if (v->quality != DataQuality::Good && v->quality != DataQuality::OutOfRange)
+            continue;
+
+        const int expectedMs = qMax(1, point.pollIntervalSec) * 1000;
+        const int threshold = qMax(minTimeoutMs, expectedMs * 3);
+        if (v->timestamp.msecsTo(now) <= threshold)
+            continue;
+
+        const DataQuality old = v->quality;
+        v->quality = DataQuality::Timeout;
+        v->timestamp = now;
+        ++staleCount;
+        if (old != v->quality)
+            emit pointQualityChanged(point.id, v->quality);
+    }
+    if (staleCount > 0)
+        qWarning("PointModel: %d point(s) marked Timeout by staleness watchdog", staleCount);
+    return staleCount;
+}
+
 QJsonObject PointModel::pointToJson(const PointDefinition &point) const
 {
     QJsonObject obj;
     obj["name"] = point.name;
+    obj["deviceId"] = point.deviceId;
     obj["serverAddress"] = point.serverAddress;
     obj["registerType"] = static_cast<int>(point.registerType);
     obj["address"] = point.address;
@@ -198,6 +295,8 @@ QJsonObject PointModel::pointToJson(const PointDefinition &point) const
     obj["alarmHigh"] = point.alarmHigh;
     obj["archiveEnabled"] = point.archiveEnabled;
     obj["archiveIntervalSec"] = point.archiveIntervalSec;
+    obj["archiveDeadband"] = point.archiveDeadband;
+    obj["pollIntervalSec"] = point.pollIntervalSec;
     return obj;
 }
 
@@ -205,6 +304,7 @@ PointDefinition PointModel::pointFromJson(const QJsonObject &obj) const
 {
     PointDefinition point;
     point.name = obj["name"].toString();
+    point.deviceId = obj["deviceId"].toInt(0);
     point.serverAddress = obj["serverAddress"].toInt(1);
     point.registerType = static_cast<QModbusDataUnit::RegisterType>(obj["registerType"].toInt(QModbusDataUnit::HoldingRegisters));
     point.address = obj["address"].toInt(0);
@@ -222,6 +322,8 @@ PointDefinition PointModel::pointFromJson(const QJsonObject &obj) const
     point.alarmHigh = obj["alarmHigh"].toDouble(65535.0);
     point.archiveEnabled = obj["archiveEnabled"].toBool(true);
     point.archiveIntervalSec = obj["archiveIntervalSec"].toInt(5);
+    point.archiveDeadband = obj["archiveDeadband"].toDouble(0.0);
+    point.pollIntervalSec = obj["pollIntervalSec"].toInt(1);
     return point;
 }
 
@@ -395,6 +497,9 @@ const ColumnAlias kColumnAliases[] = {
     { "alarmhigh",          "alarmhigh" },
     { "archiveenabled",     "archiveenabled" },
     { "archiveintervalsec", "archiveintervalsec" },
+    { "deviceid",           "deviceid" },
+    { "pollintervalsec",    "pollintervalsec" },
+    { "archivedeadband",    "archivedeadband" },
     // 中文别名
     { "name",               "名称" },
     { "serveraddress",      "从站地址" },
@@ -415,6 +520,11 @@ const ColumnAlias kColumnAliases[] = {
     { "archiveenabled",     "是否归档" },
     { "archiveintervalsec", "归档周期" },
     { "archiveintervalsec", "归档间隔" },
+    { "deviceid",           "设备ID" },
+    { "deviceid",           "设备" },
+    { "pollintervalsec",    "采集周期" },
+    { "pollintervalsec",    "轮询周期" },
+    { "archivedeadband",    "归档死区" },
 };
 
 // 把一个表头单元格文本映射到规范列名；不是已知列名则返回空串。
@@ -483,7 +593,7 @@ bool PointModel::exportToCsv(const QString &filePath, QString *error) const
     QTextStream out(&file);
     out.setGenerateByteOrderMark(true);
     // 列顺序与 defaultOrder 严格一致；新增列一律追加到末尾以保持旧文件兼容。
-    out << "id,name,serverAddress,registerType,address,count,dataType,scale,offset,unit,alarmLow,alarmHigh,archiveEnabled,archiveIntervalSec,byteOrder\n";
+    out << "id,name,serverAddress,registerType,address,count,dataType,scale,offset,unit,alarmLow,alarmHigh,archiveEnabled,archiveIntervalSec,byteOrder,deviceId,pollIntervalSec,archiveDeadband\n";
     for (const auto &p : m_points) {
         QStringList cells;
         cells << QString::number(p.id)
@@ -501,7 +611,10 @@ bool PointModel::exportToCsv(const QString &filePath, QString *error) const
               << QString::number(p.alarmHigh, 'g', 17)
               << QString(p.archiveEnabled ? QLatin1String("1") : QLatin1String("0"))
               << QString::number(p.archiveIntervalSec)
-              << csvEscape(DataParser::byteOrderToToken(p.byteOrder));
+              << csvEscape(DataParser::byteOrderToToken(p.byteOrder))
+              << QString::number(p.deviceId)
+              << QString::number(p.pollIntervalSec)
+              << QString::number(p.archiveDeadband, 'g', 17);
         out << cells.join(QLatin1Char(',')) << '\n';
     }
     out.flush();
@@ -632,7 +745,7 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
     const QStringList defaultOrder = { "id", "name", "serveraddress", "registertype", "address",
                                        "count", "datatype", "scale", "offset", "unit",
                                        "alarmlow", "alarmhigh", "archiveenabled", "archiveintervalsec",
-                                       "byteorder" };
+                                       "byteorder", "deviceid", "pollintervalsec", "archivedeadband" };
     if (!hasHeader) {
         for (int i = 0; i < defaultOrder.size(); ++i)
             col.insert(defaultOrder.at(i), i);
@@ -781,6 +894,39 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
         p.archiveEnabled = boolFromToken(cellOf(row, QStringLiteral("archiveenabled")), true);
         const int archiveInterval = cellOf(row, QStringLiteral("archiveintervalsec")).toInt();
         p.archiveIntervalSec = qMax(1, archiveInterval > 0 ? archiveInterval : 5);
+
+        // ---- 设备 / 采集周期 / 归档死区（旧 CSV 缺列时使用默认值） ----
+        {
+            const QString deviceText = cellOf(row, QStringLiteral("deviceid"));
+            bool ok = false;
+            const int deviceId = deviceText.isEmpty() ? 0 : deviceText.toInt(&ok);
+            if (!deviceText.isEmpty() && (!ok || deviceId < 0)) {
+                invalidReasons << QStringLiteral("第 %1 行：设备ID '%2' 非法，按主连接处理").arg(r + 1).arg(deviceText);
+                p.deviceId = 0;
+            } else {
+                p.deviceId = deviceId;
+            }
+
+            const QString pollText = cellOf(row, QStringLiteral("pollintervalsec"));
+            bool pollOk = false;
+            const int pollSec = pollText.isEmpty() ? 1 : pollText.toInt(&pollOk);
+            if (!pollText.isEmpty() && (!pollOk || pollSec < 1)) {
+                invalidReasons << QStringLiteral("第 %1 行：采集周期 '%2' 非法，按 1s 处理").arg(r + 1).arg(pollText);
+                p.pollIntervalSec = 1;
+            } else {
+                p.pollIntervalSec = qBound(1, pollSec > 0 ? pollSec : 1, 86400);
+            }
+
+            const QString deadbandText = cellOf(row, QStringLiteral("archivedeadband"));
+            bool deadbandOk = false;
+            const double deadband = deadbandText.isEmpty() ? 0.0 : deadbandText.toDouble(&deadbandOk);
+            if (!deadbandText.isEmpty() && (!deadbandOk || deadband < 0.0)) {
+                invalidReasons << QStringLiteral("第 %1 行：归档死区 '%2' 非法，按 0 处理").arg(r + 1).arg(deadbandText);
+                p.archiveDeadband = 0.0;
+            } else {
+                p.archiveDeadband = qMax(0.0, deadband);
+            }
+        }
         if (p.name.isEmpty())
             p.name = QStringLiteral("点位%1").arg(p.address);
         parsed.append(p);

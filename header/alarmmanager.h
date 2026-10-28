@@ -34,6 +34,10 @@ struct AlarmRule {
     int id = 0;
     QString name;
     bool enabled = true;
+    // 点位规则：pointId > 0 时按工程值判定，serverAddress/registerType/address 仅作展示。
+    // 原始寄存器规则：pointId == 0 时按 checkValue() 的寄存器地址判定（兼容旧配置）。
+    int deviceId = 0;
+    int pointId = 0;
     int serverAddress = 1;
     int registerType = 0;
     int address = 0;
@@ -73,6 +77,9 @@ public:
     QVector<AlarmRule> allRules() const;
 
     void checkValue(int serverAddress, int registerType, int address, double value);
+    // 点位规则：value 必须是 scale/offset 换算后的工程值；quality 为 DataQuality 整型值。
+    // Bad/Timeout/Unknown 不参与判定（避免通信中断时刷出满屏假报警）。
+    void checkPointValue(int deviceId, int pointId, double value, int quality);
     void acknowledgeAlarm(qint64 eventId);
     void acknowledgeAll();
     void clearHistory();
@@ -102,10 +109,14 @@ private:
     // 规则增删改后重建地址索引（serverAddress -> (registerType,address) -> 规则 id 列表）
     void rebuildIndex();
     static quint64 addressKey(int registerType, int address);
+    static quint64 pointKey(int deviceId, int pointId);
+    // 共用的边沿/去抖判定：checkValue 与 checkPointValue 都走这里。
+    void evaluateCandidates(const QVector<int> &candidateIds, double value);
 
     QVector<int> m_ruleOrder;                            // 规则 id（保持添加顺序）
     QHash<int, AlarmRule> m_ruleMap;                      // 规则 id -> 规则定义
     QHash<int, QHash<quint64, QVector<int>>> m_addressIndex; // 从站 -> (类型,地址) -> 规则 id 列表
+    QHash<quint64, QVector<int>> m_pointIndex;               // (设备,点位) -> 规则 id 列表
     QQueue<AlarmEvent> m_history;                         // 环形队列：出队 O(1)，条数严格受上限约束
     QMap<int, bool> m_activeStates;
     QMap<int, QDateTime> m_lastTriggerTime;               // 上次真正发出事件的时间（去抖基准）

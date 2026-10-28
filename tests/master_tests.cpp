@@ -54,6 +54,10 @@ void runReviewTests();
 void runAlarmExportHistoryTests();
 // 安全/配置 的修复回归（定义在 test_security_config.cpp）
 void runSecurityConfigTests();
+// P0 功能补齐回归（定义在 test_p0_features.cpp）
+void runP0FeatureTests();
+int p0FeaturePassed();
+int p0FeatureFailed();
 
 // 全局开关：为 true 时跳过"依赖真实时间等待"的慢速用例。
 // 慢速用例必须等真实的连接超时/重连定时器（数秒到数十秒），
@@ -2258,6 +2262,11 @@ int main(int argc, char *argv[])
 
     // 安全/配置 的修复回归
     runSecurityConfigTests();
+
+    // P0 功能补齐回归（多设备 / 工程值历史 / 点位报警 / 质量降级）
+    runP0FeatureTests();
+    g_passed += p0FeaturePassed();
+    g_failed += p0FeatureFailed();
 
     printf("\n==== 汇总 ====\n");
     printf("PASS: %d  FAIL: %d  已确认已知问题: %d\n", g_passed, g_failed, g_issuesConfirmed);

@@ -51,6 +51,8 @@ class DeviceSimulatorPanel;
 
 struct PollTask;
 struct BatchTask;
+struct PointDefinition;
+struct PointValue;
 
 // 读取结果刷新模式随请求下发的属性名。
 // true = 按地址原地刷新既有行（定时读取）；false = 追加新行（手动读取）。
@@ -127,7 +129,8 @@ private slots:
     void saveProfile();
     void loadProfile();
     QJsonObject buildRemoteStatus() const;
-    void publishMqttTelemetry(int serverAddress, int registerType, int startAddress, const QVector<quint16> &values);
+    void publishMqttTelemetry(int deviceId, int serverAddress, int registerType, int startAddress,
+                              const QVector<quint16> &values);
     void publishMqttStatus(bool connected);
     void askReconnectAfterRemoteClose();   // 对端主动断开：弹窗询问用户是否重连
 
@@ -143,6 +146,18 @@ private:
     void executeRemoteWrite(int serverAddress, int registerType, int startAddress,
                             const QVector<quint16> &values,
                             const std::function<void(const QJsonObject &)> &callback);
+
+    // ---------- 多设备 / 点表驱动采集 ----------
+    // deviceId 0 = 主连接；>0 = DeviceManager 中的设备（返回 nullptr 表示设备不存在）
+    QModbusClient *clientForDevice(int deviceId) const;
+    QString deviceDisplayName(int deviceId) const;
+    // 按点表重建采集段：同设备/从站/寄存器类型下合并相邻地址，周期取点位最小值。
+    // 只清理并重建 fromPoints=true 的任务，人工任务不受影响。
+    void rebuildPointPollTasks();
+    // 归档节流：archiveEnabled / archiveIntervalSec / archiveDeadband 在这里真正生效。
+    void maybeArchivePoint(const PointDefinition &point, const PointValue &value);
+    // 陈旧看门狗：轮询运行中，超过 3×采集周期（且 ≥5s）未更新的点位置 Timeout。
+    void updateQualityWatchdog();
 
     Ui::MainWindow *ui;
     QModbusReply *lastRequest;
@@ -179,6 +194,11 @@ private:
     class QLabel *m_autoReadIndicator = nullptr;   // 定时读取常驻状态指示（状态栏右侧）
     QMap<int, int> m_pointChartSeriesMap;
     QMap<int, int> m_pointDashboardGaugeMap;
+    // 点位归档节流状态（pointId -> 上次落库时间/值/质量）
+    QHash<int, QDateTime> m_lastArchiveTime;
+    QHash<int, double> m_lastArchiveValue;
+    QHash<int, int> m_lastArchiveQuality;
+    class QTimer *m_qualityWatchdog = nullptr;      // 陈旧检测定时器
     int m_lastModbusState = -1;        // 上一次 Modbus 连接状态（调试用）
     bool m_hadRealConnection = false;  // 本次连接周期内是否真正连上过（识别"连上后意外断线"）
     bool m_userDisconnecting = false;  // 用户主动断开标记（抑制对端断开弹窗）

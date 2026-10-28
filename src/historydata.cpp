@@ -107,6 +107,26 @@ void HistoryData::createTables()
     // P2-08：组合索引——按 从站+类型+起始地址+时间 的组合查询是历史页的主查询路径
     query.exec("CREATE INDEX IF NOT EXISTS idx_hist_lookup "
                "ON history(server_address, register_type, start_address, timestamp)");
+
+    // 工程值归档：按点位存储 scale/offset/字节序换算后的值，并保留质量码。
+    // 原始寄存器表保留用于报文级追溯；点位表用于报表/趋势/聚合查询。
+    query.exec(
+        "CREATE TABLE IF NOT EXISTS point_history ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  timestamp TEXT NOT NULL,"
+        "  device_id INTEGER NOT NULL DEFAULT 0,"
+        "  point_id INTEGER NOT NULL,"
+        "  point_name TEXT,"
+        "  server_address INTEGER,"
+        "  value REAL,"
+        "  quality INTEGER"
+        ")"
+    );
+    query.exec("CREATE INDEX IF NOT EXISTS idx_point_hist_lookup "
+               "ON point_history(point_id, timestamp)");
+    query.exec("CREATE INDEX IF NOT EXISTS idx_point_hist_device "
+               "ON point_history(device_id, timestamp)");
+    query.exec("CREATE INDEX IF NOT EXISTS idx_point_hist_time ON point_history(timestamp)");
 }
 
 void HistoryData::applyPragmas()
@@ -197,6 +217,162 @@ bool HistoryData::addRecords(const QVector<HistoryBatchEntry> &records)
     return true;
 }
 
+bool HistoryData::writePointEntry(QSqlQuery &query, const PointHistoryRecord &entry,
+                                  const QDateTime &timestamp)
+{
+    query.addBindValue(timestamp.toString(Qt::ISODateWithMs));
+    query.addBindValue(entry.deviceId);
+    query.addBindValue(entry.pointId);
+    query.addBindValue(entry.pointName);
+    query.addBindValue(entry.serverAddress);
+    query.addBindValue(entry.value);
+    query.addBindValue(entry.quality);
+    return query.exec();
+}
+
+bool HistoryData::addPointRecord(const PointHistoryRecord &record)
+{
+    return addPointRecords(QVector<PointHistoryRecord>{record});
+}
+
+bool HistoryData::addPointRecords(const QVector<PointHistoryRecord> &records)
+{
+    if (!m_db.isOpen()) {
+        setLastError(QStringLiteral("历史数据库未打开，工程值记录未写入"));
+        return false;
+    }
+    if (records.isEmpty()) {
+        setLastError(QString());
+        return true;
+    }
+
+    QSqlQuery query(m_db);
+    if (!query.prepare(
+            "INSERT INTO point_history (timestamp, device_id, point_id, point_name, "
+            "server_address, value, quality) VALUES (?, ?, ?, ?, ?, ?, ?)")) {
+        setLastError(QStringLiteral("准备点位归档 INSERT 失败: %1").arg(query.lastError().text()));
+        qWarning() << "HistoryData::addPointRecords:" << m_lastError;
+        return false;
+    }
+
+    const bool ownTransaction = m_db.transaction();
+    for (const PointHistoryRecord &entry : records) {
+        const QDateTime ts = entry.timestamp.isValid() ? entry.timestamp : QDateTime::currentDateTime();
+        if (!writePointEntry(query, entry, ts)) {
+            setLastError(QStringLiteral("写入点位归档失败(point=%1): %2")
+                             .arg(entry.pointId).arg(query.lastError().text()));
+            qWarning() << "HistoryData::addPointRecords:" << m_lastError;
+            if (ownTransaction)
+                m_db.rollback();
+            return false;
+        }
+    }
+    if (ownTransaction && !m_db.commit()) {
+        setLastError(QStringLiteral("提交点位归档事务失败: %1").arg(m_db.lastError().text()));
+        return false;
+    }
+
+    setLastError(QString());
+    maybeAutoCleanup();
+    return true;
+}
+
+QVector<PointHistoryRecord> HistoryData::queryPoints(const QDateTime &from, const QDateTime &to,
+                                                     int deviceId, int pointId,
+                                                     int limit, int offset) const
+{
+    QString sql = "SELECT * FROM point_history WHERE timestamp >= ? AND timestamp <= ?";
+    QVariantList binds;
+    binds.append(from.toString(Qt::ISODateWithMs));
+    binds.append(to.toString(Qt::ISODateWithMs));
+    if (deviceId >= 0) {
+        sql += " AND device_id = ?";
+        binds.append(deviceId);
+    }
+    if (pointId >= 0) {
+        sql += " AND point_id = ?";
+        binds.append(pointId);
+    }
+    sql += " ORDER BY timestamp DESC";
+    if (limit >= 0) {
+        sql += " LIMIT ? OFFSET ?";
+        binds.append(limit);
+        binds.append(qMax(0, offset));
+    }
+
+    QSqlQuery q(m_db);
+    q.prepare(sql);
+    for (const QVariant &value : binds)
+        q.addBindValue(value);
+    if (!q.exec()) {
+        setLastError(QStringLiteral("查询点位归档失败: %1").arg(q.lastError().text()));
+        qWarning() << "HistoryData::queryPoints:" << m_lastError;
+        return QVector<PointHistoryRecord>();
+    }
+
+    QVector<PointHistoryRecord> results;
+    while (q.next()) {
+        PointHistoryRecord rec;
+        rec.id = q.value("id").toLongLong();
+        rec.timestamp = QDateTime::fromString(q.value("timestamp").toString(), Qt::ISODateWithMs);
+        rec.deviceId = q.value("device_id").toInt();
+        rec.pointId = q.value("point_id").toInt();
+        rec.pointName = q.value("point_name").toString();
+        rec.serverAddress = q.value("server_address").toInt();
+        rec.value = q.value("value").toDouble();
+        rec.quality = q.value("quality").toInt();
+        results.append(rec);
+    }
+    return results;
+}
+
+QVector<PointHistoryAggregate> HistoryData::aggregatePoints(const QDateTime &from, const QDateTime &to,
+                                                            int deviceId, int pointId,
+                                                            int bucketSeconds) const
+{
+    const int bucket = qMax(1, bucketSeconds);
+    QString sql =
+        "SELECT (CAST(strftime('%s', timestamp) AS INTEGER) / ?) * ? AS bucket, "
+        "MIN(value), MAX(value), AVG(value), COUNT(*) "
+        "FROM point_history WHERE timestamp >= ? AND timestamp <= ?";
+    QVariantList binds;
+    binds.append(bucket);
+    binds.append(bucket);
+    binds.append(from.toString(Qt::ISODateWithMs));
+    binds.append(to.toString(Qt::ISODateWithMs));
+    if (deviceId >= 0) {
+        sql += " AND device_id = ?";
+        binds.append(deviceId);
+    }
+    if (pointId >= 0) {
+        sql += " AND point_id = ?";
+        binds.append(pointId);
+    }
+    sql += " GROUP BY bucket ORDER BY bucket ASC";
+
+    QSqlQuery q(m_db);
+    q.prepare(sql);
+    for (const QVariant &value : binds)
+        q.addBindValue(value);
+    if (!q.exec()) {
+        setLastError(QStringLiteral("聚合点位归档失败: %1").arg(q.lastError().text()));
+        qWarning() << "HistoryData::aggregatePoints:" << m_lastError;
+        return QVector<PointHistoryAggregate>();
+    }
+
+    QVector<PointHistoryAggregate> results;
+    while (q.next()) {
+        PointHistoryAggregate agg;
+        agg.bucketStart = QDateTime::fromSecsSinceEpoch(q.value(0).toLongLong());
+        agg.minValue = q.value(1).toDouble();
+        agg.maxValue = q.value(2).toDouble();
+        agg.avgValue = q.value(3).toDouble();
+        agg.count = q.value(4).toInt();
+        results.append(agg);
+    }
+    return results;
+}
+
 void HistoryData::maybeAutoCleanup()
 {
     if (m_retentionDays <= 0)
@@ -215,14 +391,13 @@ int HistoryData::purgeOlderThan(const QDateTime &before)
     if (!m_db.isOpen())
         return 0;
 
-    QSqlQuery q(m_db);
-    if (!q.prepare("DELETE FROM history WHERE timestamp < ?")) {
-        setLastError(QStringLiteral("准备清理语句失败: %1").arg(q.lastError().text()));
-        return 0;
-    }
-    q.addBindValue(before.toString(Qt::ISODateWithMs));
-
+    const QString ts = before.toString(Qt::ISODateWithMs);
     const bool ownTransaction = m_db.transaction();
+    int removed = 0;
+
+    QSqlQuery q(m_db);
+    q.prepare("DELETE FROM history WHERE timestamp < ?");
+    q.addBindValue(ts);
     if (!q.exec()) {
         setLastError(QStringLiteral("清理历史记录失败: %1").arg(q.lastError().text()));
         qWarning() << "HistoryData::purgeOlderThan:" << m_lastError;
@@ -230,7 +405,24 @@ int HistoryData::purgeOlderThan(const QDateTime &before)
             m_db.rollback();
         return 0;
     }
-    const int removed = q.numRowsAffected();
+    removed += q.numRowsAffected();
+
+    if (!q.prepare("DELETE FROM point_history WHERE timestamp < ?")) {
+        setLastError(QStringLiteral("准备清理点位归档语句失败: %1").arg(q.lastError().text()));
+        if (ownTransaction)
+            m_db.rollback();
+        return 0;
+    }
+    q.addBindValue(ts);
+    if (!q.exec()) {
+        setLastError(QStringLiteral("清理点位归档失败: %1").arg(q.lastError().text()));
+        qWarning() << "HistoryData::purgeOlderThan:" << m_lastError;
+        if (ownTransaction)
+            m_db.rollback();
+        return 0;
+    }
+    removed += q.numRowsAffected();
+
     if (ownTransaction && !m_db.commit()) {
         setLastError(QStringLiteral("提交清理事务失败: %1").arg(m_db.lastError().text()));
         return 0;
@@ -336,6 +528,15 @@ qint64 HistoryData::totalRecords() const
     return 0;
 }
 
+qint64 HistoryData::totalPointRecords() const
+{
+    QSqlQuery q(m_db);
+    q.exec("SELECT COUNT(*) FROM point_history");
+    if (q.next())
+        return q.value(0).toLongLong();
+    return 0;
+}
+
 void HistoryData::clearOlderThan(const QDateTime &before)
 {
     purgeOlderThan(before);
@@ -348,6 +549,11 @@ void HistoryData::clearAll()
     QSqlQuery q(m_db);
     if (!q.exec("DELETE FROM history")) {
         setLastError(QStringLiteral("清空历史记录失败: %1").arg(q.lastError().text()));
+        qWarning() << "HistoryData::clearAll:" << m_lastError;
+        return;
+    }
+    if (!q.exec("DELETE FROM point_history")) {
+        setLastError(QStringLiteral("清空点位归档失败: %1").arg(q.lastError().text()));
         qWarning() << "HistoryData::clearAll:" << m_lastError;
         return;
     }

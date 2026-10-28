@@ -30,6 +30,27 @@ struct HistoryBatchEntry {
     QDateTime timestamp;
 };
 
+// 工程值归档的一条记录（按点位存储，而不是按寄存器块）。
+struct PointHistoryRecord {
+    qint64 id = 0;
+    QDateTime timestamp;
+    int deviceId = 0;
+    int pointId = 0;
+    QString pointName;
+    int serverAddress = 1;
+    double value = 0.0;
+    int quality = 0;          // DataQuality 的整型值（0=Good）
+};
+
+// 历史聚合结果（min/max/avg + 样本数）。
+struct PointHistoryAggregate {
+    QDateTime bucketStart;
+    double minValue = 0.0;
+    double maxValue = 0.0;
+    double avgValue = 0.0;
+    int count = 0;
+};
+
 class HistoryData : public QObject
 {
     Q_OBJECT
@@ -47,6 +68,19 @@ public:
 
     // P2-11：批量写入，用一个事务提交，避免逐条 autocommit 造成的写放大
     bool addRecords(const QVector<HistoryBatchEntry> &records);
+
+    // ---------- 工程值归档 ----------
+    bool addPointRecord(const PointHistoryRecord &record);
+    bool addPointRecords(const QVector<PointHistoryRecord> &records);
+
+    QVector<PointHistoryRecord> queryPoints(const QDateTime &from, const QDateTime &to,
+                                            int deviceId = -1, int pointId = -1,
+                                            int limit = -1, int offset = 0) const;
+    // 按时间桶聚合（bucketSeconds <= 0 时按 60s）。pointId < 0 表示全部点位。
+    QVector<PointHistoryAggregate> aggregatePoints(const QDateTime &from, const QDateTime &to,
+                                                   int deviceId, int pointId,
+                                                   int bucketSeconds = 60) const;
+    qint64 totalPointRecords() const;
 
     // limit < 0 表示不限制；offset 为跳过的行数
     QVector<HistoryRecord> query(const QDateTime &from, const QDateTime &to,
@@ -74,6 +108,7 @@ private:
     void createTables();
     void applyPragmas();
     bool writeEntry(QSqlQuery &query, const HistoryBatchEntry &entry, const QDateTime &timestamp);
+    bool writePointEntry(QSqlQuery &query, const PointHistoryRecord &entry, const QDateTime &timestamp);
     void maybeAutoCleanup();
     int purgeOlderThan(const QDateTime &before);
     void setLastError(const QString &message) const;

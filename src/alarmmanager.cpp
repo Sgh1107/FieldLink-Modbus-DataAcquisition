@@ -17,15 +17,24 @@ quint64 AlarmManager::addressKey(int registerType, int address)
     return (quint64(quint32(registerType)) << 32) | quint64(quint32(address));
 }
 
+quint64 AlarmManager::pointKey(int deviceId, int pointId)
+{
+    return (quint64(quint32(deviceId)) << 32) | quint64(quint32(pointId));
+}
+
 void AlarmManager::rebuildIndex()
 {
     m_addressIndex.clear();
+    m_pointIndex.clear();
     for (int id : m_ruleOrder) {
         auto it = m_ruleMap.constFind(id);
         if (it == m_ruleMap.constEnd())
             continue;
         const AlarmRule &r = it.value();
-        m_addressIndex[r.serverAddress][addressKey(r.registerType, r.address)].append(id);
+        if (r.pointId > 0)
+            m_pointIndex[pointKey(r.deviceId, r.pointId)].append(id);
+        else
+            m_addressIndex[r.serverAddress][addressKey(r.registerType, r.address)].append(id);
     }
 }
 
@@ -186,9 +195,26 @@ void AlarmManager::checkValue(int serverAddress, int registerType, int address, 
     if (keyIt == serverIt->constEnd())
         return;
 
-    // 拷贝一份 id 列表：下面的 emit 可能触发槽函数增删规则，直接遍历会失效
-    const QVector<int> candidateIds = keyIt.value();
+    evaluateCandidates(keyIt.value(), value);
+}
 
+void AlarmManager::checkPointValue(int deviceId, int pointId, double value, int quality)
+{
+    // DataQuality: Good=0, Bad=1, Timeout=2, OutOfRange=3, Unknown=4
+    // 通信异常期间不评估过程报警，否则一次断线会让所有点位同时"超限"。
+    if (quality == 1 || quality == 2 || quality == 4)
+        return;
+
+    auto it = m_pointIndex.constFind(pointKey(deviceId, pointId));
+    if (it == m_pointIndex.constEnd())
+        return;
+
+    evaluateCandidates(it.value(), value);
+}
+
+void AlarmManager::evaluateCandidates(const QVector<int> &candidateIds, double value)
+{
+    // 拷贝一份 id 列表：下面的 emit 可能触发槽函数增删规则，直接遍历会失效
     for (int ruleId : candidateIds) {
         auto ruleIt = m_ruleMap.constFind(ruleId);
         if (ruleIt == m_ruleMap.constEnd())

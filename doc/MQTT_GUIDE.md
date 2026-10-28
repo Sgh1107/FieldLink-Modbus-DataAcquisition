@@ -12,15 +12,18 @@ FieldLink 内置了一个**极简 MQTT 3.1.1 发布端客户端**（QoS 0/1）�
 
 | 主题 | 内容 | 触发时机 | retain |
 | --- | --- | --- | --- |
-| `{前缀}data/{从站}/{寄存器类型}/{起始地址}` | 采集数据 JSON（时间戳/地址/值数组） | 轮询任务、批量读取成功后 | 否 |
+| `{前缀}data/{从站}/{寄存器类型}/{起始地址}` | 主连接采集数据 JSON（时间戳/设备/地址/值数组） | 轮询任务、批量读取成功后 | 否 |
+| `{前缀}data/d{设备ID}/{从站}/{寄存器类型}/{起始地址}` | 多设备采集数据 JSON | 多设备轮询/批量读取成功后 | 否 |
 | `{前缀}alarm/triggered` | 报警事件 JSON（规则/严重度/触发值） | 报警触发 | 否 |
 | `{前缀}status` | 设备连接状态 | 现场连接/断开 | **是**（订阅方上线即得最新状态） |
 
 数据消息示例：
 
 ```json
-{"timestamp":"2026-09-01T21:00:00.123","serverAddress":1,"registerType":"HoldingRegisters","startAddress":0,"count":3,"values":[248,1737,42]}
+{"timestamp":"2026-09-01T21:00:00.123","deviceId":0,"serverAddress":1,"registerType":"HoldingRegisters","startAddress":0,"count":3,"values":[248,1737,42]}
 ```
+
+> 主连接（`deviceId=0`）沿用原主题格式，保持向后兼容；多设备使用 `data/d{设备ID}/...` 主题，JSON 同时携带 `deviceId`，订阅方可据此区分同从站地址的不同设备。
 
 ## 二、配置与使用
 
@@ -76,6 +79,7 @@ python -u slave\mqtt_test_broker.py --port 1883 --user test --pass secret
 # broker 终端将实时打印：
 # CONNECT client=fieldlink-xxxx proto=MQTT level=4 clean=True
 # PUBLISH topic=fieldlink/data/1/HoldingRegisters/0 retain=0 qos=0 bytes=96 payload={...}
+# 多设备：PUBLISH topic=fieldlink/data/d2/1/HoldingRegisters/0 ... payload 含 "deviceId":2
 # PINGREQ client=fieldlink-xxxx
 ```
 

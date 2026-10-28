@@ -388,6 +388,10 @@ void MainWindow::onStateChanged(int state)
             m_reliabilityManager->notifyDisconnected();
             if (unexpected)
                 askReconnectAfterRemoteClose();
+            // 主连接断开：主连接下的点位立即降级，避免界面继续显示"最后一次 Good 值"
+            if (m_hadRealConnection && m_pointModel)
+                m_pointModel->markDeviceBad(0, DataQuality::Bad,
+                                            QStringLiteral("main link disconnected"));
             m_hadRealConnection = false;   // 本轮断开流程已处理完毕
             m_userDisconnecting = false;   // 恢复默认
         }
@@ -1042,6 +1046,32 @@ void MainWindow::initAdvancedFeatures()
             m_chart->addDataPoint(m_pointChartSeriesMap.value(point.id), value.value);
         if (m_dashboard && m_pointDashboardGaugeMap.contains(point.id))
             m_dashboard->updateGaugeValue(m_pointDashboardGaugeMap.value(point.id), value.value);
+
+        // 工程值报警：AlarmManager 里的点位规则按 scale/offset 换算后的值判定，
+        // 不再把原始寄存器值当成工程量（scale≠1 时旧实现必然误报/漏报）。
+        if (m_alarmManager)
+            m_alarmManager->checkPointValue(point.deviceId, point.id, value.value,
+                                            static_cast<int>(value.quality));
+
+        // 归档开关 / 归档周期 / 死区在这里真正生效
+        maybeArchivePoint(point, value);
+    });
+
+    // 陈旧看门狗：轮询运行中，点位超过 3×采集周期（且 ≥5s）未更新 → Timeout
+    m_qualityWatchdog = new QTimer(this);
+    m_qualityWatchdog->setInterval(1000);
+    connect(m_qualityWatchdog, &QTimer::timeout, this, &MainWindow::updateQualityWatchdog);
+    m_qualityWatchdog->start();
+
+    // 设备断开 → 该设备下所有点位质量码降级（否则界面永远显示最后一次 Good 值）
+    connect(m_deviceManager, &DeviceManager::deviceDisconnected, this, [this](int deviceId) {
+        if (m_pointModel)
+            m_pointModel->markDeviceBad(deviceId, DataQuality::Bad,
+                                        QStringLiteral("device %1 disconnected").arg(deviceId));
+        logMessage(QStringLiteral("多设备 %1 已断开，关联点位质量码置 Bad").arg(deviceId), 2);
+    });
+    connect(m_deviceManager, &DeviceManager::deviceError, this, [this](int deviceId, const QString &error) {
+        logMessage(QStringLiteral("多设备 %1 通信错误: %2").arg(deviceId).arg(error), 3);
     });
     m_verificationManager = new VerificationManager(this);
     m_deliveryManager = new DeliveryManager(this);
@@ -1054,8 +1084,19 @@ void MainWindow::initAdvancedFeatures()
         }
     });
     connect(m_reliabilityManager, &ReliabilityManager::heartbeatRequested, this, [this]() {
-        if (modbusDevice && modbusDevice->state() == QModbusDevice::ConnectedState)
-            onPollRequest(PollTask{0, QStringLiteral("Heartbeat"), ui->serverEdit->value(), QModbusDataUnit::HoldingRegisters, ui->readAddress->value(), 1, 5000, true, false, 0, 0});
+        if (modbusDevice && modbusDevice->state() == QModbusDevice::ConnectedState) {
+            PollTask heartbeat;
+            heartbeat.id = 0;
+            heartbeat.name = QStringLiteral("Heartbeat");
+            heartbeat.deviceId = 0;
+            heartbeat.serverAddress = ui->serverEdit->value();
+            heartbeat.registerType = QModbusDataUnit::HoldingRegisters;
+            heartbeat.startAddress = ui->readAddress->value();
+            heartbeat.quantity = 1;
+            heartbeat.intervalMs = 5000;
+            heartbeat.enabled = true;
+            onPollRequest(heartbeat);
+        }
     });
     connect(m_reliabilityManager, &ReliabilityManager::continuousFailureAlarm, this, [this](int count, const QString &reason) {
         m_dashboard->appendAlarmLog(QStringLiteral("连续通信失败 %1 次: %2").arg(count).arg(reason));

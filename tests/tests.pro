@@ -19,6 +19,7 @@ SOURCES += \
     review_tests.cpp \
     test_alarm_export_history.cpp \
     test_security_config.cpp \
+    test_p0_features.cpp \
     ../src/alarmmanager.cpp \
     ../src/securitymanager.cpp \
     ../src/reliabilitymanager.cpp \

@@ -65,6 +65,9 @@
 #include <QElapsedTimer>
 #include <QRandomGenerator>
 #include <QDateTimeEdit>
+#include <QMap>
+#include <QSet>
+#include <algorithm>
 
 static QModbusDataUnit::RegisterType registerTypeFromComboIndex(int index)
 {
@@ -238,16 +241,184 @@ static bool exportPointsInteractive(QWidget *parent, PointModel *model)
     return true;
 }
 
+QModbusClient *MainWindow::clientForDevice(int deviceId) const
+{
+    if (deviceId <= 0)
+        return modbusDevice;
+    return m_deviceManager ? m_deviceManager->modbusClient(deviceId) : nullptr;
+}
+
+QString MainWindow::deviceDisplayName(int deviceId) const
+{
+    if (deviceId <= 0)
+        return QStringLiteral("主连接");
+    if (m_deviceManager) {
+        for (const auto &d : m_deviceManager->allDevices()) {
+            if (d.id == deviceId)
+                return d.name.isEmpty() ? QStringLiteral("设备%1").arg(deviceId) : d.name;
+        }
+    }
+    return QStringLiteral("设备%1").arg(deviceId);
+}
+
+void MainWindow::rebuildPointPollTasks()
+{
+    if (!m_pollManager || !m_pointModel)
+        return;
+
+    // 只清理上一轮由点表生成的任务；设备/模板/扫描器/人工任务保持不变。
+    const QVector<PollTask> existing = m_pollManager->tasks();
+    for (const PollTask &task : existing) {
+        if (task.fromPoints)
+            m_pollManager->removeTask(task.id);
+    }
+
+    // 分组键：设备 + 从站 + 寄存器类型（不同类型不能同请求）
+    QMap<QString, QVector<PointDefinition>> groups;
+    for (const PointDefinition &p : m_pointModel->points()) {
+        const QString key = QStringLiteral("%1|%2|%3")
+                                .arg(p.deviceId).arg(p.serverAddress)
+                                .arg(static_cast<int>(p.registerType));
+        groups[key].append(p);
+    }
+
+    constexpr int kBaseId = 30000000;   // 点表采集段 id 段（与扫描 20000000+ 不重叠）
+    int seq = 0;
+    int created = 0;
+
+    for (auto it = groups.begin(); it != groups.end(); ++it) {
+        QVector<PointDefinition> pts = it.value();
+        std::sort(pts.begin(), pts.end(), [](const PointDefinition &a, const PointDefinition &b) {
+            if (a.address != b.address)
+                return a.address < b.address;
+            return a.id < b.id;
+        });
+
+        const bool bitType = (pts.first().registerType == QModbusDataUnit::Coils
+                              || pts.first().registerType == QModbusDataUnit::DiscreteInputs);
+        const int maxSpan = bitType ? 2000 : 125;
+
+        int i = 0;
+        while (i < pts.size()) {
+            const int start = pts[i].address;
+            int end = start + qMax(1, pts[i].count);          // exclusive
+            int intervalMs = qMax(100, pts[i].pollIntervalSec * 1000);
+            QVector<int> pointIds;
+            pointIds.append(pts[i].id);
+
+            int j = i + 1;
+            while (j < pts.size()) {
+                const int nextStart = pts[j].address;
+                const int nextEnd = nextStart + qMax(1, pts[j].count);
+                // 只合并相邻/重叠区间；中间有空洞就断开，避免读到未实现的地址段
+                if (nextStart > end)
+                    break;
+                if (qMax(end, nextEnd) - start > maxSpan)
+                    break;
+                end = qMax(end, nextEnd);
+                intervalMs = qMin(intervalMs, qMax(100, pts[j].pollIntervalSec * 1000));
+                pointIds.append(pts[j].id);
+                ++j;
+            }
+
+            PollTask task;
+            task.id = kBaseId + seq++;
+            task.name = QStringLiteral("点表:%1/从站%2/%3@%4")
+                            .arg(deviceDisplayName(pts[i].deviceId))
+                            .arg(pts[i].serverAddress)
+                            .arg(registerTypeName(static_cast<int>(pts[i].registerType)))
+                            .arg(start);
+            task.deviceId = pts[i].deviceId;
+            task.serverAddress = pts[i].serverAddress;
+            task.registerType = pts[i].registerType;
+            task.startAddress = start;
+            task.quantity = end - start;
+            task.intervalMs = intervalMs;
+            task.enabled = true;
+            task.pointIds = pointIds;
+            task.fromPoints = true;
+            m_pollManager->addTask(task);
+            ++created;
+            i = j;
+        }
+    }
+
+    logMessage(QStringLiteral("点表采集段已重建：%1 个请求段，覆盖 %2 个点位")
+                   .arg(created).arg(m_pointModel->points().size()));
+}
+
+void MainWindow::maybeArchivePoint(const PointDefinition &point, const PointValue &value)
+{
+    if (!m_historyData || !m_historyData->isOpen() || !point.archiveEnabled)
+        return;
+    if (!value.timestamp.isValid())
+        return;
+
+    const int intervalMs = qMax(1, point.archiveIntervalSec) * 1000;
+    const int quality = static_cast<int>(value.quality);
+
+    const auto lastTimeIt = m_lastArchiveTime.constFind(point.id);
+    if (lastTimeIt != m_lastArchiveTime.constEnd()) {
+        const qint64 elapsed = lastTimeIt.value().msecsTo(value.timestamp);
+        if (elapsed >= 0 && elapsed < intervalMs)
+            return;
+
+        // 死区：用户显式配置 >0 时，同质量码且变化小于死区 → 不落库（抑制稳态噪声）
+        if (point.archiveDeadband > 0.0
+            && m_lastArchiveQuality.value(point.id, -1) == quality
+            && m_lastArchiveValue.contains(point.id)
+            && qAbs(value.value - m_lastArchiveValue.value(point.id)) < point.archiveDeadband) {
+            return;
+        }
+    }
+
+    PointHistoryRecord rec;
+    rec.timestamp = value.timestamp;
+    rec.deviceId = point.deviceId;
+    rec.pointId = point.id;
+    rec.pointName = point.name;
+    rec.serverAddress = point.serverAddress;
+    rec.value = value.value;
+    rec.quality = quality;
+
+    if (!m_historyData->addPointRecord(rec))
+        return;
+
+    m_lastArchiveTime[point.id] = value.timestamp;
+    m_lastArchiveValue[point.id] = value.value;
+    m_lastArchiveQuality[point.id] = quality;
+}
+
+void MainWindow::updateQualityWatchdog()
+{
+    if (!m_pointModel || !m_pollManager || !m_pollManager->isRunning())
+        return;
+    m_pointModel->markStale(QDateTime::currentDateTime(), 5000);
+}
+
 void MainWindow::onPollRequest(const PollTask &task)
 {
-    if (!modbusDevice || modbusDevice->state() != QModbusDevice::ConnectedState) {
-        // 设备未连接：本次请求不会发出，必须立即解除在途标志，避免任务被永久跳过
+    QModbusClient *client = clientForDevice(task.deviceId);
+    if (!client || client->state() != QModbusDevice::ConnectedState) {
+        // 设备未连接：本次请求不会发出，必须立即解除在途标志，避免任务被永久跳过；
+        // 同时把该任务关联的点位降级，界面不能继续显示旧的 Good 值。
+        if (m_pointModel) {
+            if (!task.pointIds.isEmpty())
+                m_pointModel->markPointsBad(task.pointIds, DataQuality::Bad,
+                                            QStringLiteral("device not connected"));
+            else
+                m_pointModel->markRangeBad(task.deviceId, task.serverAddress, task.registerType,
+                                           task.startAddress, task.quantity, DataQuality::Bad,
+                                           QStringLiteral("device not connected"));
+        }
+        if (task.deviceId == 0 && m_reliabilityManager)
+            m_reliabilityManager->notifyFailure(QStringLiteral("Modbus device not connected"));
         m_pollManager->notifyTaskFinished(task.id);
         return;
     }
 
     QModbusDataUnit unit(task.registerType, task.startAddress, task.quantity);
-    if (auto *reply = modbusDevice->sendReadRequest(unit, task.serverAddress)) {
+    if (auto *reply = client->sendReadRequest(unit, task.serverAddress)) {
         if (!reply->isFinished()) {
             connect(reply, &QModbusReply::finished, this, [this, task, reply]() {
                 if (reply->error() == QModbusDevice::NoError) {
@@ -264,10 +435,14 @@ void MainWindow::onPollRequest(const PollTask &task)
                     rec.values = values;
                     m_dataExporter->addRecord(rec);
 
+                    // 原始寄存器块保留用于报文级追溯；工程值归档由
+                    // PointModel::pointValueUpdated → maybeArchivePoint 按点位写入。
                     m_historyData->addRecord(task.serverAddress, task.registerType,
                                              task.startAddress, values);
-                    m_reliabilityManager->notifySuccess();
-                    m_pointModel->updateFromRaw(task.serverAddress, task.registerType, task.startAddress, values);
+                    if (task.deviceId == 0 && m_reliabilityManager)
+                        m_reliabilityManager->notifySuccess();
+                    m_pointModel->updateFromRaw(task.serverAddress, task.registerType,
+                                                task.startAddress, values, task.deviceId);
 
                     if (!values.isEmpty()) {
                         m_chart->addDataPoint(0, values.first());
@@ -291,8 +466,8 @@ void MainWindow::onPollRequest(const PollTask &task)
                     m_pluginManager->notifyDataReceived(task.serverAddress,
                         static_cast<int>(task.registerType), task.startAddress, values);
 
-                    // MQTT：轮询数据实时上送
-                    publishMqttTelemetry(task.serverAddress,
+                    // MQTT：轮询数据实时上送（带 deviceId，避免多设备同从站地址时无法区分）
+                    publishMqttTelemetry(task.deviceId, task.serverAddress,
                         static_cast<int>(task.registerType), task.startAddress, values);
 
                     m_dashboard->appendCommunicationLog(QStringLiteral("READ OK addr=%1 count=%2 first=%3")
@@ -303,7 +478,18 @@ void MainWindow::onPollRequest(const PollTask &task)
                     logMessage(QStringLiteral("POLL-OK [%1] addr=%2 count=%3")
                                .arg(task.name).arg(task.startAddress).arg(task.quantity));
                 } else {
-                    m_reliabilityManager->notifyFailure(reply->errorString());
+                    if (task.deviceId == 0 && m_reliabilityManager)
+                        m_reliabilityManager->notifyFailure(reply->errorString());
+                    if (m_pointModel) {
+                        if (!task.pointIds.isEmpty())
+                            m_pointModel->markPointsBad(task.pointIds, DataQuality::Bad,
+                                                        reply->errorString());
+                        else
+                            m_pointModel->markRangeBad(task.deviceId, task.serverAddress,
+                                                       task.registerType, task.startAddress,
+                                                       task.quantity, DataQuality::Bad,
+                                                       reply->errorString());
+                    }
                     m_dashboard->appendCommunicationLog(QStringLiteral("READ ERROR %1").arg(reply->errorString()));
                     logMessage(QStringLiteral("POLL-ERR [%1] %2")
                                .arg(task.name).arg(reply->errorString()), 3);
@@ -320,20 +506,29 @@ void MainWindow::onPollRequest(const PollTask &task)
         }
     } else {
         // 发送失败：立即解除在途标志，否则任务会被永久跳过
-        logMessage(QStringLiteral("POLL-SEND-ERR [%1] %2").arg(task.name).arg(modbusDevice->errorString()), 3);
+        logMessage(QStringLiteral("POLL-SEND-ERR [%1] %2").arg(task.name).arg(client->errorString()), 3);
+        if (m_pointModel) {
+            if (!task.pointIds.isEmpty())
+                m_pointModel->markPointsBad(task.pointIds, DataQuality::Bad, client->errorString());
+            else
+                m_pointModel->markRangeBad(task.deviceId, task.serverAddress, task.registerType,
+                                           task.startAddress, task.quantity, DataQuality::Bad,
+                                           client->errorString());
+        }
         m_pollManager->notifyTaskFinished(task.id);
     }
 }
 
 void MainWindow::onBatchReadTask(const BatchTask &task)
 {
-    if (!modbusDevice || modbusDevice->state() != QModbusDevice::ConnectedState) {
+    QModbusClient *client = clientForDevice(task.deviceId);
+    if (!client || client->state() != QModbusDevice::ConnectedState) {
         m_batchTaskManager->onTaskFinished(task.id, false, "Not connected", {});
         return;
     }
 
     QModbusDataUnit unit(task.registerType, task.startAddress, task.quantity);
-    if (auto *reply = modbusDevice->sendReadRequest(unit, task.serverAddress)) {
+    if (auto *reply = client->sendReadRequest(unit, task.serverAddress)) {
         if (!reply->isFinished()) {
             connect(reply, &QModbusReply::finished, this, [this, task, reply]() {
                 if (reply->error() == QModbusDevice::NoError) {
@@ -344,7 +539,7 @@ void MainWindow::onBatchReadTask(const BatchTask &task)
                     m_batchTaskManager->onTaskFinished(task.id, true, QString(), values);
 
                     // MQTT：批量读取数据上送
-                    publishMqttTelemetry(task.serverAddress,
+                    publishMqttTelemetry(task.deviceId, task.serverAddress,
                         static_cast<int>(task.registerType), task.startAddress, values);
                 } else {
                     m_batchTaskManager->onTaskFinished(task.id, false, reply->errorString(), {});
@@ -356,13 +551,14 @@ void MainWindow::onBatchReadTask(const BatchTask &task)
             m_batchTaskManager->onTaskFinished(task.id, false, "Immediate reply", {});
         }
     } else {
-        m_batchTaskManager->onTaskFinished(task.id, false, modbusDevice->errorString(), {});
+        m_batchTaskManager->onTaskFinished(task.id, false, client->errorString(), {});
     }
 }
 
 void MainWindow::onBatchWriteTask(const BatchTask &task)
 {
-    if (!modbusDevice || modbusDevice->state() != QModbusDevice::ConnectedState) {
+    QModbusClient *client = clientForDevice(task.deviceId);
+    if (!client || client->state() != QModbusDevice::ConnectedState) {
         m_batchTaskManager->onTaskFinished(task.id, false, "Not connected", {});
         return;
     }
@@ -371,7 +567,7 @@ void MainWindow::onBatchWriteTask(const BatchTask &task)
     for (int i = 0; i < task.writeValues.size() && i < task.quantity; ++i)
         unit.setValue(i, task.writeValues[i]);
 
-    if (auto *reply = modbusDevice->sendWriteRequest(unit, task.serverAddress)) {
+    if (auto *reply = client->sendWriteRequest(unit, task.serverAddress)) {
         if (!reply->isFinished()) {
             connect(reply, &QModbusReply::finished, this, [this, task, reply]() {
                 if (reply->error() == QModbusDevice::NoError)
@@ -385,7 +581,7 @@ void MainWindow::onBatchWriteTask(const BatchTask &task)
             m_batchTaskManager->onTaskFinished(task.id, false, "Immediate reply", {});
         }
     } else {
-        m_batchTaskManager->onTaskFinished(task.id, false, modbusDevice->errorString(), {});
+        m_batchTaskManager->onTaskFinished(task.id, false, client->errorString(), {});
     }
 }
 
@@ -578,19 +774,35 @@ void MainWindow::startStopPolling()
         statusBar()->showMessage("轮询已停止", 3000);
         logMessage("定时轮询已停止");
     } else {
+        // 点表驱动：启动前按当前点表重建采集段（新增/修改点位无需手动"生成轮询"）
+        rebuildPointPollTasks();
+
+        // 采集段引用到多设备时，启动前自动尝试连接（用户仍可在设备管理中手动断开）
+        if (m_deviceManager) {
+            QSet<int> deviceIds;
+            for (const PollTask &task : m_pollManager->tasks()) {
+                if (task.deviceId > 0)
+                    deviceIds.insert(task.deviceId);
+            }
+            for (int deviceId : deviceIds) {
+                if (!m_deviceManager->isConnected(deviceId)) {
+                    if (!m_deviceManager->connectDevice(deviceId))
+                        logMessage(QStringLiteral("设备 %1 启动采集时连接失败").arg(deviceId), 3);
+                }
+            }
+        }
+
         if (m_pollManager->tasks().isEmpty()) {
             PollTask task;
             task.id = 1;
             task.name = "Default Poll";
+            task.deviceId = 0;
             task.serverAddress = ui->serverEdit->value();
             task.registerType = currentUiRegisterType(ui);
             task.startAddress = ui->readAddress->value();
             task.quantity = ui->readSize->currentText().toInt();
             task.intervalMs = 1000;
             task.enabled = true;
-            task.alarmEnabled = false;
-            task.alarmMin = 0;
-            task.alarmMax = 65535;
             m_pollManager->addTask(task);
             m_chart->addSeries("Register " + QString::number(task.startAddress), Qt::blue, 200);
         }
@@ -829,7 +1041,7 @@ void MainWindow::showDeviceManager()
         PollTask task; task.id = 100000 + d.id; task.name = d.name; task.serverAddress = d.serverAddress;
         task.registerType = currentUiRegisterType(ui);
         task.startAddress = ui->readAddress->value(); task.quantity = ui->readSize->currentText().toInt(); task.intervalMs = d.pollIntervalMs;
-        task.enabled = true; task.alarmEnabled = true; task.alarmMin = 0; task.alarmMax = 65535;
+        task.enabled = true; task.deviceId = d.id; task.fromPoints = false;
         m_pollManager->removeTask(task.id); m_pollManager->addTask(task);
         statusBar()->showMessage(QString("已生成设备轮询任务: %1").arg(d.name), 3000);
     });
@@ -1073,9 +1285,8 @@ void MainWindow::showTemplateManager()
             task.quantity = reg.count;
             task.intervalMs = 1000;
             task.enabled = true;
-            task.alarmEnabled = false;
-            task.alarmMin = 0;
-            task.alarmMax = 65535;
+            task.deviceId = 0;
+            task.fromPoints = false;
             m_pollManager->removeTask(task.id);
             m_pollManager->addTask(task);
             ++created;
@@ -1317,14 +1528,16 @@ void MainWindow::showMqttSettings()
     dialog.exec();
 }
 
-void MainWindow::publishMqttTelemetry(int serverAddress, int registerType, int startAddress,
-                                      const QVector<quint16> &values)
+void MainWindow::publishMqttTelemetry(int deviceId, int serverAddress, int registerType,
+                                      int startAddress, const QVector<quint16> &values)
 {
     if (!m_mqttClient || !m_mqttClient->isConnectedToBroker() || values.isEmpty())
         return;
 
     QJsonObject obj;
     obj[QStringLiteral("timestamp")] = QDateTime::currentDateTime().toString(Qt::ISODateWithMs);
+    // deviceId 必须上送：多设备可能存在相同的从站地址/寄存器地址
+    obj[QStringLiteral("deviceId")] = deviceId;
     obj[QStringLiteral("serverAddress")] = serverAddress;
     obj[QStringLiteral("registerType")] = registerTypeName(registerType);
     obj[QStringLiteral("startAddress")] = startAddress;
@@ -1336,9 +1549,13 @@ void MainWindow::publishMqttTelemetry(int serverAddress, int registerType, int s
 
     const QString prefix = m_appSettings.value(QStringLiteral("mqtt/topicPrefix"),
                                                QStringLiteral("fieldlink/")).toString();
-    const QString topic = QStringLiteral("%1data/%2/%3/%4")
-                              .arg(prefix).arg(serverAddress)
-                              .arg(registerTypeName(registerType)).arg(startAddress);
+    // 主题保持旧格式（device 0 完全兼容）；多设备时追加设备段，避免不同设备互相覆盖
+    const QString topic = deviceId == 0
+        ? QStringLiteral("%1data/%2/%3/%4")
+              .arg(prefix).arg(serverAddress).arg(registerTypeName(registerType)).arg(startAddress)
+        : QStringLiteral("%1data/d%2/%3/%4/%5")
+              .arg(prefix).arg(deviceId).arg(serverAddress)
+              .arg(registerTypeName(registerType)).arg(startAddress);
     m_mqttClient->publishJson(topic, obj);
 }
 
@@ -1456,53 +1673,180 @@ void MainWindow::showHistoryQuery()
 {
     QDialog dialog(this);
     dialog.setWindowTitle("历史数据查询");
-    dialog.resize(1150, 680);
+    dialog.resize(1200, 700);
     auto *layout = new QVBoxLayout(&dialog);
     auto *filters = new QHBoxLayout();
+
+    auto *modeCombo = new QComboBox(&dialog);
+    modeCombo->addItem("工程值", 0);       // 按点位归档的 scale/offset 换算值
+    modeCombo->addItem("原始寄存器", 1);   // 报文级追溯
+
     auto *fromEdit = new QDateTimeEdit(QDateTime::currentDateTime().addDays(-1), &dialog);
     auto *toEdit = new QDateTimeEdit(QDateTime::currentDateTime(), &dialog);
     fromEdit->setCalendarPopup(true);
     toEdit->setCalendarPopup(true);
+
+    auto *deviceCombo = new QComboBox(&dialog);
+    deviceCombo->addItem("全部设备", -1);
+    deviceCombo->addItem("主连接", 0);
+    for (const auto &d : m_deviceManager->allDevices())
+        deviceCombo->addItem(QStringLiteral("%1 (设备%2)").arg(d.name).arg(d.id), d.id);
+
+    auto *pointCombo = new QComboBox(&dialog);
+    pointCombo->addItem("全部点位", -1);
+
     auto *serverEdit = new QSpinBox(&dialog); serverEdit->setRange(-1, 247); serverEdit->setValue(-1); serverEdit->setSpecialValueText("全部");
     auto *typeEdit = new QComboBox(&dialog); typeEdit->addItems({"全部", "Coils", "Discrete Inputs", "Input Registers", "Holding Registers"});
     auto *addrEdit = new QSpinBox(&dialog); addrEdit->setRange(-1, 65535); addrEdit->setValue(-1); addrEdit->setSpecialValueText("全部");
+    auto *aggCombo = new QComboBox(&dialog);
+    aggCombo->addItem("不聚合", 0);
+    aggCombo->addItem("1 分钟", 60);
+    aggCombo->addItem("5 分钟", 300);
+    aggCombo->addItem("1 小时", 3600);
+
+    filters->addWidget(new QLabel("模式", &dialog)); filters->addWidget(modeCombo);
     filters->addWidget(new QLabel("开始", &dialog)); filters->addWidget(fromEdit);
     filters->addWidget(new QLabel("结束", &dialog)); filters->addWidget(toEdit);
+    filters->addWidget(new QLabel("设备", &dialog)); filters->addWidget(deviceCombo);
+    filters->addWidget(new QLabel("点位", &dialog)); filters->addWidget(pointCombo);
     filters->addWidget(new QLabel("从站", &dialog)); filters->addWidget(serverEdit);
     filters->addWidget(new QLabel("寄存器", &dialog)); filters->addWidget(typeEdit);
     filters->addWidget(new QLabel("地址", &dialog)); filters->addWidget(addrEdit);
+    filters->addWidget(new QLabel("聚合", &dialog)); filters->addWidget(aggCombo);
     layout->addLayout(filters);
 
     auto *table = new QTableWidget(&dialog);
-    table->setColumnCount(7);
-    table->setHorizontalHeaderLabels({"ID", "时间", "从站", "寄存器", "起始地址", "数量", "值"});
-    table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
     table->setSelectionBehavior(QAbstractItemView::SelectRows);
     table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
     layout->addWidget(table);
 
-    QVector<HistoryRecord> records;
-    // 单次查询的显示上限：query() 不带 LIMIT 时会把整个时间范围读进内存，
-    // 再逐行 new QTableWidgetItem（7 列）→ 几十万行时界面直接卡死。
+    // 导出严格跟随当前视图（模式 + 聚合），避免"界面看到工程值、CSV 却是原始寄存器"。
+    QStringList currentHeader;
+    QVector<QStringList> currentRows;
     constexpr int kMaxDisplayRows = 5000;
-    auto refresh = [&]() {
-        const int regType = typeEdit->currentIndex() == 0 ? -1 : static_cast<int>(registerTypeFromComboIndex(typeEdit->currentIndex() - 1));
-        records = m_historyData->query(fromEdit->dateTime(), toEdit->dateTime(), serverEdit->value(),
-                                       regType, addrEdit->value(), kMaxDisplayRows, 0);
-        table->setRowCount(records.size());
-        for (int row = 0; row < records.size(); ++row) {
-            const auto &r = records[row];
-            QStringList values;
-            for (quint16 v : r.values) values << QString::number(v);
-            const QStringList cells = {QString::number(r.id), r.timestamp.toString("yyyy-MM-dd HH:mm:ss.zzz"), QString::number(r.serverAddress), registerTypeName(static_cast<int>(r.registerType)), QString::number(r.startAddress), QString::number(r.count), values.join(",")};
-            for (int col = 0; col < cells.size(); ++col)
+
+    auto isEngineering = [&]() { return modeCombo->currentData().toInt() == 0; };
+
+    // 点位下拉随设备筛选联动：避免"全部设备"下几百个同名点位无法区分。
+    auto rebuildPointCombo = [&]() {
+        const int selectedDevice = deviceCombo->currentData().toInt();
+        pointCombo->blockSignals(true);
+        pointCombo->clear();
+        pointCombo->addItem("全部点位", -1);
+        for (const PointDefinition &p : m_pointModel->points()) {
+            if (selectedDevice >= 0 && p.deviceId != selectedDevice)
+                continue;
+            pointCombo->addItem(QStringLiteral("%1 (设备%2/ID%3)")
+                                    .arg(p.name).arg(deviceDisplayName(p.deviceId)).arg(p.id), p.id);
+        }
+        pointCombo->blockSignals(false);
+    };
+
+    auto applyModeVisibility = [&]() {
+        const bool eng = isEngineering();
+        deviceCombo->setEnabled(eng);
+        pointCombo->setEnabled(eng);
+        aggCombo->setEnabled(eng);
+        serverEdit->setEnabled(!eng);
+        typeEdit->setEnabled(!eng);
+        addrEdit->setEnabled(!eng);
+    };
+
+    auto setTable = [&](const QStringList &header, const QVector<QStringList> &rows) {
+        currentHeader = header;
+        currentRows = rows;
+        table->setColumnCount(header.size());
+        table->setHorizontalHeaderLabels(header);
+        table->setRowCount(rows.size());
+        for (int row = 0; row < rows.size(); ++row) {
+            const QStringList &cells = rows[row];
+            for (int col = 0; col < cells.size() && col < header.size(); ++col)
                 table->setItem(row, col, new QTableWidgetItem(cells[col]));
         }
+    };
+
+    auto refreshEngineering = [&]() {
+        const QDateTime from = fromEdit->dateTime();
+        const QDateTime to = toEdit->dateTime();
+        const int deviceId = deviceCombo->currentData().toInt();
+        const int pointId = pointCombo->currentData().toInt();
+        const int bucket = aggCombo->currentData().toInt();
+
+        if (bucket > 0) {
+            if (pointId < 0) {
+                QMessageBox::information(&dialog, "需要选择点位",
+                                         "按时间聚合时请选择一个具体点位，否则不同点位的值会被混在同一条曲线里。");
+                return;
+            }
+            const auto aggregates = m_historyData->aggregatePoints(from, to, deviceId, pointId, bucket);
+            QVector<QStringList> rows;
+            rows.reserve(aggregates.size());
+            for (const auto &a : aggregates) {
+                rows.append({a.bucketStart.toString("yyyy-MM-dd HH:mm:ss"),
+                             QString::number(a.avgValue, 'f', 3),
+                             QString::number(a.minValue, 'f', 3),
+                             QString::number(a.maxValue, 'f', 3),
+                             QString::number(a.count)});
+            }
+            setTable({"时间桶", "平均", "最小", "最大", "样本数"}, rows);
+            statusBar()->showMessage(QString("聚合查询完成：%1 个时间桶").arg(rows.size()), 3000);
+            return;
+        }
+
+        const auto records = m_historyData->queryPoints(from, to, deviceId, pointId, kMaxDisplayRows, 0);
+        QVector<QStringList> rows;
+        rows.reserve(records.size());
+        for (const auto &r : records) {
+            QString pointText = r.pointName;
+            if (pointText.isEmpty() && m_pointModel)
+                pointText = m_pointModel->point(r.pointId).name;
+            rows.append({QString::number(r.id),
+                         r.timestamp.toString("yyyy-MM-dd HH:mm:ss.zzz"),
+                         deviceDisplayName(r.deviceId),
+                         QStringLiteral("%1 (ID%2)").arg(pointText).arg(r.pointId),
+                         QString::number(r.serverAddress),
+                         QString::number(r.value, 'f', 3),
+                         pointQualityName(static_cast<DataQuality>(r.quality))});
+        }
+        setTable({"ID", "时间", "设备", "点位", "从站", "值", "质量"}, rows);
         if (records.size() >= kMaxDisplayRows)
-            statusBar()->showMessage(QString("历史查询完成：显示前 %1 条（结果已截断，请缩小时间范围）")
+            statusBar()->showMessage(QString("工程值查询完成：显示前 %1 条（已截断，请缩小时间范围）")
                                           .arg(records.size()), 5000);
         else
-            statusBar()->showMessage(QString("历史查询完成：%1 条").arg(records.size()), 3000);
+            statusBar()->showMessage(QString("工程值查询完成：%1 条").arg(records.size()), 3000);
+    };
+
+    auto refreshRaw = [&]() {
+        const int regType = typeEdit->currentIndex() == 0 ? -1 : static_cast<int>(registerTypeFromComboIndex(typeEdit->currentIndex() - 1));
+        const auto records = m_historyData->query(fromEdit->dateTime(), toEdit->dateTime(), serverEdit->value(),
+                                                  regType, addrEdit->value(), kMaxDisplayRows, 0);
+        QVector<QStringList> rows;
+        rows.reserve(records.size());
+        for (const auto &r : records) {
+            QStringList values;
+            for (quint16 v : r.values) values << QString::number(v);
+            rows.append({QString::number(r.id),
+                         r.timestamp.toString("yyyy-MM-dd HH:mm:ss.zzz"),
+                         QString::number(r.serverAddress),
+                         registerTypeName(static_cast<int>(r.registerType)),
+                         QString::number(r.startAddress),
+                         QString::number(r.count),
+                         values.join(",")});
+        }
+        setTable({"ID", "时间", "从站", "寄存器", "起始地址", "数量", "值"}, rows);
+        if (records.size() >= kMaxDisplayRows)
+            statusBar()->showMessage(QString("原始寄存器查询完成：显示前 %1 条（已截断，请缩小时间范围）")
+                                          .arg(records.size()), 5000);
+        else
+            statusBar()->showMessage(QString("原始寄存器查询完成：%1 条").arg(records.size()), 3000);
+    };
+
+    auto refresh = [&]() {
+        if (isEngineering())
+            refreshEngineering();
+        else
+            refreshRaw();
     };
 
     auto *buttons = new QHBoxLayout();
@@ -1513,17 +1857,52 @@ void MainWindow::showHistoryQuery()
     buttons->addWidget(queryBtn); buttons->addWidget(lastBtn); buttons->addWidget(exportBtn); buttons->addWidget(clearOldBtn); buttons->addStretch();
     layout->addLayout(buttons);
 
+    connect(modeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog, [&](int) {
+        applyModeVisibility();
+        refresh();
+    });
+    connect(deviceCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog, [&](int) {
+        rebuildPointCombo();
+    });
     connect(queryBtn, &QPushButton::clicked, &dialog, refresh);
     connect(lastBtn, &QPushButton::clicked, &dialog, [&]() {
-        records = m_historyData->lastRecords(100);
-        table->setRowCount(records.size());
-        for (int row = 0; row < records.size(); ++row) {
-            const auto &r = records[row];
-            QStringList values;
-            for (quint16 v : r.values) values << QString::number(v);
-            const QStringList cells = {QString::number(r.id), r.timestamp.toString("yyyy-MM-dd HH:mm:ss.zzz"), QString::number(r.serverAddress), registerTypeName(static_cast<int>(r.registerType)), QString::number(r.startAddress), QString::number(r.count), values.join(",")};
-            for (int col = 0; col < cells.size(); ++col)
-                table->setItem(row, col, new QTableWidgetItem(cells[col]));
+        const QDateTime from = QDateTime::currentDateTime().addDays(-7);
+        const QDateTime to = QDateTime::currentDateTime();
+        if (isEngineering()) {
+            // 最近 100 条工程值：直接按时间倒序取，不做聚合
+            aggCombo->setCurrentIndex(0);
+            const int deviceId = deviceCombo->currentData().toInt();
+            const int pointId = pointCombo->currentData().toInt();
+            const auto records = m_historyData->queryPoints(from, to, deviceId, pointId, 100, 0);
+            QVector<QStringList> rows;
+            for (const auto &r : records) {
+                QString pointText = r.pointName;
+                if (pointText.isEmpty() && m_pointModel)
+                    pointText = m_pointModel->point(r.pointId).name;
+                rows.append({QString::number(r.id),
+                             r.timestamp.toString("yyyy-MM-dd HH:mm:ss.zzz"),
+                             deviceDisplayName(r.deviceId),
+                             QStringLiteral("%1 (ID%2)").arg(pointText).arg(r.pointId),
+                             QString::number(r.serverAddress),
+                             QString::number(r.value, 'f', 3),
+                             pointQualityName(static_cast<DataQuality>(r.quality))});
+            }
+            setTable({"ID", "时间", "设备", "点位", "从站", "值", "质量"}, rows);
+        } else {
+            const auto records = m_historyData->lastRecords(100);
+            QVector<QStringList> rows;
+            for (const auto &r : records) {
+                QStringList values;
+                for (quint16 v : r.values) values << QString::number(v);
+                rows.append({QString::number(r.id),
+                             r.timestamp.toString("yyyy-MM-dd HH:mm:ss.zzz"),
+                             QString::number(r.serverAddress),
+                             registerTypeName(static_cast<int>(r.registerType)),
+                             QString::number(r.startAddress),
+                             QString::number(r.count),
+                             values.join(",")});
+            }
+            setTable({"ID", "时间", "从站", "寄存器", "起始地址", "数量", "值"}, rows);
         }
     });
     connect(exportBtn, &QPushButton::clicked, &dialog, [&]() {
@@ -1533,16 +1912,26 @@ void MainWindow::showHistoryQuery()
         if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) return;
         QTextStream out(&f);
         out.setGenerateByteOrderMark(true);
-        out << "id,timestamp,serverAddress,registerType,startAddress,count,values\n";
-        for (const auto &r : records) {
-            QStringList values;
-            for (quint16 v : r.values) values << QString::number(v);
-            out << r.id << ',' << r.timestamp.toString(Qt::ISODateWithMs) << ',' << r.serverAddress << ',' << static_cast<int>(r.registerType) << ',' << r.startAddress << ',' << r.count << ",\"" << values.join(",") << "\"\n";
+        auto escape = [](const QString &text) {
+            QString escaped = text;
+            escaped.replace('"', "\"\"");
+            return escaped.contains(',') || escaped.contains('"') || escaped.contains('\n')
+                       ? QStringLiteral("\"%1\"").arg(escaped) : escaped;
+        };
+        QStringList header;
+        for (const QString &cell : currentHeader) header << escape(cell);
+        out << header.join(',') << '\n';
+        for (const QStringList &row : currentRows) {
+            QStringList cells;
+            for (const QString &cell : row) cells << escape(cell);
+            out << cells.join(',') << '\n';
         }
         statusBar()->showMessage("历史数据已导出", 3000);
     });
     connect(clearOldBtn, &QPushButton::clicked, &dialog, [&]() { m_historyData->clearOlderThan(QDateTime::currentDateTime().addDays(-30)); refresh(); });
 
+    rebuildPointCombo();
+    applyModeVisibility();
     refresh();
     dialog.exec();
 }
@@ -1554,8 +1943,8 @@ void MainWindow::showPointManager()
     dialog.resize(1280, 720);
     auto *layout = new QVBoxLayout(&dialog);
     auto *table = new QTableWidget(&dialog);
-    table->setColumnCount(17);
-    table->setHorizontalHeaderLabels({"ID", "名称", "设备", "从站", "寄存器", "地址", "数量", "数据类型", "系数", "偏移", "单位", "报警下限", "报警上限", "归档", "归档周期", "当前值", "质量码"});
+    table->setColumnCount(19);
+    table->setHorizontalHeaderLabels({"ID", "名称", "设备", "从站", "寄存器", "地址", "数量", "数据类型", "系数", "偏移", "单位", "报警下限", "报警上限", "归档", "归档周期", "采集周期", "归档死区", "当前值", "质量码"});
     table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
     table->setSelectionBehavior(QAbstractItemView::SelectRows);
     table->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -1572,11 +1961,8 @@ void MainWindow::showPointManager()
         for (int row = 0; row < points.size(); ++row) {
             const auto &p = points[row];
             const auto v = currentPointValue(m_pointModel, p.id);
-            QString deviceName = QStringLiteral("从站%1").arg(p.serverAddress);
-            for (const auto &d : m_deviceManager->allDevices()) {
-                if (d.serverAddress == p.serverAddress) { deviceName = d.name; break; }
-            }
-            const QStringList cells = {QString::number(p.id), p.name, deviceName, QString::number(p.serverAddress), registerTypeName(static_cast<int>(p.registerType)), QString::number(p.address), QString::number(p.count), p.dataType, QString::number(p.scale), QString::number(p.offset), p.unit, QString::number(p.alarmLow), QString::number(p.alarmHigh), p.archiveEnabled ? "是" : "否", QString::number(p.archiveIntervalSec), v.timestamp.isValid() ? QString::number(v.value, 'f', 3) : QStringLiteral("--"), pointQualityName(v.quality)};
+            const QString deviceName = deviceDisplayName(p.deviceId);
+            const QStringList cells = {QString::number(p.id), p.name, deviceName, QString::number(p.serverAddress), registerTypeName(static_cast<int>(p.registerType)), QString::number(p.address), QString::number(p.count), p.dataType, QString::number(p.scale), QString::number(p.offset), p.unit, QString::number(p.alarmLow), QString::number(p.alarmHigh), p.archiveEnabled ? "是" : "否", QString::number(p.archiveIntervalSec), QString::number(p.pollIntervalSec), QString::number(p.archiveDeadband), v.timestamp.isValid() ? QString::number(v.value, 'f', 3) : QStringLiteral("--"), pointQualityName(v.quality)};
             for (int col = 0; col < cells.size(); ++col)
                 table->setItem(row, col, new QTableWidgetItem(cells[col]));
         }
@@ -1587,6 +1973,16 @@ void MainWindow::showPointManager()
         editor.setWindowTitle(isNew ? "新增点位" : "编辑点位");
         auto *form = new QFormLayout(&editor);
         auto *name = new QLineEdit(isNew ? QStringLiteral("点位") : point.name, &editor);
+        // 设备维度：0 = 主连接；其余为 DeviceManager 设备。缺失该选择会导致
+        // 两台同从站地址的设备共用一个点位集（数据互相覆盖）。
+        auto *device = new QComboBox(&editor);
+        device->addItem(QStringLiteral("主连接"), 0);
+        for (const auto &d : m_deviceManager->allDevices())
+            device->addItem(QStringLiteral("%1 (设备%2)").arg(d.name).arg(d.id), d.id);
+        {
+            const int index = device->findData(isNew ? 0 : point.deviceId);
+            device->setCurrentIndex(index >= 0 ? index : 0);
+        }
         auto *server = new QSpinBox(&editor); server->setRange(1, 247); server->setValue(isNew ? ui->serverEdit->value() : point.serverAddress);
         auto *regType = new QComboBox(&editor); regType->addItems({"Coils", "Discrete Inputs", "Input Registers", "Holding Registers"}); regType->setCurrentIndex(isNew ? currentUiRegisterComboIndex(ui) : comboIndexFromRegisterType(static_cast<int>(point.registerType)));
         auto *address = new QSpinBox(&editor); address->setRange(0, 65535); address->setValue(isNew ? ui->readAddress->value() : point.address);
@@ -1604,19 +2000,21 @@ void MainWindow::showPointManager()
         auto *alarmHigh = new QDoubleSpinBox(&editor); alarmHigh->setRange(-999999999, 999999999); alarmHigh->setDecimals(3); alarmHigh->setValue(isNew ? 65535.0 : point.alarmHigh);
         auto *archiveEnabled = new QCheckBox(&editor); archiveEnabled->setChecked(isNew ? true : point.archiveEnabled);
         auto *archiveInterval = new QSpinBox(&editor); archiveInterval->setRange(1, 86400); archiveInterval->setValue(isNew ? 5 : point.archiveIntervalSec);
-        form->addRow("名称", name); form->addRow("从站地址", server); form->addRow("寄存器类型", regType); form->addRow("地址", address); form->addRow("数量", count); form->addRow("数据类型", dataType); form->addRow("字节序", byteOrder); form->addRow("系数", scale); form->addRow("偏移", offset); form->addRow("单位", unit); form->addRow("报警下限", alarmLow); form->addRow("报警上限", alarmHigh); form->addRow("是否归档", archiveEnabled); form->addRow("归档周期(s)", archiveInterval);
+        auto *pollInterval = new QSpinBox(&editor); pollInterval->setRange(1, 3600); pollInterval->setValue(isNew ? 1 : point.pollIntervalSec);
+        auto *archiveDeadband = new QDoubleSpinBox(&editor); archiveDeadband->setRange(0, 999999999); archiveDeadband->setDecimals(6); archiveDeadband->setValue(isNew ? 0.0 : point.archiveDeadband);
+        form->addRow("设备", device); form->addRow("名称", name); form->addRow("从站地址", server); form->addRow("寄存器类型", regType); form->addRow("地址", address); form->addRow("数量", count); form->addRow("数据类型", dataType); form->addRow("字节序", byteOrder); form->addRow("系数", scale); form->addRow("偏移", offset); form->addRow("单位", unit); form->addRow("报警下限", alarmLow); form->addRow("报警上限", alarmHigh); form->addRow("是否归档", archiveEnabled); form->addRow("归档周期(s)", archiveInterval); form->addRow("采集周期(s)", pollInterval); form->addRow("归档死区", archiveDeadband);
         auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &editor);
         form->addRow(buttons);
         connect(buttons, &QDialogButtonBox::accepted, &editor, &QDialog::accept);
         connect(buttons, &QDialogButtonBox::rejected, &editor, &QDialog::reject);
         if (editor.exec() != QDialog::Accepted) return;
-        point.name = name->text(); point.serverAddress = server->value(); point.registerType = registerTypeFromComboIndex(regType->currentIndex()); point.address = address->value(); point.count = count->value(); point.dataType = dataType->currentText(); point.byteOrder = static_cast<ByteOrder>(byteOrder->currentIndex()); point.scale = scale->value(); point.offset = offset->value(); point.unit = unit->text(); point.alarmLow = alarmLow->value(); point.alarmHigh = alarmHigh->value(); point.archiveEnabled = archiveEnabled->isChecked(); point.archiveIntervalSec = archiveInterval->value();
+        point.name = name->text(); point.deviceId = device->currentData().toInt(); point.serverAddress = server->value(); point.registerType = registerTypeFromComboIndex(regType->currentIndex()); point.address = address->value(); point.count = count->value(); point.dataType = dataType->currentText(); point.byteOrder = static_cast<ByteOrder>(byteOrder->currentIndex()); point.scale = scale->value(); point.offset = offset->value(); point.unit = unit->text(); point.alarmLow = alarmLow->value(); point.alarmHigh = alarmHigh->value(); point.archiveEnabled = archiveEnabled->isChecked(); point.archiveIntervalSec = archiveInterval->value(); point.pollIntervalSec = pollInterval->value(); point.archiveDeadband = archiveDeadband->value();
         if (isNew) m_pointModel->addPoint(point); else m_pointModel->updatePoint(point);
         m_pointModel->saveToFile(pointFilePath()); refresh();
     };
 
     auto *buttons = new QHBoxLayout();
-    auto *addBtn = new QPushButton("新增", &dialog); auto *editBtn = new QPushButton("编辑", &dialog); auto *deleteBtn = new QPushButton("删除", &dialog); auto *importBtn = new QPushButton("导入 JSON/CSV", &dialog); auto *exportBtn = new QPushButton("导出 JSON/CSV", &dialog); auto *templateBtn = new QPushButton("从模板生成", &dialog); auto *pollBtn = new QPushButton("生成轮询", &dialog); auto *alarmBtn = new QPushButton("绑定报警", &dialog); auto *chartBtn = new QPushButton("绑定曲线", &dialog); auto *dashboardBtn = new QPushButton("绑定仪表盘", &dialog); auto *archiveBtn = new QPushButton("归档策略", &dialog); auto *saveBtn = new QPushButton("保存", &dialog);
+    auto *addBtn = new QPushButton("新增", &dialog); auto *editBtn = new QPushButton("编辑", &dialog); auto *deleteBtn = new QPushButton("删除", &dialog); auto *importBtn = new QPushButton("导入 JSON/CSV", &dialog); auto *exportBtn = new QPushButton("导出 JSON/CSV", &dialog); auto *templateBtn = new QPushButton("从模板生成", &dialog); auto *pollBtn = new QPushButton("生成轮询(全部)", &dialog); auto *alarmBtn = new QPushButton("绑定报警", &dialog); auto *chartBtn = new QPushButton("绑定曲线", &dialog); auto *dashboardBtn = new QPushButton("绑定仪表盘", &dialog); auto *archiveBtn = new QPushButton("归档策略", &dialog); auto *saveBtn = new QPushButton("保存", &dialog);
     for (auto *btn : {addBtn, editBtn, deleteBtn, importBtn, exportBtn, templateBtn, pollBtn, alarmBtn, chartBtn, dashboardBtn, archiveBtn, saveBtn}) buttons->addWidget(btn);
     buttons->addStretch(); layout->addLayout(buttons);
 
@@ -1632,8 +2030,19 @@ void MainWindow::showPointManager()
     });
     connect(exportBtn, &QPushButton::clicked, &dialog, [&]() { exportPointsInteractive(&dialog, m_pointModel); });
     connect(templateBtn, &QPushButton::clicked, &dialog, [&]() { showTemplateManager(); refresh(); });
-    connect(pollBtn, &QPushButton::clicked, &dialog, [&]() { const int id = selectedPointId(); if (!id) return; const auto p = m_pointModel->point(id); PollTask task{10000000 + p.id, QStringLiteral("点位.%1").arg(p.name), p.serverAddress, p.registerType, p.address, p.count, qMax(100, p.archiveIntervalSec * 1000), true, true, p.alarmLow, p.alarmHigh}; m_pollManager->removeTask(task.id); m_pollManager->addTask(task); statusBar()->showMessage("点位轮询任务已生成", 3000); });
-    connect(alarmBtn, &QPushButton::clicked, &dialog, [&]() { const int id = selectedPointId(); if (!id) return; const auto p = m_pointModel->point(id); AlarmRule r{}; r.name = p.name + " 上下限报警"; r.enabled = true; r.serverAddress = p.serverAddress; r.registerType = static_cast<int>(p.registerType); r.address = p.address; r.condition = AlarmCondition::OutOfRange; r.threshold1 = p.alarmLow; r.threshold2 = p.alarmHigh; r.severity = AlarmSeverity::Warning; r.message = p.name + " 超出上下限"; r.debounceMs = 0; m_alarmManager->addRule(r); statusBar()->showMessage("点位报警规则已绑定", 3000); });
+    connect(pollBtn, &QPushButton::clicked, &dialog, [&]() {
+        // 点表驱动：一次性按设备/从站/寄存器类型合并重建全部采集段，
+        // 不再为单个点位生成彼此独立的任务（那会放大请求数并互相冲突）。
+        rebuildPointPollTasks();
+        int pointTaskCount = 0;
+        for (const PollTask &task : m_pollManager->tasks()) {
+            if (task.fromPoints)
+                ++pointTaskCount;
+        }
+        statusBar()->showMessage(QString("已重建点表采集段 %1 个（点位 %2 个）")
+                                      .arg(pointTaskCount).arg(m_pointModel->points().size()), 3000);
+    });
+    connect(alarmBtn, &QPushButton::clicked, &dialog, [&]() { const int id = selectedPointId(); if (!id) return; const auto p = m_pointModel->point(id); AlarmRule r{}; r.name = p.name + " 上下限报警"; r.enabled = true; r.deviceId = p.deviceId; r.pointId = p.id; r.serverAddress = p.serverAddress; r.registerType = static_cast<int>(p.registerType); r.address = p.address; r.condition = AlarmCondition::OutOfRange; r.threshold1 = p.alarmLow; r.threshold2 = p.alarmHigh; r.severity = AlarmSeverity::Warning; r.message = p.name + " 超出上下限"; r.debounceMs = 0; m_alarmManager->addRule(r); statusBar()->showMessage("点位报警规则已绑定（按工程值判定）", 3000); });
     connect(chartBtn, &QPushButton::clicked, &dialog, [&]() { const int id = selectedPointId(); if (id) { const int series = m_chart->addSeries(m_pointModel->point(id).name, QColor::fromHsv((id * 37) % 360, 180, 220), 500); m_pointChartSeriesMap.insert(id, series); m_chart->show(); m_chart->raise(); statusBar()->showMessage("点位已动态绑定趋势曲线", 3000); } });
     connect(dashboardBtn, &QPushButton::clicked, &dialog, [&]() { const int id = selectedPointId(); if (!id) return; const auto p = m_pointModel->point(id); GaugeConfig g; g.name = p.name; g.unit = p.unit; g.minValue = p.alarmLow; g.maxValue = p.alarmHigh; g.warningThreshold = p.alarmHigh * 0.8; g.criticalThreshold = p.alarmHigh; g.currentValue = currentPointValue(m_pointModel, id).value; g.normalColor = QColor(46, 204, 113); g.warningColor = QColor(241, 196, 15); g.criticalColor = QColor(231, 76, 60); const int gauge = m_dashboard->addGauge(g); m_pointDashboardGaugeMap.insert(id, gauge); m_dashboard->show(); m_dashboard->raise(); statusBar()->showMessage("点位已动态绑定仪表盘", 3000); });
     connect(archiveBtn, &QPushButton::clicked, &dialog, [&]() { const int id = selectedPointId(); if (id) editPoint(m_pointModel->point(id), false); });
@@ -1641,7 +2050,7 @@ void MainWindow::showPointManager()
             [&](const PointDefinition &, const PointValue &) {
         // 每次点位值更新就整表重建会造成 UI 风暴：
         // 一次读回命中 M 个点位 → M 次 refresh() → 每次都 setRowCount +
-        // 逐格 new QTableWidgetItem（17 列），复杂度 O(M × P × 17)。
+        // 逐格 new QTableWidgetItem（19 列），复杂度 O(M × P × 19)。
         // 100 个点位 + 100ms 定时读时 CPU 打满、界面几乎无法操作。
         // 改为 200ms 节流。
         if (!valueRefreshTimer->isActive())
@@ -1661,12 +2070,14 @@ void MainWindow::showPointManager()
             const QString valueText = (found && found->timestamp.isValid())
                                           ? QString::number(found->value, 'f', 3) : QStringLiteral("--");
             const QString qualityText = found ? pointQualityName(found->quality) : QStringLiteral("--");
-            if (QTableWidgetItem *it = table->item(row, 15)) it->setText(valueText);
-            else table->setItem(row, 15, new QTableWidgetItem(valueText));
-            if (QTableWidgetItem *it = table->item(row, 16)) it->setText(qualityText);
-            else table->setItem(row, 16, new QTableWidgetItem(qualityText));
+            if (QTableWidgetItem *it = table->item(row, 17)) it->setText(valueText);
+            else table->setItem(row, 17, new QTableWidgetItem(valueText));
+            if (QTableWidgetItem *it = table->item(row, 18)) it->setText(qualityText);
+            else table->setItem(row, 18, new QTableWidgetItem(qualityText));
         }
     });
+    // 关闭点位管理后按最新点表重建采集段：新增/修改/删除点位无需再手动点"生成轮询"。
+    connect(&dialog, &QDialog::finished, &dialog, [this]() { rebuildPointPollTasks(); });
     refresh(); dialog.exec();
 }
 

@@ -361,9 +361,8 @@ void ScannerDialog::createPollTaskForSelection()
         task.quantity = seed.quantity;
         task.intervalMs = seed.intervalMs;
         task.enabled = true;
-        task.alarmEnabled = seed.alarmEnabled;
-        task.alarmMin = 0.0;
-        task.alarmMax = 65535.0;
+        task.deviceId = 0;          // 扫描器使用主连接
+        task.fromPoints = false;    // 人工任务，点表重建时保留
         m_pollManager->removeTask(task.id);
         m_pollManager->addTask(task);
         ++added;

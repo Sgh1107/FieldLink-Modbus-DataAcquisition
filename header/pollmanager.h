@@ -11,15 +11,18 @@
 struct PollTask {
     int id = 0;
     QString name;
+    // 0 = 主连接；>0 = DeviceManager 设备。采集路径按此字段选择 Modbus client。
+    int deviceId = 0;
     int serverAddress = 1;
     QModbusDataUnit::RegisterType registerType = QModbusDataUnit::HoldingRegisters;
     int startAddress = 0;
     int quantity = 1;
     int intervalMs = 1000;
     bool enabled = true;
-    bool alarmEnabled = false;
-    double alarmMin = 0.0;
-    double alarmMax = 65535.0;
+    // 由点表自动生成的采集段所关联的点位 id（失败时据此精确降级质量码）
+    QVector<int> pointIds;
+    // 标记任务来源：点表重建时只清理/重建这一类任务
+    bool fromPoints = false;
 };
 
 class PollManager : public QObject
@@ -45,7 +48,6 @@ public:
 
 signals:
     void pollRequest(const PollTask &task);
-    void alarmTriggered(const PollTask &task, double value, const QString &message);
 
 private slots:
     void onTimerTimeout();

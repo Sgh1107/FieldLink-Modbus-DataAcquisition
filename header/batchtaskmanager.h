@@ -13,6 +13,7 @@ struct BatchTask {
     int id = 0;
     QString name;
     enum Type { Read, Write } type = Read;
+    int deviceId = 0;        // 0 = 主连接；>0 = DeviceManager 设备
     int serverAddress = 1;
     QModbusDataUnit::RegisterType registerType = QModbusDataUnit::HoldingRegisters;
     int startAddress = 0;
