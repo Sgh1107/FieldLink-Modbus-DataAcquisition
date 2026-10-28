@@ -1,4 +1,5 @@
 #include "pointmodel.h"
+#include <QCoreApplication>
 #include "dataparser.h"
 #include <QFile>
 #include <QSaveFile>
@@ -576,7 +577,7 @@ bool PointModel::exportToJson(const QString &filePath, QString *error) const
         arr.append(pointToJson(p));
     QFile file(filePath);
     if (!file.open(QIODevice::WriteOnly)) {
-        if (error) *error = QStringLiteral("无法写入文件：%1").arg(file.errorString());
+        if (error) *error = QCoreApplication::translate("PointModel", "Cannot write file: %1").arg(file.errorString());
         return false;
     }
     file.write(QJsonDocument(arr).toJson(QJsonDocument::Indented));
@@ -587,7 +588,7 @@ bool PointModel::exportToCsv(const QString &filePath, QString *error) const
 {
     QFile file(filePath);
     if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
-        if (error) *error = QStringLiteral("无法写入文件：%1").arg(file.errorString());
+        if (error) *error = QCoreApplication::translate("PointModel", "Cannot write file: %1").arg(file.errorString());
         return false;
     }
     QTextStream out(&file);
@@ -625,13 +626,13 @@ bool PointModel::importFromJson(const QString &filePath, bool append, int *impor
 {
     QFile file(filePath);
     if (!file.open(QIODevice::ReadOnly)) {
-        if (error) *error = QStringLiteral("无法读取文件：%1").arg(file.errorString());
+        if (error) *error = QCoreApplication::translate("PointModel", "Cannot read file: %1").arg(file.errorString());
         return false;
     }
     QJsonParseError parseError{};
     const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
     if (parseError.error != QJsonParseError::NoError || !doc.isArray()) {
-        if (error) *error = QStringLiteral("JSON 解析失败：%1").arg(parseError.errorString());
+        if (error) *error = QCoreApplication::translate("PointModel", "JSON parse failed: %1").arg(parseError.errorString());
         return false;
     }
     // 原子性：先解析到临时列表，确认有内容后再改动现有数据（与 CSV 导入保持一致）
@@ -644,14 +645,14 @@ bool PointModel::importFromJson(const QString &filePath, bool append, int *impor
         const QJsonObject obj = v.toObject();
         PointDefinition p = pointFromJson(obj);
         if (p.address < 0 || p.address > 65535) {
-            invalidReasons << QStringLiteral("第 %1 项：地址 %2 非法（应为 0~65535），已跳过").arg(row).arg(p.address);
+            invalidReasons << QCoreApplication::translate("PointModel", "Item %1: invalid address %2 (expected 0~65535), skipped").arg(row).arg(p.address);
             ++skipped;
             continue;
         }
         if (p.count < 1)
             p.count = 1;
         if (p.scale == 0.0) {
-            invalidReasons << QStringLiteral("第 %1 项：系数为 0，已重置为 1.0").arg(row);
+            invalidReasons << QCoreApplication::translate("PointModel", "Item %1: scale is 0, reset to 1.0").arg(row);
             p.scale = 1.0;
         }
         parsed.append(p);
@@ -660,7 +661,7 @@ bool PointModel::importFromJson(const QString &filePath, bool append, int *impor
     if (parsed.isEmpty()) {
         if (imported) *imported = 0;
         if (error) {
-            *error = QStringLiteral("未解析到有效点位（共 %1 项被跳过）。").arg(skipped);
+            *error = QCoreApplication::translate("PointModel", "No valid points parsed (%1 item(s) skipped).").arg(skipped);
             if (!invalidReasons.isEmpty())
                 *error += QStringLiteral("\n") + invalidReasons.mid(0, 10).join(QStringLiteral("\n"));
         }
@@ -676,7 +677,7 @@ bool PointModel::importFromJson(const QString &filePath, bool append, int *impor
         addPoint(p);
     if (imported) *imported = parsed.size();
     if (error && !invalidReasons.isEmpty()) {
-        *error = QStringLiteral("成功导入 %1 个点位；%2 项被修正/跳过：\n%3")
+        *error = QCoreApplication::translate("PointModel", "Imported %1 point(s); %2 item(s) corrected/skipped:\n%3")
                      .arg(parsed.size()).arg(skipped)
                      .arg(invalidReasons.mid(0, 10).join(QStringLiteral("\n")));
     }
@@ -687,7 +688,7 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
 {
     QFile file(filePath);
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        if (error) *error = QStringLiteral("无法读取文件：%1").arg(file.errorString());
+        if (error) *error = QCoreApplication::translate("PointModel", "Cannot read file: %1").arg(file.errorString());
         return false;
     }
     QTextStream in(&file);
@@ -780,7 +781,7 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
             const QString txt = cellOf(row, QStringLiteral("serveraddress"));
             const int v = txt.isEmpty() ? 1 : txt.toInt(&ok);
             if (!txt.isEmpty() && !ok) {
-                invalidReasons << QStringLiteral("第 %1 行：从站地址 '%2' 非法").arg(r + 1).arg(txt);
+                invalidReasons << QCoreApplication::translate("PointModel", "Line %1: invalid slave address '%2'").arg(r + 1).arg(txt);
                 ++skipped;
                 continue;
             }
@@ -799,7 +800,7 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
             bool ok = false;
             const int v = addrText.toInt(&ok);
             if (!addrText.isEmpty() && (!ok || v < 0 || v > 65535)) {
-                invalidReasons << QStringLiteral("第 %1 行：地址 '%2' 非法（应为 0~65535）").arg(r + 1).arg(addrText);
+                invalidReasons << QCoreApplication::translate("PointModel", "Line %1: invalid address '%2' (expected 0~65535)").arg(r + 1).arg(addrText);
                 ++skipped;
                 continue;
             }
@@ -812,7 +813,7 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
             const QString txt = cellOf(row, QStringLiteral("count"));
             const int v = txt.isEmpty() ? 1 : txt.toInt(&ok);
             if (!txt.isEmpty() && !ok) {
-                invalidReasons << QStringLiteral("第 %1 行：数量 '%2' 非法").arg(r + 1).arg(txt);
+                invalidReasons << QCoreApplication::translate("PointModel", "Line %1: invalid count '%2'").arg(r + 1).arg(txt);
                 ++skipped;
                 continue;
             }
@@ -832,7 +833,7 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
                 bool ok = false;
                 const ByteOrder bo = DataParser::byteOrderFromToken(tok, &ok);
                 if (!ok) {
-                    invalidReasons << QStringLiteral("第 %1 行：字节序 '%2' 无法识别，按 ABCD 处理").arg(r + 1).arg(tok);
+                    invalidReasons << QCoreApplication::translate("PointModel", "Line %1: unrecognized byte order '%2', using ABCD").arg(r + 1).arg(tok);
                 }
                 p.byteOrder = bo;
             }
@@ -847,7 +848,7 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
                 bool ok = false;
                 const double v = scaleText.toDouble(&ok);
                 if (!ok) {
-                    invalidReasons << QStringLiteral("第 %1 行：系数 '%2' 非法，按 1.0 处理").arg(r + 1).arg(scaleText);
+                    invalidReasons << QCoreApplication::translate("PointModel", "Line %1: invalid scale '%2', using 1.0").arg(r + 1).arg(scaleText);
                     p.scale = 1.0;
                 } else {
                     p.scale = v;
@@ -860,7 +861,7 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
                 bool ok = false;
                 const double v = offsetText.toDouble(&ok);
                 if (!ok) {
-                    invalidReasons << QStringLiteral("第 %1 行：偏移 '%2' 非法，按 0.0 处理").arg(r + 1).arg(offsetText);
+                    invalidReasons << QCoreApplication::translate("PointModel", "Line %1: invalid offset '%2', using 0.0").arg(r + 1).arg(offsetText);
                     p.offset = 0.0;
                 } else {
                     p.offset = v;
@@ -876,7 +877,7 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
             bool ok = false;
             const double low = lowText.isEmpty() ? 0.0 : lowText.toDouble(&ok);
             if (!lowText.isEmpty() && !ok) {
-                invalidReasons << QStringLiteral("第 %1 行：报警下限 '%2' 非法，按 0.0 处理").arg(r + 1).arg(lowText);
+                invalidReasons << QCoreApplication::translate("PointModel", "Line %1: invalid alarm low '%2', using 0.0").arg(r + 1).arg(lowText);
             }
             p.alarmLow = lowText.isEmpty() ? 0.0 : (ok ? low : 0.0);
 
@@ -884,7 +885,7 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
             bool ok2 = false;
             const double high = highText.isEmpty() ? 65535.0 : highText.toDouble(&ok2);
             if (!highText.isEmpty() && !ok2) {
-                invalidReasons << QStringLiteral("第 %1 行：报警上限 '%2' 非法，按 65535 处理").arg(r + 1).arg(highText);
+                invalidReasons << QCoreApplication::translate("PointModel", "Line %1: invalid alarm high '%2', using 65535").arg(r + 1).arg(highText);
             }
             p.alarmHigh = highText.isEmpty() ? 65535.0 : (ok2 ? high : 65535.0);
             if (p.alarmHigh <= p.alarmLow)
@@ -901,7 +902,7 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
             bool ok = false;
             const int deviceId = deviceText.isEmpty() ? 0 : deviceText.toInt(&ok);
             if (!deviceText.isEmpty() && (!ok || deviceId < 0)) {
-                invalidReasons << QStringLiteral("第 %1 行：设备ID '%2' 非法，按主连接处理").arg(r + 1).arg(deviceText);
+                invalidReasons << QCoreApplication::translate("PointModel", "Line %1: invalid device ID '%2', using the main connection").arg(r + 1).arg(deviceText);
                 p.deviceId = 0;
             } else {
                 p.deviceId = deviceId;
@@ -911,7 +912,7 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
             bool pollOk = false;
             const int pollSec = pollText.isEmpty() ? 1 : pollText.toInt(&pollOk);
             if (!pollText.isEmpty() && (!pollOk || pollSec < 1)) {
-                invalidReasons << QStringLiteral("第 %1 行：采集周期 '%2' 非法，按 1s 处理").arg(r + 1).arg(pollText);
+                invalidReasons << QCoreApplication::translate("PointModel", "Line %1: invalid poll interval '%2', using 1 s").arg(r + 1).arg(pollText);
                 p.pollIntervalSec = 1;
             } else {
                 p.pollIntervalSec = qBound(1, pollSec > 0 ? pollSec : 1, 86400);
@@ -921,14 +922,14 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
             bool deadbandOk = false;
             const double deadband = deadbandText.isEmpty() ? 0.0 : deadbandText.toDouble(&deadbandOk);
             if (!deadbandText.isEmpty() && (!deadbandOk || deadband < 0.0)) {
-                invalidReasons << QStringLiteral("第 %1 行：归档死区 '%2' 非法，按 0 处理").arg(r + 1).arg(deadbandText);
+                invalidReasons << QCoreApplication::translate("PointModel", "Line %1: invalid archive deadband '%2', using 0").arg(r + 1).arg(deadbandText);
                 p.archiveDeadband = 0.0;
             } else {
                 p.archiveDeadband = qMax(0.0, deadband);
             }
         }
         if (p.name.isEmpty())
-            p.name = QStringLiteral("点位%1").arg(p.address);
+            p.name = QCoreApplication::translate("PointModel", "Point %1").arg(p.address);
         parsed.append(p);
     }
 
@@ -936,7 +937,7 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
         // 一条有效点位都没有 → 视为导入失败，且不触碰现有点位
         if (imported) *imported = 0;
         if (error) {
-            *error = QStringLiteral("未解析到有效点位（共 %1 行被跳过），请检查表头或列顺序。").arg(skipped);
+            *error = QCoreApplication::translate("PointModel", "No valid points parsed (%1 line(s) skipped); check the header or column order.").arg(skipped);
             if (!invalidReasons.isEmpty())
                 *error += QStringLiteral("\n") + invalidReasons.mid(0, 10).join(QStringLiteral("\n"));
         }
@@ -955,7 +956,7 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
     // 部分行非法时导入仍然成功（好行已导入），但必须把被跳过的行与原因报告给用户，
     // 否则用户以为全部导入成功，实际部分点位静默丢失。
     if (error && !invalidReasons.isEmpty()) {
-        *error = QStringLiteral("成功导入 %1 个点位；%2 行被跳过：\n%3")
+        *error = QCoreApplication::translate("PointModel", "Imported %1 point(s); %2 line(s) skipped:\n%3")
                      .arg(parsed.size()).arg(skipped)
                      .arg(invalidReasons.mid(0, 10).join(QStringLiteral("\n")));
     }
@@ -994,7 +995,7 @@ bool PointModel::importAuto(const QString &filePath, bool append, int *imported,
     }
     // 两种格式都解析失败：给出合并后的错误信息，且不改动现有点位
     if (error)
-        *error = QStringLiteral("无法识别文件格式（既非 JSON 也非 CSV）。JSON 解析：%1；CSV 解析：%2")
+        *error = QCoreApplication::translate("PointModel", "Unrecognized file format (neither JSON nor CSV). JSON: %1; CSV: %2")
                      .arg(jsonError, csvError);
     if (imported) *imported = 0;
     return false;

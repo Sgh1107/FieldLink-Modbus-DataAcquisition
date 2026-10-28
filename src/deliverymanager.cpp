@@ -12,16 +12,16 @@
 DeliveryManager::DeliveryManager(QObject *parent)
     : QObject(parent)
 {
-    m_checklist << "安装包生成"
-                << "Qt依赖打包"
-                << "配置迁移验证"
-                << "日志打包路径确认"
-                << "崩溃日志路径确认"
-                << "用户手册"
-                << "维护手册"
-                << "版本发布说明"
-                << "运行环境检查"
-                << "回滚方案";
+    m_checklist << QCoreApplication::translate("DeliveryManager", "Installer build")
+                << QCoreApplication::translate("DeliveryManager", "Qt dependency packaging")
+                << QCoreApplication::translate("DeliveryManager", "Configuration migration check")
+                << QCoreApplication::translate("DeliveryManager", "Log package path check")
+                << QCoreApplication::translate("DeliveryManager", "Crash log path check")
+                << QCoreApplication::translate("DeliveryManager", "User manual")
+                << QCoreApplication::translate("DeliveryManager", "Maintenance manual")
+                << QCoreApplication::translate("DeliveryManager", "Release notes")
+                << QCoreApplication::translate("DeliveryManager", "Runtime environment check")
+                << QCoreApplication::translate("DeliveryManager", "Rollback plan");
 }
 
 QStringList DeliveryManager::checklist() const

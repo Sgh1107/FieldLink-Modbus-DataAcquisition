@@ -1,4 +1,5 @@
 ﻿#include "modbusdiagnostics.h"
+#include <QCoreApplication>
 
 #include <QRegularExpression>
 
@@ -24,7 +25,7 @@ bool parseHexBytes(const QString &text, QByteArray *out, QString *error)
 
     if (s.size() % 2 != 0) {
         if (error)
-            *error = QStringLiteral("十六进制字符数必须为偶数（每字节 2 个字符），当前 %1 个")
+            *error = QCoreApplication::translate("ModbusDiagnostics", "Hex character count must be even (2 per byte); got %1")
                          .arg(s.size());
         return false;
     }
@@ -35,7 +36,7 @@ bool parseHexBytes(const QString &text, QByteArray *out, QString *error)
         const int b = chunk.toInt(&ok, 16);
         if (!ok) {
             if (error)
-                *error = QStringLiteral("非法十六进制片段：%1").arg(chunk);
+                *error = QCoreApplication::translate("ModbusDiagnostics", "Invalid hex fragment: %1").arg(chunk);
             return false;
         }
         out->append(static_cast<char>(b & 0xFF));
@@ -62,16 +63,16 @@ QString hexBytes(const QByteArray &bytes)
 QString exceptionName(int exceptionCode)
 {
     switch (exceptionCode) {
-    case 0x01: return QStringLiteral("非法功能");
-    case 0x02: return QStringLiteral("非法数据地址");
-    case 0x03: return QStringLiteral("非法数据值");
-    case 0x04: return QStringLiteral("从站设备故障");
-    case 0x05: return QStringLiteral("确认(处理中)");
-    case 0x06: return QStringLiteral("从站设备忙");
-    case 0x08: return QStringLiteral("存储奇偶校验错");
-    case 0x0A: return QStringLiteral("网关路径不可用");
-    case 0x0B: return QStringLiteral("网关目标设备响应失败");
-    default:   return QStringLiteral("未知异常");
+    case 0x01: return QCoreApplication::translate("ModbusDiagnostics", "Illegal function");
+    case 0x02: return QCoreApplication::translate("ModbusDiagnostics", "Illegal data address");
+    case 0x03: return QCoreApplication::translate("ModbusDiagnostics", "Illegal data value");
+    case 0x04: return QCoreApplication::translate("ModbusDiagnostics", "Slave device failure");
+    case 0x05: return QCoreApplication::translate("ModbusDiagnostics", "Acknowledge (processing)");
+    case 0x06: return QCoreApplication::translate("ModbusDiagnostics", "Slave device busy");
+    case 0x08: return QCoreApplication::translate("ModbusDiagnostics", "Memory parity error");
+    case 0x0A: return QCoreApplication::translate("ModbusDiagnostics", "Gateway path unavailable");
+    case 0x0B: return QCoreApplication::translate("ModbusDiagnostics", "Gateway target device failed to respond");
+    default:   return QCoreApplication::translate("ModbusDiagnostics", "Unknown exception");
     }
 }
 
@@ -97,10 +98,10 @@ bool isValidFunctionCode(int code)
 // ==================== 扫描器逻辑 ====================
 
 static const ProbeOption kProbeOptions[] = {
-    { 0x03, QModbusDataUnit::HoldingRegisters, "03 读保持寄存器" },
-    { 0x01, QModbusDataUnit::Coils,            "01 读线圈" },
-    { 0x04, QModbusDataUnit::InputRegisters,   "04 读输入寄存器" },
-    { 0x02, QModbusDataUnit::DiscreteInputs,   "02 读离散输入" },
+    { 0x03, QModbusDataUnit::HoldingRegisters, "03 Read Holding Registers" },
+    { 0x01, QModbusDataUnit::Coils,            "01 Read Coils" },
+    { 0x04, QModbusDataUnit::InputRegisters,   "04 Read Input Registers" },
+    { 0x02, QModbusDataUnit::DiscreteInputs,   "02 Read Discrete Inputs" },
 };
 
 const ProbeOption *probeOptions()
@@ -130,17 +131,17 @@ bool validateScanRange(int startUnit, int endUnit, int *totalOut, QString *error
     // 0 为广播地址，不能用于扫描（广播请求从站不响应）
     if (startUnit < 1 || startUnit > 247) {
         if (error)
-            *error = QStringLiteral("起始地址必须在 1~247 之间（0 为广播地址，不可扫描）。");
+            *error = QCoreApplication::translate("ModbusDiagnostics", "Start address must be 1~247 (0 is the broadcast address and cannot be scanned).");
         return false;
     }
     if (endUnit < 1 || endUnit > 247) {
         if (error)
-            *error = QStringLiteral("结束地址必须在 1~247 之间（0 为广播地址，不可扫描）。");
+            *error = QCoreApplication::translate("ModbusDiagnostics", "End address must be 1~247 (0 is the broadcast address and cannot be scanned).");
         return false;
     }
     if (endUnit < startUnit) {
         if (error)
-            *error = QStringLiteral("结束地址必须不小于起始地址。");
+            *error = QCoreApplication::translate("ModbusDiagnostics", "End address must not be less than the start address.");
         return false;
     }
 
@@ -155,7 +156,7 @@ PollTaskSeed makePollTaskSeed(int unit, int functionCode, int startAddress, int 
 {
     PollTaskSeed seed;
     seed.id = 20000000 + unit;   // 稳定可重现：同一从站重复生成会覆盖同一条任务
-    seed.name = QStringLiteral("扫描生成-从站%1").arg(unit);
+    seed.name = QCoreApplication::translate("ModbusDiagnostics", "Scan result - slave %1").arg(unit);
     seed.serverAddress = unit;
     seed.registerType = registerTypeForFunctionCode(functionCode);
     seed.startAddress = qMax(0, startAddress);
@@ -169,7 +170,7 @@ PollTaskSeed makePollTaskSeed(int unit, int functionCode, int startAddress, int 
 
 QString scanProgressText(int scanned, int total, int found)
 {
-    return QStringLiteral("已扫描 %1/%2，发现 %3 个在线从站")
+    return QCoreApplication::translate("ModbusDiagnostics", "Scanned %1/%2, found %3 online slave(s)")
         .arg(scanned).arg(total).arg(qMax(0, found));
 }
 

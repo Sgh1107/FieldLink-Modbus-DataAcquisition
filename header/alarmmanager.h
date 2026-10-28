@@ -60,7 +60,16 @@ struct AlarmEvent {
     double value = 0.0;
     bool acknowledged = false;
     QDateTime acknowledgedTime;
+    // 事件上下文：规则被删除后，持久化的事件仍能说明"哪个设备/点位/地址"报的警。
+    int deviceId = 0;
+    int pointId = 0;
+    int serverAddress = 0;
+    int registerType = 0;
+    int address = 0;
+    AlarmCondition condition = AlarmCondition::GreaterThan;
 };
+
+class AlarmRepository;
 
 class AlarmManager : public QObject
 {
@@ -68,6 +77,12 @@ class AlarmManager : public QObject
 
 public:
     explicit AlarmManager(QObject *parent = nullptr);
+
+    // 注入 SQLite 持久化层。若当前内存为空，会立即恢复已保存的规则/事件/活跃状态；
+    // 数据库不可用时报警逻辑继续在内存工作，只发 storageError 提示。
+    void setRepository(AlarmRepository *repository);
+    AlarmRepository *repository() const { return m_repository; }
+    bool reloadPersistedState();
 
     int addRule(const AlarmRule &rule);
     void removeRule(int ruleId);
@@ -98,6 +113,8 @@ signals:
     void alarmTriggered(const AlarmEvent &event);
     void alarmCleared(int ruleId);
     void alarmAcknowledged(qint64 eventId);
+    // 持久化失败（磁盘满/数据库被占用等）。同一次故障只发一次，避免刷屏。
+    void storageError(const QString &message);
 
 private:
     bool evaluateCondition(const AlarmRule &rule, double value) const;
@@ -112,6 +129,14 @@ private:
     static quint64 pointKey(int deviceId, int pointId);
     // 共用的边沿/去抖判定：checkValue 与 checkPointValue 都走这里。
     void evaluateCandidates(const QVector<int> &candidateIds, double value);
+
+    void persistRule(const AlarmRule &rule);
+    void persistEvent(const AlarmEvent &event);
+    void persistState(int ruleId, bool active, const QDateTime &lastTriggerTime);
+    void reportStorageError(const QString &message);
+
+    AlarmRepository *m_repository = nullptr;
+    bool m_storageErrorReported = false;
 
     QVector<int> m_ruleOrder;                            // 规则 id（保持添加顺序）
     QHash<int, AlarmRule> m_ruleMap;                      // 规则 id -> 规则定义

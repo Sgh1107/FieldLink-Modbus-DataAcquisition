@@ -23,12 +23,19 @@ void VerificationManager::generateDefaultPlan()
 {
     if (!m_items.isEmpty())
         return;
-    addResult("通信测试", "Modbus模拟从站测试", "使用模拟从站覆盖01/02/03/04/0F/10/17功能码", "待执行/可记录");
-    addResult("长稳测试", "24/72/168小时长稳测试", "连续轮询、写入、历史归档和导出监控", "待执行/可记录");
-    addResult("内存测试", "内存泄露测试", "长时间轮询观察内存曲线与对象释放", "待执行/可记录");
-    addResult("压力测试", "高并发轮询测试", "多任务、多点位、多设备轮询压力验证", "待执行/可记录");
-    addResult("异常测试", "异常断线测试", "TCP断线、串口拔插、从站无响应自动恢复", "待执行/可记录");
-    addResult("数据库测试", "数据库写入压力测试", "历史归档、清理策略、磁盘异常验证", "待执行/可记录");
+    const QString pending = tr("Pending / recordable");
+    addResult(tr("Communication test"), tr("Modbus simulator test"),
+              tr("Cover function codes 01/02/03/04/0F/10/17 with a simulated slave"), pending);
+    addResult(tr("Soak test"), tr("24/72/168-hour soak test"),
+              tr("Continuous polling, writes, history archiving and export monitoring"), pending);
+    addResult(tr("Memory test"), tr("Memory leak test"),
+              tr("Long-running polling to observe memory curves and object release"), pending);
+    addResult(tr("Stress test"), tr("High-concurrency polling test"),
+              tr("Multi-task, multi-point and multi-device polling stress validation"), pending);
+    addResult(tr("Exception test"), tr("Abnormal disconnect test"),
+              tr("TCP disconnect, serial unplug/replug and auto recovery from unresponsive slaves"), pending);
+    addResult(tr("Database test"), tr("Database write stress test"),
+              tr("Validate history archiving, cleanup policy and disk anomalies"), pending);
 }
 
 bool VerificationManager::exportReport(const QString &filePath) const

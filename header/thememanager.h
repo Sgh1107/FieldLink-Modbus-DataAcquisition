@@ -33,8 +33,8 @@ inline QStringList availableThemes()
 inline QString themeDisplayName(const QString &themeId)
 {
     if (themeId == QLatin1String("light"))
-        return QStringLiteral("浅色现代风");
-    return QStringLiteral("深色工业风");
+        return QCoreApplication::translate("ThemeManager", "Light Modern");
+    return QCoreApplication::translate("ThemeManager", "Dark Industrial");
 }
 
 inline QString normalizedThemeId(const QString &themeId)

@@ -10,6 +10,7 @@
 #include <QMap>
 #include <QHash>
 #include <QSet>
+#include <QScopedPointer>
 #include <functional>
 
 QT_BEGIN_NAMESPACE
@@ -38,6 +39,7 @@ class RemoteServer;
 class HistoryData;
 class PluginManager;
 class AlarmManager;
+class AlarmRepository;
 class BatchTaskManager;
 class Dashboard;
 class ConfigProfileManager;
@@ -113,6 +115,7 @@ private slots:
     void showScriptConsole();
     void toggleRemoteServer();
     void showMqttSettings();
+    void showDatabaseSettings();               // SQLite 数据库文件路径 / 连接状态配置
     void showDeviceSimulator();
     void showPluginManager();
     void showPointManager();
@@ -132,6 +135,9 @@ private slots:
     void publishMqttTelemetry(int deviceId, int serverAddress, int registerType, int startAddress,
                               const QVector<quint16> &values);
     void publishMqttStatus(bool connected);
+    // MQTT 是否被用户启用（mqtt/enabled）。未启用时采集/报警不应写入离线队列，
+    // 否则长期不接 MQTT 的现场会白白占用磁盘并堆积无意义消息。
+    bool mqttPublishEnabled() const;
     void askReconnectAfterRemoteClose();   // 对端主动断开：弹窗询问用户是否重连
 
 private:
@@ -178,6 +184,7 @@ private:
     HistoryData *m_historyData;
     PluginManager *m_pluginManager;
     AlarmManager *m_alarmManager;
+    QScopedPointer<AlarmRepository> m_alarmRepository;   // 报警规则/事件/状态持久化
     BatchTaskManager *m_batchTaskManager;
     Dashboard *m_dashboard;
     ConfigProfileManager *m_configProfileManager;

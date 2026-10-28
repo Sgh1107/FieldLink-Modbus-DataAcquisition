@@ -35,6 +35,7 @@ SOURCES += src/main.cpp\
         src/historydata.cpp \
         src/pluginmanager.cpp \
         src/alarmmanager.cpp \
+        src/alarmrepository.cpp \
         src/batchtaskmanager.cpp \
         src/dashboard.cpp \
         src/configprofile.cpp \
@@ -45,6 +46,7 @@ SOURCES += src/main.cpp\
         src/deliverymanager.cpp \
         src/crashlogger.cpp \
         src/mqttclient.cpp \
+        src/mqttoutbox.cpp \
         src/devicesimulator.cpp \
         src/rawrequestdialog.cpp \
         src/scannerdialog.cpp \
@@ -66,6 +68,7 @@ HEADERS  += header/mainwindow.h \
         header/plugininterface.h \
         header/pluginmanager.h \
         header/alarmmanager.h \
+        header/alarmrepository.h \
         header/batchtaskmanager.h \
         header/dashboard.h \
         header/configprofile.h \
@@ -77,6 +80,7 @@ HEADERS  += header/mainwindow.h \
         header/crashlogger.h \
         header/thememanager.h \
         header/mqttclient.h \
+        header/mqttoutbox.h \
         header/credentialcodec.h \
         header/devicesimulator.h \
         header/rawrequestdialog.h \

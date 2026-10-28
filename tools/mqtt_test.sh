@@ -82,7 +82,7 @@ run_e2e() {
   # qmake 在 Windows 上需要 Windows 格式路径（D:/...），而 $ROOT 是 /c/...
   local wroot="${ROOT/\/c\//C:/}"
   cat > "$build/mqtt_e2e.pro" << EOF
-QT += core network serialport
+QT += core network serialport sql
 QT -= gui
 CONFIG += c++11 console
 CONFIG -= app_bundle
@@ -90,8 +90,9 @@ TEMPLATE = app
 TARGET = mqtt_e2e
 INCLUDEPATH += $wroot/header
 SOURCES += $wroot/tools/mqtt_e2e.cpp \\
-    $wroot/src/mqttclient.cpp
-HEADERS += $wroot/header/mqttclient.h $wroot/header/credentialcodec.h
+    $wroot/src/mqttclient.cpp \\
+    $wroot/src/mqttoutbox.cpp
+HEADERS += $wroot/header/mqttclient.h $wroot/header/mqttoutbox.h $wroot/header/credentialcodec.h
 EOF
   ( cd "$build" && qmake.exe mqtt_e2e.pro "CONFIG+=release" >q.log 2>&1 \
     && mingw32-make.exe -j8 >b.log 2>&1 )

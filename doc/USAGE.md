@@ -24,6 +24,8 @@
 15. 常见问题 FAQ
 16. Modbus 调试工具（原始功能码窗 / 总线扫描器）
 17. 点表批量导入导出
+18. 数据库文件与外部查看
+19. 界面语言与翻译
 
 ---
 
@@ -170,7 +172,7 @@
 
 ## 七、历史数据查询与 CSV 导出
 
-- 所有读取成功的数据（手动读、Auto read、轮询、批量读）**自动写入 SQLite**（程序目录 `history.db`，免安装），同时保存两类数据：
+- 所有读取成功的数据（手动读、Auto read、轮询、批量读）**自动写入 SQLite**（默认 `%APPDATA%\fieldlink\fieldlink\history.db`，可用 Advanced → Database Settings 修改），同时保存两类数据：
   - **原始寄存器块**：按 从站/寄存器类型/起始地址 存储，用于报文级追溯；
   - **工程值**：按 设备/点位 存储，含 scale/offset 换算后的值与质量码，用于报表、趋势与聚合；
 - 菜单 View → 历史查询支持两种模式：
@@ -198,6 +200,12 @@
 4. 触发时：报警事件入历史、仪表盘告警日志记录、（若启用 MQTT）上送 `fieldlink/alarm/triggered`；
 5. 支持单条确认 / 全部确认 / 报警历史查询；条件解除后自动"清除"。
 
+### 持久化与重启恢复
+- 规则、事件、确认状态以及"当前是否处于报警中"写入独立数据库 `alarms.db`（默认与 `history.db` 同目录，可用配置项 `alarm/dbPath` 覆盖），与高频历史写入分库，避免锁竞争；
+- 重启后规则、历史与活跃报警自动恢复；已在报警中的规则**不会重复触发**，条件解除后正常清除；
+- 删除规则会级联删除该规则的事件与状态；「清空历史」只删除事件，保留规则与活动状态；
+- 数据库不可用时自动降级为纯内存运行（运行日志提示一次），报警判定与 UI 不受影响，但重启会丢失数据。
+
 搭配建议：reg1（随机游走）配一条"大于 4000 报警"规则，跑几分钟必触发，方便演练报警→MQTT 全链路。
 
 ---
@@ -206,8 +214,10 @@
 
 ### 配置与使用
 1. 菜单 **Advanced → MQTT Publishing**；
-2. 填 Broker 地址（默认 `127.0.0.1:1883`）、ClientID（留空自动生成）、用户名/密码（**保存后混淆存储，不明文落盘**）、主题前缀（默认 `fieldlink/`）、KeepAlive；
-3. 点「保存并连接」→ 之后每次启动自动重连 broker；「断开」停止上送。
+2. 填 Broker 地址（默认 `127.0.0.1:1883`）、ClientID（留空自动生成）、用户名/密码（**保存后混淆存储，不明文落盘**）、主题前缀（默认 `fieldlink/`）、KeepAlive、**发布 QoS（0/1）**；
+3. **离线队列默认开启**：断线期间的遥测/状态/报警消息落盘到 `mqtt_outbox.db`（默认 `AppDataLocation`，可用 `mqtt/outboxPath` 覆盖，或在 **Advanced → Database Settings** 中修改），重连后按 **报警 > 状态 > 遥测** 顺序补发；可在同一对话框查看积压条数、调整条数上限或清空队列；
+4. 队列默认上限 **10000 条 / 32 MB**（`mqtt/outboxMaxMessages` / `mqtt/outboxMaxBytes`），超限时优先淘汰最旧的低优先级消息，报警消息最后被淘汰；
+5. 点「保存并连接」→ 之后每次启动自动重连 broker；「断开」停止上送。
 
 ### 自动发布的主题
 
@@ -237,7 +247,7 @@ mosquitto_sub -t "fieldlink/#" -v
 build\release\fieldlink_tests.exe
 ```
 
-可靠性设计：断线每 5 秒自动重连（认证被拒不重试）；断连期间消息**静默丢弃不刷屏**（每个断连周期只报一次告警）；支持 QoS 0 / QoS 1（QoS1 有 PUBACK 确认 + 超时 DUP 重发）；KeepAlive/2 周期心跳。
+可靠性设计：断线每 5 秒自动重连（认证被拒不重试）；启用离线队列时断线消息**落盘并在重连后补发**（报警优先），关闭队列时退回旧的丢弃策略（每个断连周期只告警一次，不刷屏）；支持 QoS 0 / QoS 1（QoS1 有 PUBACK 确认 + 超时 DUP 重发；未确认消息在断线或程序退出时重新入队，不静默丢失）；KeepAlive/2 周期心跳。
 
 ---
 
@@ -366,7 +376,7 @@ data 消息由**轮询/批量读取成功**触发，先确认有轮询任务在�
 默认账号 admin/admin123 与初始密码 123456 都带强制改密标记，改完即解除。
 
 **Q6：历史数据存哪？会不会无限膨胀？**
-程序目录 `history.db`（SQLite）；超过 30 天的数据在写入过程中自动清理。
+默认 `%APPDATA%\fieldlink\fieldlink\history.db`（SQLite，可用 Advanced → Database Settings 修改）；超过 30 天的数据在写入过程中自动清理。报警库 `alarms.db` 与 MQTT 离线队列 `mqtt_outbox.db` 的位置见第十八节。
 
 **Q7：测试怎么跑？**
 `tests/` 目录：`qmake tests.pro && mingw32-make`，运行 `fieldlink_tests.exe`，退出码 0 = 全部通过；CI（GitHub Actions, Qt 6）每次 push 自动回归。
@@ -432,5 +442,101 @@ data 消息由**轮询/批量读取成功**触发，先确认有轮询任务在�
 解析失败（缺列、格式错误）会给出明确提示，且**不会**破坏现有点位；导入成功后自动落盘到程序目录 `points.json`。
 
 **导出**：按扩展名选择 CSV 或 JSON；CSV 带 UTF-8 BOM，Excel 直接打开不乱码；字段按需加引号转义。
+
+---
+
+## 十八、数据库文件与外部查看
+
+### 1. 三个库，各管一摊
+
+FieldLink 使用 **嵌入式 SQLite**（Qt 自带 `QSQLITE` 驱动），不需要安装数据库服务、不需要账号密码，也不需要手工建库建表。
+
+| 数据库 | 内容 | 默认路径 | 配置键 |
+| --- | --- | --- | --- |
+| `history.db` | `history` 原始寄存器块、`point_history` 工程值归档 | `%APPDATA%\fieldlink\fieldlink\history.db` | `history/dbPath` |
+| `alarms.db` | `alarm_rules` 规则、`alarm_events` 事件、`alarm_states` 活动状态 | 与 `history.db` 同目录 | `alarm/dbPath` |
+| `mqtt_outbox.db` | `mqtt_outbox` 待补发消息 | `%APPDATA%\fieldlink\fieldlink\mqtt_outbox.db` | `mqtt/outboxPath` |
+
+- 文件不存在时自动创建；每次打开都会执行 `CREATE TABLE IF NOT EXISTS` 与建索引（幂等），因此**不需要任何手工建表脚本**；
+- 三个库都启用 `journal_mode=WAL`、`synchronous=NORMAL`、`busy_timeout=3000`，历史高频写入与报警写入互不阻塞；
+- 报警库与历史库分库，是为了避免报警写入被历史批量事务拖慢。
+
+### 2. 修改路径与连通性自检
+
+菜单 **Advanced → Database Settings**：
+
+1. 三个路径各自有输入框与「Browse…」；
+2. **Test Connections**：用独立连接逐个打开并执行只读语句，不会影响正在使用的连接；
+3. **Save**：历史库与报警库**立即切换**（打开失败自动回滚到原路径）；切到空的报警库时，会把当前内存中的规则写入新库，避免切换即丢规则；
+4. MQTT 离线队列路径在**下次打开队列时**生效（通常是下次启用 MQTT 或重连）。
+
+> 对尚不存在的路径点 Test Connections 会生成一个 0 字节空文件（SQLite 行为），不建表，无害。
+
+### 3. 用 Navicat / DB Browser 查看
+
+1. Navicat Premium（或 Navicat for SQLite）→ **连接 → SQLite** → 选择对应的 `.db` 文件 → 测试连接；
+2. 三个库需要分别建连接（一个连接对应一个文件）；
+3. 免费替代品 **DB Browser for SQLite** 对 WAL 支持更直接，排查数据更省事。
+
+字段约定：
+
+- `history` / `point_history` 的 `timestamp` 是 **ISO8601 文本**（本地时间，如 `2026-10-28T15:07:47.123`）；
+- `alarm_events.timestamp_ms`、`alarm_states.last_trigger_ms`、`mqtt_outbox.created_ms` 是**毫秒时间戳**，查询时用 `datetime(ts/1000,'unixepoch','localtime')` 转本地时间；
+- `history.values_data` 是**逗号分隔的十进制寄存器值**（如 `100,200,300`），不是 JSON；
+- 枚举：`register_type` 0=离散输入 1=线圈 2=输入寄存器 3=保持寄存器；`quality` 0=Good 1=Bad 2=Timeout 3=OutOfRange 4=Unknown；`cond` 0=`>` 1=`<` 2=`==` 3=`!=` 4=区间内 5=区间外 6=置位 7=清零；`severity` 0=Info 1=Warning 2=Critical；`mqtt_outbox.priority` 0=遥测 1=状态 2=报警；
+- `mqtt_outbox.payload` 是 **BLOB**，查看时用 `CAST(payload AS TEXT)`。
+
+常用查询：
+
+```sql
+-- 最近 50 条工程值
+SELECT timestamp, device_id, point_name, value, quality
+FROM point_history ORDER BY timestamp DESC LIMIT 50;
+
+-- 当前活跃报警
+SELECT rule_id, active,
+       datetime(last_trigger_ms/1000,'unixepoch','localtime') AS last_trigger
+FROM alarm_states WHERE active = 1;
+
+-- 报警事件（含确认状态）
+SELECT datetime(timestamp_ms/1000,'unixepoch','localtime') AS time,
+       rule_name, severity, alarm_value, message, acknowledged
+FROM alarm_events ORDER BY timestamp_ms DESC LIMIT 50;
+
+-- 待补发的 MQTT 消息
+SELECT id, topic, priority, qos, CAST(payload AS TEXT) AS payload_text,
+       datetime(created_ms/1000,'unixepoch','localtime') AS created
+FROM mqtt_outbox ORDER BY priority DESC, id;
+```
+
+### 4. 注意事项
+
+- **WAL**：运行中最新数据可能还在 `xxx.db-wal` 里。外部工具看不到最新记录时，先关闭 FieldLink 再刷新；
+- **备份**：运行中备份必须把 `xxx.db`、`xxx.db-wal`、`xxx.db-shm` 三个文件一起拷，只拷 `.db` 会丢最近写入；
+- **不要在程序运行时改表**：报警规则在启动时载入内存，直接改 `alarm_rules` 界面不会刷新，下次保存还可能被覆盖；要改请关程序改，或用界面改；
+- **不要改日志模式、不要 VACUUM**：外部工具若提示把 journal mode 改成 DELETE，选「否」；
+- **发布包要带 `sqldrivers/qsqlite.dll`**（`windeployqt` 会自动拷贝）。缺失时报 `QSQLITE driver not loaded`，表现为历史归档不可用、报警退化为仅内存、MQTT 离线队列打不开。
+
+### 5. 更省事的查看方式
+
+日常排查用程序自带的 **View → 历史查询**（工程值/原始寄存器两种模式、时间与设备筛选、1m/5m/1h 聚合、导出 CSV）即可，不需要外部工具；Navicat 更适合跨表统计和长期趋势分析。
+
+---
+
+## 十九、界面语言与翻译
+
+- 切换入口：菜单 **Options → Language → 简体中文 / English**，立即生效并记忆到 `ui/language`；
+- 源码以**英文**为翻译源（`tr()` / `QCoreApplication::translate()`），`translations/fieldlink_zh_CN.ts` 提供简体中文；构建期由 `lrelease` 编译为 `.qm` 并嵌入资源，无需随包分发语言文件；
+- 英文模式下不安装 translator，直接显示源码英文；
+- 新增界面文案请一律用 `tr("English text")`（静态表用 `QT_TRANSLATE_NOOP` + `QCoreApplication::translate`），改完执行：
+
+```bash
+lupdate fieldlink.pro -ts translations/fieldlink_zh_CN.ts
+# 补全 type="unfinished" 的条目
+lrelease translations/fieldlink_zh_CN.ts -qm build/release/fieldlink_zh_CN.qm
+```
+
+- 刻意不翻译的内容：CSV/JSON 表头别名与解析记号（兼容既有文件）、自动生成的 Markdown 报告正文与文件名、开发者日志（`qWarning`/审计信息）。
+
 
 

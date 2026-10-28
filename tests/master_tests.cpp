@@ -58,6 +58,10 @@ void runSecurityConfigTests();
 void runP0FeatureTests();
 int p0FeaturePassed();
 int p0FeatureFailed();
+// P1 报警持久化 / MQTT 离线队列回归（定义在 test_p1_alarm_mqtt.cpp）
+void runP1AlarmMqttTests();
+int p1AlarmMqttPassed();
+int p1AlarmMqttFailed();
 
 // 全局开关：为 true 时跳过"依赖真实时间等待"的慢速用例。
 // 慢速用例必须等真实的连接超时/重连定时器（数秒到数十秒），
@@ -1202,9 +1206,9 @@ static void testDiagExceptionNames()
     printf("\n=== ModbusDiagnostics DG3 异常码解析 ===\n");
     struct Case { int code; const char *keyword; };
     const Case cases[] = {
-        { 0x01, "非法功能" }, { 0x02, "非法数据地址" }, { 0x03, "非法数据值" },
-        { 0x04, "设备故障" }, { 0x05, "确认" },        { 0x06, "忙" },
-        { 0x08, "奇偶校验" }, { 0x0A, "网关路径" },    { 0x0B, "网关目标" },
+        { 0x01, "Illegal function" }, { 0x02, "Illegal data address" }, { 0x03, "Illegal data value" },
+        { 0x04, "device failure" },  { 0x05, "Acknowledge" },           { 0x06, "busy" },
+        { 0x08, "parity" },          { 0x0A, "Gateway path" },          { 0x0B, "Gateway target" },
     };
     for (const Case &c : cases) {
         const QString name = ModbusDiagnostics::exceptionName(c.code);
@@ -1214,14 +1218,14 @@ static void testDiagExceptionNames()
     }
     // 规范里 0x07 / 0x09 未定义，0x0C+ 为厂商自定义
     for (int code : { 0x00, 0x07, 0x09, 0x0C, 0x0D, 0xFF }) {
-        CHECK(QStringLiteral("DG3: 未定义异常码 0x%1 → 「未知异常」（非空）")
+        CHECK(QStringLiteral("DG3: 未定义异常码 0x%1 → 「Unknown exception」（非空）")
                   .arg(code, 2, 16, QLatin1Char('0')),
-              ModbusDiagnostics::exceptionName(code) == QStringLiteral("未知异常"));
+              ModbusDiagnostics::exceptionName(code) == QStringLiteral("Unknown exception"));
     }
     for (const Case &c : cases) {
         CHECK(QStringLiteral("DG3: 异常码 0x%1 不退化为未知")
                   .arg(c.code, 2, 16, QLatin1Char('0')),
-              ModbusDiagnostics::exceptionName(c.code) != QStringLiteral("未知异常"));
+              ModbusDiagnostics::exceptionName(c.code) != QStringLiteral("Unknown exception"));
     }
 }
 
@@ -1320,13 +1324,13 @@ static void testDiagScanRangeValidation()
     total = -1;
     CHECK("DG6: 100..1 非法（结束<起始）",
           !ModbusDiagnostics::validateScanRange(100, 1, &total, &err));
-    CHECK("DG6: 结束<起始时给出错误说明", err.contains(QStringLiteral("不小于")));
+    CHECK("DG6: 结束<起始时给出错误说明", err.contains(QStringLiteral("not be less than")));
     CHECK("DG6: 失败时 total 输出为 0", total == 0);
 
     err.clear();
     CHECK("DG6: 起始 0 非法（广播地址不可扫描）",
           !ModbusDiagnostics::validateScanRange(0, 10, &total, &err));
-    CHECK("DG6: 起始 0 的错误说明提到广播", err.contains(QStringLiteral("广播")));
+    CHECK("DG6: 起始 0 的错误说明提到广播", err.contains(QStringLiteral("broadcast")));
     err.clear();
     CHECK("DG6: 结束 0 非法", !ModbusDiagnostics::validateScanRange(1, 0, &total, &err));
     err.clear();
@@ -1453,15 +1457,15 @@ static void testDiagScanProgress()
     printf("\n=== ModbusDiagnostics DG9 扫描进度文案 ===\n");
     CHECK("DG9: 0/16/0 文案",
           ModbusDiagnostics::scanProgressText(0, 16, 0)
-              == QStringLiteral("已扫描 0/16，发现 0 个在线从站"));
+              == QStringLiteral("Scanned 0/16, found 0 online slave(s)"));
     CHECK("DG9: 8/16/2 文案",
           ModbusDiagnostics::scanProgressText(8, 16, 2)
-              == QStringLiteral("已扫描 8/16，发现 2 个在线从站"));
+              == QStringLiteral("Scanned 8/16, found 2 online slave(s)"));
     CHECK("DG9: 16/16/16 文案",
           ModbusDiagnostics::scanProgressText(16, 16, 16)
-              == QStringLiteral("已扫描 16/16，发现 16 个在线从站"));
+              == QStringLiteral("Scanned 16/16, found 16 online slave(s)"));
     CHECK("DG9: 负数 found 被夹为 0",
-          ModbusDiagnostics::scanProgressText(1, 16, -5).contains(QStringLiteral("发现 0")));
+          ModbusDiagnostics::scanProgressText(1, 16, -5).contains(QStringLiteral("found 0")));
 }
 // ---- PM1: JSON 往返无损 ----
 static void testPointModelJsonRoundTrip()
@@ -1797,7 +1801,7 @@ static void testPointModelImportAtomicity()
         CHECK("PM5: 全无效行时现有点点未被清空（原子性）", m.points().size() == keep.size());
         CHECK("PM5: 全无效行时点位内容完好", !m.points().isEmpty()
               && m.points().first().name == expectName);
-        CHECK("PM5: 全无效行时错误信息提示检查表头", err.contains(QStringLiteral("表头")));
+        CHECK("PM5: 全无效行时错误信息提示检查表头", err.contains(QStringLiteral("header")));
     }
 
     {   // 5.5b 完全是空行/空单元格（无任何内容）→ 视为「无内容可导入」，返回 true 但不改动数据
@@ -2267,6 +2271,11 @@ int main(int argc, char *argv[])
     runP0FeatureTests();
     g_passed += p0FeaturePassed();
     g_failed += p0FeatureFailed();
+
+    // P1 报警持久化 / MQTT 离线队列回归
+    runP1AlarmMqttTests();
+    g_passed += p1AlarmMqttPassed();
+    g_failed += p1AlarmMqttFailed();
 
     printf("\n==== 汇总 ====\n");
     printf("PASS: %d  FAIL: %d  已确认已知问题: %d\n", g_passed, g_failed, g_issuesConfirmed);

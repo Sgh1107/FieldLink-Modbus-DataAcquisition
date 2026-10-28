@@ -2,6 +2,7 @@
 #include "settingsdialog.h"
 #include "ui_settingsdialog.h"
 #include <QComboBox>
+#include <QEvent>
 #include <QList>
 
 SettingsDialog::SettingsDialog(QWidget *parent) :
@@ -10,18 +11,11 @@ SettingsDialog::SettingsDialog(QWidget *parent) :
 {
     ui->setupUi(this);
 
-    setWindowTitle("通信参数设置");
+    // 所有可见文字均来自 settingsdialog.ui（英文源文），
+    // 由 QTranslator 提供中文译文；这里不再硬编码中文，
+    // 否则切换语言时该对话框会始终显示中文。
     resize(560, 500);
     setMinimumSize(520, 460);
-
-    ui->groupBox->setTitle("  串口参数 / Serial Parameters  ");
-    ui->label->setText("响应超时:");
-    ui->label_2->setText("校验位:");
-    ui->label_3->setText("波特率:");
-    ui->label_4->setText("数据位:");
-    ui->label_5->setText("停止位:");
-    ui->label_6->setText("重试次数:");
-    ui->applyButton->setText("应用参数");
 
     ui->gridLayout->setContentsMargins(24, 24, 24, 24);
     ui->gridLayout->setHorizontalSpacing(14);
@@ -44,10 +38,6 @@ SettingsDialog::SettingsDialog(QWidget *parent) :
 
     // 界面样式跟随全局主题（见 thememanager.h / style/*.qss），
     // “应用”按钮的主色强调在各主题 QSS 中以 QPushButton#applyButton 定义。
-
-    // 设置对话框标题
-    setWindowTitle("通信参数设置");
-
 
     ui->parityCombo->setCurrentIndex(1);
     ui->baudCombo->setCurrentText(QString::number(m_settings.baud));
@@ -73,6 +63,14 @@ SettingsDialog::SettingsDialog(QWidget *parent) :
 
         hide();
     });
+}
+
+// 运行时切换界面语言时重新翻译 .ui 内的文字。
+void SettingsDialog::changeEvent(QEvent *event)
+{
+    if (event->type() == QEvent::LanguageChange)
+        ui->retranslateUi(this);
+    QDialog::changeEvent(event);
 }
 
 // 下拉框下标 → QSerialPort::Parity 枚举值。

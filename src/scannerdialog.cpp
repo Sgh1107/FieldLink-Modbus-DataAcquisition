@@ -3,6 +3,7 @@
 #include "modbusdiagnostics.h"
 
 #include <QModbusClient>
+#include <QCoreApplication>
 #include <QModbusReply>
 #include <QModbusRequest>
 #include <QModbusResponse>
@@ -34,13 +35,13 @@ ScannerDialog::ScannerDialog(std::function<QModbusClient *()> clientProvider,
     , m_clientProvider(std::move(clientProvider))
     , m_pollManager(pollManager)
 {
-    setWindowTitle(QStringLiteral("Modbus 总线扫描器"));
+    setWindowTitle(tr("Modbus Bus Scanner"));
     resize(820, 620);
 
     auto *layout = new QVBoxLayout(this);
 
     // ---------- 扫描参数 ----------
-    auto *cfgGroup = new QGroupBox(QStringLiteral("扫描参数"), this);
+    auto *cfgGroup = new QGroupBox(tr("Scan parameters"), this);
     auto *form = new QFormLayout(cfgGroup);
 
     auto *rangeRow = new QHBoxLayout();
@@ -54,20 +55,20 @@ ScannerDialog::ScannerDialog(std::function<QModbusClient *()> clientProvider,
     rangeRow->addWidget(new QLabel(QStringLiteral("~"), cfgGroup));
     rangeRow->addWidget(m_unitEndSpin);
     rangeRow->addStretch();
-    form->addRow(QStringLiteral("从站地址范围"), rangeRow);
+    form->addRow(tr("Slave address range"), rangeRow);
 
     m_attemptsSpin = new QSpinBox(cfgGroup);
     m_attemptsSpin->setRange(1, 10);
     m_attemptsSpin->setValue(1);
-    m_attemptsSpin->setToolTip(QStringLiteral("每个地址最多尝试次数（首次响应即判定在线）"));
-    form->addRow(QStringLiteral("每地址尝试次数"), m_attemptsSpin);
+    m_attemptsSpin->setToolTip(tr("Max attempts per address (first response marks it online)"));
+    form->addRow(tr("Attempts per address"), m_attemptsSpin);
 
     m_funcCombo = new QComboBox(cfgGroup);
     const ModbusDiagnostics::ProbeOption *opts = ModbusDiagnostics::probeOptions();
     for (int i = 0; i < ModbusDiagnostics::probeOptionCount(); ++i)
-        m_funcCombo->addItem(QString::fromUtf8(opts[i].label), opts[i].code);
+        m_funcCombo->addItem(QCoreApplication::translate("ModbusDiagnostics", opts[i].label), opts[i].code);
     m_funcCombo->setCurrentIndex(0);
-    form->addRow(QStringLiteral("探测功能码"), m_funcCombo);
+    form->addRow(tr("Probe function code"), m_funcCombo);
 
     auto *addrRow = new QHBoxLayout();
     m_addrSpin = new QSpinBox(cfgGroup);
@@ -76,16 +77,16 @@ ScannerDialog::ScannerDialog(std::function<QModbusClient *()> clientProvider,
     m_countSpin = new QSpinBox(cfgGroup);
     m_countSpin->setRange(1, 125);
     m_countSpin->setValue(1);
-    addrRow->addWidget(new QLabel(QStringLiteral("起始地址"), cfgGroup));
+    addrRow->addWidget(new QLabel(tr("Start address"), cfgGroup));
     addrRow->addWidget(m_addrSpin);
-    addrRow->addWidget(new QLabel(QStringLiteral("数量"), cfgGroup));
+    addrRow->addWidget(new QLabel(tr("Count"), cfgGroup));
     addrRow->addWidget(m_countSpin);
     addrRow->addStretch();
-    form->addRow(QStringLiteral("探测目标"), addrRow);
+    form->addRow(tr("Probe target"), addrRow);
 
     auto *btnRow = new QHBoxLayout();
-    m_startBtn = new QPushButton(QStringLiteral("开始扫描"), cfgGroup);
-    m_stopBtn = new QPushButton(QStringLiteral("停止"), cfgGroup);
+    m_startBtn = new QPushButton(tr("Start Scan"), cfgGroup);
+    m_stopBtn = new QPushButton(tr("Stop"), cfgGroup);
     m_stopBtn->setEnabled(false);
     btnRow->addWidget(m_startBtn);
     btnRow->addWidget(m_stopBtn);
@@ -95,12 +96,12 @@ ScannerDialog::ScannerDialog(std::function<QModbusClient *()> clientProvider,
     layout->addWidget(cfgGroup);
 
     // ---------- 结果 ----------
-    auto *resGroup = new QGroupBox(QStringLiteral("扫描结果（仅列入在线从站）"), this);
+    auto *resGroup = new QGroupBox(tr("Scan results (online slaves only)"), this);
     auto *resLayout = new QVBoxLayout(resGroup);
     m_table = new QTableWidget(resGroup);
     m_table->setColumnCount(4);
-    m_table->setHorizontalHeaderLabels({ QStringLiteral("从站地址"), QStringLiteral("状态"),
-                                         QStringLiteral("耗时(ms)"), QStringLiteral("备注") });
+    m_table->setHorizontalHeaderLabels({ tr("Slave address"), tr("Status"),
+                                         tr("Elapsed (ms)"), tr("Note") });
     m_table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
     m_table->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_table->setSelectionMode(QAbstractItemView::ExtendedSelection);
@@ -114,16 +115,16 @@ ScannerDialog::ScannerDialog(std::function<QModbusClient *()> clientProvider,
     m_progress->setRange(0, 100);
     m_progress->setValue(0);
     m_progress->setTextVisible(true);
-    m_status = new QLabel(QStringLiteral("就绪"), this);
+    m_status = new QLabel(tr("Ready"), this);
     bottom->addWidget(m_progress, 1);
     bottom->addWidget(m_status);
     layout->addLayout(bottom);
 
     auto *actionRow = new QHBoxLayout();
-    m_taskBtn = new QPushButton(QStringLiteral("为选中从站生成轮询任务"), this);
-    m_copyBtn = new QPushButton(QStringLiteral("复制结果"), this);
-    auto *clearBtn = new QPushButton(QStringLiteral("清空"), this);
-    auto *closeBtn = new QPushButton(QStringLiteral("关闭"), this);
+    m_taskBtn = new QPushButton(tr("Create Poll Task for Selected"), this);
+    m_copyBtn = new QPushButton(tr("Copy Results"), this);
+    auto *clearBtn = new QPushButton(tr("Clear"), this);
+    auto *closeBtn = new QPushButton(tr("Close"), this);
     actionRow->addWidget(m_taskBtn);
     actionRow->addWidget(m_copyBtn);
     actionRow->addStretch();
@@ -142,7 +143,7 @@ ScannerDialog::ScannerDialog(std::function<QModbusClient *()> clientProvider,
     connect(clearBtn, &QPushButton::clicked, this, [this]() {
         m_table->setRowCount(0);
         m_found = 0;
-        m_status->setText(QStringLiteral("已清空结果"));
+        m_status->setText(tr("Results cleared"));
     });
     connect(closeBtn, &QPushButton::clicked, this, [this]() {
         if (m_running) stopScan();
@@ -159,15 +160,15 @@ void ScannerDialog::startScan()
 {
     QModbusClient *client = m_clientProvider ? m_clientProvider() : nullptr;
     if (!client || client->state() != QModbusDevice::ConnectedState) {
-        QMessageBox::warning(this, QStringLiteral("无法扫描"),
-                             QStringLiteral("请先在主界面连接设备（TCP/RTU）后再扫描。"));
+        QMessageBox::warning(this, tr("Cannot Scan"),
+                             tr("Connect a device (TCP/RTU) from the main window before scanning."));
         return;
     }
     int totalUnits = 0;
     QString rangeError;
     if (!ModbusDiagnostics::validateScanRange(m_unitStartSpin->value(),
                                               m_unitEndSpin->value(), &totalUnits, &rangeError)) {
-        QMessageBox::warning(this, QStringLiteral("无法扫描"), rangeError);
+        QMessageBox::warning(this, tr("Cannot Scan"), rangeError);
         return;
     }
 
@@ -199,7 +200,7 @@ void ScannerDialog::stopScan()
     }
     m_startBtn->setEnabled(true);
     m_stopBtn->setEnabled(false);
-    m_status->setText(QStringLiteral("已停止，共发现 %1 个在线从站").arg(m_found));
+    m_status->setText(tr("Stopped; found %1 online slave(s)").arg(m_found));
 }
 
 void ScannerDialog::sendNextProbe()
@@ -215,7 +216,7 @@ void ScannerDialog::sendNextProbe()
     QModbusClient *client = m_clientProvider ? m_clientProvider() : nullptr;
     if (!client || client->state() != QModbusDevice::ConnectedState) {
         stopScan();
-        m_status->setText(QStringLiteral("连接已断开，扫描中止"));
+        m_status->setText(tr("Connection lost; scan aborted"));
         return;
     }
 
@@ -253,14 +254,14 @@ void ScannerDialog::onReplyFinished()
                     && !reply->rawResult().isException();
 
     if (ok) {
-        QString note = QStringLiteral("响应正常");
+        QString note = tr("Response OK");
         const QModbusResponse resp = reply->rawResult();
         const QByteArray data = resp.data();
         const int probeCode = m_funcCombo->currentData().toInt();
         if (data.size() >= 4 && (probeCode == 0x03 || probeCode == 0x04)) {
             // 寄存器读响应：byte0=字节数，byte1.. 为寄存器大端数据
             const int first = (static_cast<quint8>(data.at(2)) << 8) | static_cast<quint8>(data.at(3));
-            note = QStringLiteral("首个寄存器值 = %1").arg(first);
+            note = tr("First register value = %1").arg(first);
         }
         appendFound(m_currentUnit, ms, note);
         ++m_scanned;
@@ -311,7 +312,7 @@ void ScannerDialog::appendFound(int unit, int elapsedMs, const QString &note)
     const int row = m_table->rowCount();
     m_table->insertRow(row);
     m_table->setItem(row, 0, new QTableWidgetItem(QString::number(unit)));
-    m_table->setItem(row, 1, new QTableWidgetItem(QStringLiteral("在线")));
+    m_table->setItem(row, 1, new QTableWidgetItem(tr("Online")));
     m_table->setItem(row, 2, new QTableWidgetItem(QString::number(elapsedMs)));
     m_table->setItem(row, 3, new QTableWidgetItem(note));
     ++m_found;
@@ -330,18 +331,18 @@ void ScannerDialog::finishScan()
     m_startBtn->setEnabled(true);
     m_stopBtn->setEnabled(false);
     m_progress->setValue(m_total);
-    m_status->setText(QStringLiteral("扫描完成，共发现 %1 个在线从站").arg(m_found));
+    m_status->setText(tr("Scan complete; found %1 online slave(s)").arg(m_found));
 }
 
 void ScannerDialog::createPollTaskForSelection()
 {
     if (!m_pollManager) {
-        QMessageBox::information(this, QStringLiteral("不可用"), QStringLiteral("轮询管理器未初始化。"));
+        QMessageBox::information(this, tr("Unavailable"), tr("Poll manager is not initialized."));
         return;
     }
     const auto rows = m_table->selectionModel()->selectedRows();
     if (rows.isEmpty()) {
-        QMessageBox::information(this, QStringLiteral("未选择"), QStringLiteral("请先在结果表中选中一行或多行。"));
+        QMessageBox::information(this, tr("No selection"), tr("Select one or more rows in the results table first."));
         return;
     }
 
@@ -367,13 +368,13 @@ void ScannerDialog::createPollTaskForSelection()
         m_pollManager->addTask(task);
         ++added;
     }
-    m_status->setText(QStringLiteral("已为 %1 个从站生成轮询任务").arg(added));
+    m_status->setText(tr("Created poll tasks for %1 slave(s)").arg(added));
 }
 
 void ScannerDialog::copyResults()
 {
     QStringList lines;
-    lines << QStringLiteral("从站地址\t状态\t耗时(ms)\t备注");
+    lines << tr("Slave address\tStatus\tElapsed (ms)\tNote");
     for (int row = 0; row < m_table->rowCount(); ++row) {
         QStringList cells;
         for (int col = 0; col < m_table->columnCount(); ++col) {
@@ -383,5 +384,5 @@ void ScannerDialog::copyResults()
         lines << cells.join(QLatin1Char('\t'));
     }
     QApplication::clipboard()->setText(lines.join(QLatin1Char('\n')));
-    m_status->setText(QStringLiteral("结果已复制到剪贴板"));
+    m_status->setText(tr("Results copied to clipboard"));
 }

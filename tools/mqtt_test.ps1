@@ -99,7 +99,7 @@ function Build-E2E {
     New-Item -ItemType Directory -Force -Path $build | Out-Null
     $pro = Join-Path $build 'mqtt_e2e.pro'
     $content = @"
-QT += core network serialport
+QT += core network serialport sql
 QT -= gui
 CONFIG += c++17 console
 CONFIG -= app_bundle
@@ -107,8 +107,9 @@ TEMPLATE = app
 TARGET = mqtt_e2e
 INCLUDEPATH += $proRoot/header
 SOURCES += $proRoot/tools/mqtt_e2e.cpp \
-    $proRoot/src/mqttclient.cpp
-HEADERS += $proRoot/header/mqttclient.h $proRoot/header/credentialcodec.h
+    $proRoot/src/mqttclient.cpp \
+    $proRoot/src/mqttoutbox.cpp
+HEADERS += $proRoot/header/mqttclient.h $proRoot/header/mqttoutbox.h $proRoot/header/credentialcodec.h
 "@
     # 注意：不能用 Set-Content -Encoding UTF8 —— PowerShell 5.1 会写入 BOM，
     # qmake 无法解析带 BOM 的 .pro（报 "Error processing project file"）。

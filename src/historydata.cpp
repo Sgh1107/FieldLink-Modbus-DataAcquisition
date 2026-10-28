@@ -1,4 +1,5 @@
 #include "historydata.h"
+#include <QCoreApplication>
 #include <QSqlError>
 #include <QSqlRecord>
 #include <QUuid>
@@ -56,9 +57,9 @@ bool HistoryData::openDatabase(const QString &dbPath)
     if (!m_db.open()) {
         // P2-8/P2-17：打开失败时清理连接名，避免后续 addDatabase 重复连接警告
         const QString reason = m_db.lastError().text().isEmpty()
-            ? QStringLiteral("未知错误")
+            ? QCoreApplication::translate("HistoryData", "Unknown error")
             : m_db.lastError().text();
-        setLastError(QStringLiteral("打开历史数据库失败(%1): %2").arg(dbPath, reason));
+        setLastError(QCoreApplication::translate("HistoryData", "Failed to open history database (%1): %2").arg(dbPath, reason));
         qWarning() << "HistoryData::openDatabase:" << m_lastError;
         m_db = QSqlDatabase();
         QSqlDatabase::removeDatabase(m_connectionName);
@@ -172,8 +173,8 @@ bool HistoryData::addRecords(const QVector<HistoryBatchEntry> &records)
 {
     if (!m_db.isOpen()) {
         // P2-12：写失败不能静默丢数据，必须留下可查的错误描述
-        setLastError(QStringLiteral("历史数据库未打开，记录未写入"));
-        qWarning() << "HistoryData::addRecords: 数据库未打开，丢弃" << records.size() << "条记录";
+        setLastError(QCoreApplication::translate("HistoryData", "History database is not open; record not written"));
+        qWarning() << QCoreApplication::translate("HistoryData", "HistoryData::addRecords: database is not open, dropped") << records.size() << QCoreApplication::translate("HistoryData", " record(s)");
         return false;
     }
     if (records.isEmpty()) {
@@ -185,7 +186,7 @@ bool HistoryData::addRecords(const QVector<HistoryBatchEntry> &records)
     if (!query.prepare(
             "INSERT INTO history (timestamp, server_address, register_type, start_address, count, values_data) "
             "VALUES (?, ?, ?, ?, ?, ?)")) {
-        setLastError(QStringLiteral("准备 INSERT 失败: %1").arg(query.lastError().text()));
+        setLastError(QCoreApplication::translate("HistoryData", "Failed to prepare INSERT: %1").arg(query.lastError().text()));
         qWarning() << "HistoryData::addRecords:" << m_lastError;
         return false;
     }
@@ -195,7 +196,7 @@ bool HistoryData::addRecords(const QVector<HistoryBatchEntry> &records)
     for (const HistoryBatchEntry &entry : records) {
         const QDateTime ts = entry.timestamp.isValid() ? entry.timestamp : QDateTime::currentDateTime();
         if (!writeEntry(query, entry, ts)) {
-            setLastError(QStringLiteral("写入历史记录失败(从站%1/地址%2): %3")
+            setLastError(QCoreApplication::translate("HistoryData", "Failed to write history record (slave %1 / address %2): %3")
                              .arg(entry.serverAddress).arg(entry.startAddress)
                              .arg(query.lastError().text()));
             qWarning() << "HistoryData::addRecords:" << m_lastError;
@@ -205,7 +206,7 @@ bool HistoryData::addRecords(const QVector<HistoryBatchEntry> &records)
         }
     }
     if (ownTransaction && !m_db.commit()) {
-        setLastError(QStringLiteral("提交历史记录事务失败: %1").arg(m_db.lastError().text()));
+        setLastError(QCoreApplication::translate("HistoryData", "Failed to commit history transaction: %1").arg(m_db.lastError().text()));
         qWarning() << "HistoryData::addRecords:" << m_lastError;
         return false;
     }
@@ -238,7 +239,7 @@ bool HistoryData::addPointRecord(const PointHistoryRecord &record)
 bool HistoryData::addPointRecords(const QVector<PointHistoryRecord> &records)
 {
     if (!m_db.isOpen()) {
-        setLastError(QStringLiteral("历史数据库未打开，工程值记录未写入"));
+        setLastError(QCoreApplication::translate("HistoryData", "History database is not open; engineering value record not written"));
         return false;
     }
     if (records.isEmpty()) {
@@ -250,7 +251,7 @@ bool HistoryData::addPointRecords(const QVector<PointHistoryRecord> &records)
     if (!query.prepare(
             "INSERT INTO point_history (timestamp, device_id, point_id, point_name, "
             "server_address, value, quality) VALUES (?, ?, ?, ?, ?, ?, ?)")) {
-        setLastError(QStringLiteral("准备点位归档 INSERT 失败: %1").arg(query.lastError().text()));
+        setLastError(QCoreApplication::translate("HistoryData", "Failed to prepare point archive INSERT: %1").arg(query.lastError().text()));
         qWarning() << "HistoryData::addPointRecords:" << m_lastError;
         return false;
     }
@@ -259,7 +260,7 @@ bool HistoryData::addPointRecords(const QVector<PointHistoryRecord> &records)
     for (const PointHistoryRecord &entry : records) {
         const QDateTime ts = entry.timestamp.isValid() ? entry.timestamp : QDateTime::currentDateTime();
         if (!writePointEntry(query, entry, ts)) {
-            setLastError(QStringLiteral("写入点位归档失败(point=%1): %2")
+            setLastError(QCoreApplication::translate("HistoryData", "Failed to write point archive (point=%1): %2")
                              .arg(entry.pointId).arg(query.lastError().text()));
             qWarning() << "HistoryData::addPointRecords:" << m_lastError;
             if (ownTransaction)
@@ -268,7 +269,7 @@ bool HistoryData::addPointRecords(const QVector<PointHistoryRecord> &records)
         }
     }
     if (ownTransaction && !m_db.commit()) {
-        setLastError(QStringLiteral("提交点位归档事务失败: %1").arg(m_db.lastError().text()));
+        setLastError(QCoreApplication::translate("HistoryData", "Failed to commit point archive transaction: %1").arg(m_db.lastError().text()));
         return false;
     }
 
@@ -305,7 +306,7 @@ QVector<PointHistoryRecord> HistoryData::queryPoints(const QDateTime &from, cons
     for (const QVariant &value : binds)
         q.addBindValue(value);
     if (!q.exec()) {
-        setLastError(QStringLiteral("查询点位归档失败: %1").arg(q.lastError().text()));
+        setLastError(QCoreApplication::translate("HistoryData", "Failed to query point archive: %1").arg(q.lastError().text()));
         qWarning() << "HistoryData::queryPoints:" << m_lastError;
         return QVector<PointHistoryRecord>();
     }
@@ -355,7 +356,7 @@ QVector<PointHistoryAggregate> HistoryData::aggregatePoints(const QDateTime &fro
     for (const QVariant &value : binds)
         q.addBindValue(value);
     if (!q.exec()) {
-        setLastError(QStringLiteral("聚合点位归档失败: %1").arg(q.lastError().text()));
+        setLastError(QCoreApplication::translate("HistoryData", "Failed to aggregate point archive: %1").arg(q.lastError().text()));
         qWarning() << "HistoryData::aggregatePoints:" << m_lastError;
         return QVector<PointHistoryAggregate>();
     }
@@ -383,7 +384,7 @@ void HistoryData::maybeAutoCleanup()
 
     const QDateTime before = QDateTime::currentDateTime().addDays(-m_retentionDays);
     const int removed = purgeOlderThan(before);
-    qInfo() << "HistoryData: 自动清理保留期" << m_retentionDays << "天，删除记录数:" << removed;
+    qInfo() << QCoreApplication::translate("HistoryData", "HistoryData: auto-cleanup retention") << m_retentionDays << QCoreApplication::translate("HistoryData", " day(s), records deleted:") << removed;
 }
 
 int HistoryData::purgeOlderThan(const QDateTime &before)
@@ -399,7 +400,7 @@ int HistoryData::purgeOlderThan(const QDateTime &before)
     q.prepare("DELETE FROM history WHERE timestamp < ?");
     q.addBindValue(ts);
     if (!q.exec()) {
-        setLastError(QStringLiteral("清理历史记录失败: %1").arg(q.lastError().text()));
+        setLastError(QCoreApplication::translate("HistoryData", "Failed to clean history records: %1").arg(q.lastError().text()));
         qWarning() << "HistoryData::purgeOlderThan:" << m_lastError;
         if (ownTransaction)
             m_db.rollback();
@@ -408,14 +409,14 @@ int HistoryData::purgeOlderThan(const QDateTime &before)
     removed += q.numRowsAffected();
 
     if (!q.prepare("DELETE FROM point_history WHERE timestamp < ?")) {
-        setLastError(QStringLiteral("准备清理点位归档语句失败: %1").arg(q.lastError().text()));
+        setLastError(QCoreApplication::translate("HistoryData", "Failed to prepare point archive cleanup: %1").arg(q.lastError().text()));
         if (ownTransaction)
             m_db.rollback();
         return 0;
     }
     q.addBindValue(ts);
     if (!q.exec()) {
-        setLastError(QStringLiteral("清理点位归档失败: %1").arg(q.lastError().text()));
+        setLastError(QCoreApplication::translate("HistoryData", "Failed to clean point archive: %1").arg(q.lastError().text()));
         qWarning() << "HistoryData::purgeOlderThan:" << m_lastError;
         if (ownTransaction)
             m_db.rollback();
@@ -424,7 +425,7 @@ int HistoryData::purgeOlderThan(const QDateTime &before)
     removed += q.numRowsAffected();
 
     if (ownTransaction && !m_db.commit()) {
-        setLastError(QStringLiteral("提交清理事务失败: %1").arg(m_db.lastError().text()));
+        setLastError(QCoreApplication::translate("HistoryData", "Failed to commit cleanup transaction: %1").arg(m_db.lastError().text()));
         return 0;
     }
     return removed;
@@ -467,7 +468,7 @@ QVector<HistoryRecord> HistoryData::query(const QDateTime &from, const QDateTime
     for (const QVariant &value : binds)
         q.addBindValue(value);
     if (!q.exec()) {
-        setLastError(QStringLiteral("查询历史记录失败: %1").arg(q.lastError().text()));
+        setLastError(QCoreApplication::translate("HistoryData", "Failed to query history records: %1").arg(q.lastError().text()));
         qWarning() << "HistoryData::query:" << m_lastError;
         return QVector<HistoryRecord>();
     }
@@ -496,7 +497,7 @@ QVector<HistoryRecord> HistoryData::lastRecords(int count) const
     q.prepare("SELECT * FROM history ORDER BY id DESC LIMIT ?");
     q.addBindValue(count);
     if (!q.exec()) {
-        setLastError(QStringLiteral("查询最近记录失败: %1").arg(q.lastError().text()));
+        setLastError(QCoreApplication::translate("HistoryData", "Failed to query latest records: %1").arg(q.lastError().text()));
         return QVector<HistoryRecord>();
     }
 
@@ -548,12 +549,12 @@ void HistoryData::clearAll()
         return;
     QSqlQuery q(m_db);
     if (!q.exec("DELETE FROM history")) {
-        setLastError(QStringLiteral("清空历史记录失败: %1").arg(q.lastError().text()));
+        setLastError(QCoreApplication::translate("HistoryData", "Failed to clear history records: %1").arg(q.lastError().text()));
         qWarning() << "HistoryData::clearAll:" << m_lastError;
         return;
     }
     if (!q.exec("DELETE FROM point_history")) {
-        setLastError(QStringLiteral("清空点位归档失败: %1").arg(q.lastError().text()));
+        setLastError(QCoreApplication::translate("HistoryData", "Failed to clear point archive: %1").arg(q.lastError().text()));
         qWarning() << "HistoryData::clearAll:" << m_lastError;
         return;
     }

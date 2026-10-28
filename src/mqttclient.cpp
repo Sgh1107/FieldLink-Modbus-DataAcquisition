@@ -4,6 +4,7 @@
 // 所有控制包 = 固定头(1 字节类型/标志 + 1~4 字节剩余长度 varint) + 变长头 + 载荷。
 
 #include "mqttclient.h"
+#include "mqttoutbox.h"
 
 #include <QDateTime>
 #include <QJsonDocument>
@@ -25,6 +26,10 @@ constexpr int kMaxRemainingLength = 16 * 1024 * 1024;   // 16 MB
 constexpr int kMaxBufferSize = 32 * 1024 * 1024;        // 32 MB
 // QoS1 在途消息上限：防止 broker 永不回 PUBACK 时 m_pending 无界增长
 constexpr int kMaxPendingPublish = 1000;
+// 每次补发最多发送多少条，避免重连瞬间卡住 UI / 淹没 broker
+constexpr int kOutboxFlushBatch = 100;
+// 补发节拍：PUBACK 释放窗口后继续补发
+constexpr int kOutboxFlushIntervalMs = 300;
 
 // CONNACK 返回码（MQTT 3.1.1 表 3.1）
 enum ConnackCode {
@@ -70,11 +75,17 @@ MqttClient::MqttClient(QObject *parent)
     m_connectTimeoutTimer.setSingleShot(true);
     m_connectTimeoutTimer.setInterval(kConnectTimeoutMs);
     connect(&m_connectTimeoutTimer, &QTimer::timeout, this, &MqttClient::onConnectTimeout);
+
+    m_outboxFlushTimer.setSingleShot(true);
+    m_outboxFlushTimer.setInterval(kOutboxFlushIntervalMs);
+    connect(&m_outboxFlushTimer, &QTimer::timeout, this, &MqttClient::flushOutbox);
 }
 
 MqttClient::~MqttClient()
 {
     m_userRequestedDisconnect = true;
+    // 进程退出时把未确认的 QoS1 消息留在离线队列，下次启动继续补发。
+    requeuePendingToOutbox();
     if (m_brokerConnected) {
         sendDisconnect();
         // socket 随后作为子对象被销毁，未 flush 的数据不会发出，
@@ -115,6 +126,87 @@ void MqttClient::setPublishQos(int qos)
     m_publishQos = (qos >= 1) ? 1 : 0;
 }
 
+bool MqttClient::enableOutbox(const QString &dbPath)
+{
+    if (m_outbox && m_outbox->isOpen()
+        && m_outbox->databasePath() == dbPath) {
+        m_outbox->setLimits(m_outboxMaxMessages, m_outboxMaxBytes);
+        return true;
+    }
+    m_outbox.reset(new MqttOutbox());
+    m_outbox->setLimits(m_outboxMaxMessages, m_outboxMaxBytes);
+    if (!m_outbox->open(dbPath)) {
+        const QString error = m_outbox->lastError();
+        m_outbox.reset();
+        emit errorOccurred(tr("MQTT offline queue open failed: %1").arg(error));
+        return false;
+    }
+    emitQueueSize();
+    return true;
+}
+
+void MqttClient::disableOutbox()
+{
+    m_outboxFlushTimer.stop();
+    m_outboxInFlight.clear();
+    m_outbox.reset();
+    emitQueueSize();
+}
+
+bool MqttClient::isOutboxEnabled() const
+{
+    return m_outbox && m_outbox->isOpen();
+}
+
+MqttOutbox *MqttClient::outbox() const
+{
+    return m_outbox.data();
+}
+
+void MqttClient::setOutboxLimits(int maxMessages, qint64 maxBytes)
+{
+    m_outboxMaxMessages = qMax(1, maxMessages);
+    m_outboxMaxBytes = qMax<qint64>(1024, maxBytes);
+    if (m_outbox)
+        m_outbox->setLimits(m_outboxMaxMessages, m_outboxMaxBytes);
+    emitQueueSize();
+}
+
+int MqttClient::outboxCount() const
+{
+    return m_outbox ? m_outbox->count() : 0;
+}
+
+qint64 MqttClient::outboxBytes() const
+{
+    return m_outbox ? m_outbox->bytes() : 0;
+}
+
+int MqttClient::outboxDroppedCount() const
+{
+    return m_outbox ? m_outbox->droppedCount() : 0;
+}
+
+bool MqttClient::clearOutbox()
+{
+    if (!m_outbox)
+        return false;
+    const bool ok = m_outbox->clear();
+    m_outboxInFlight.clear();
+    // 已经发出、等待 PUBACK 的队列消息也一并放弃重发：
+    // 用户点「清空队列」后不应再收到这些历史消息的补发。
+    for (auto it = m_pending.begin(); it != m_pending.end();) {
+        if (it->outboxId > 0)
+            it = m_pending.erase(it);
+        else
+            ++it;
+    }
+    if (m_pending.isEmpty())
+        m_retransmitTimer.stop();
+    emitQueueSize();
+    return ok;
+}
+
 bool MqttClient::isConnectedToBroker() const
 {
     return m_brokerConnected;
@@ -135,8 +227,10 @@ void MqttClient::connectToBroker()
     }
     // 任何非未连接状态（连接中/已连接/半开连接）一律断开重来，
     // 避免"卡在正在连接"或"半开连接上静默返回"的死状态
-    if (m_socket->state() != QAbstractSocket::UnconnectedState)
+    if (m_socket->state() != QAbstractSocket::UnconnectedState) {
+        requeuePendingToOutbox();
         m_socket->abort();
+    }
 
     m_userRequestedDisconnect = false;
     m_brokerConnected = false;
@@ -151,8 +245,12 @@ void MqttClient::disconnectFromBroker()
     m_reconnectTimer.stop();
     m_pingTimer.stop();
     m_connectTimeoutTimer.stop();
-    if (m_brokerConnected)
+    if (m_brokerConnected) {
+        // 主动断开（例如用户关闭 MQTT）也把未确认消息留在离线队列，
+        // 下次启用后仍能补发，不因一次手动断开丢数据。
+        requeuePendingToOutbox();
         sendDisconnect();
+    }
     if (m_socket->state() != QAbstractSocket::UnconnectedState)
         m_socket->disconnectFromHost();
 }
@@ -247,18 +345,29 @@ void MqttClient::resetSessionState()
     m_brokerConnected = false;
     m_pingTimer.stop();
     m_connectTimeoutTimer.stop();
+    m_outboxFlushTimer.stop();
     m_buffer.clear();
-    // 断线即清空 QoS1 待确认队列（会话已失效）。但必须告警：
-    // 否则调用方只知道 publish() 返回了 true，实际消息已永久丢失（静默丢数据）。
+
+    // QoS1 待确认消息在会话失效后不能静默丢弃：
+    //   - 已来自离线队列（outboxId > 0）的消息，数据库行仍在，重连后自然补发；
+    //   - 直接发送的消息，先落盘再清空。
     if (!m_pending.isEmpty()) {
-        emit errorOccurred(tr("MQTT connection lost: %1 unacknowledged QoS1 message(s) dropped")
-                               .arg(m_pending.size()));
-        m_pending.clear();
+        const int count = m_pending.size();
+        if (m_outbox && m_outbox->isOpen()) {
+            requeuePendingToOutbox();
+            emit errorOccurred(tr("MQTT connection lost: %1 unacknowledged message(s) kept in offline queue")
+                                   .arg(count));
+        } else {
+            emit errorOccurred(tr("MQTT connection lost: %1 unacknowledged QoS1 message(s) dropped")
+                                   .arg(count));
+            m_pending.clear();
+        }
     }
     m_retransmitTimer.stop();
     m_dropWarningEmitted = false;   // 新的断连周期允许再次告警
     m_lastPingRespMs = 0;
     m_pingOutstanding = false;
+    emitQueueSize();
 }
 
 // 连接超时：TCP 已连上但 CONNACK 迟迟不来（broker 假死/被静默过滤等），
@@ -363,10 +472,46 @@ void MqttClient::sendDisconnect()
 
 // ---------------- 发布 ----------------
 
-bool MqttClient::publish(const QString &topic, const QByteArray &payload, bool retain)
+bool MqttClient::publish(const QString &topic, const QByteArray &payload, bool retain, int priority)
 {
-    if (!m_brokerConnected) {
-        // M1：断连期间静默丢弃，只在每个断连周期发一次告警，避免轮询场景日志刷屏
+    // MQTT 字符串长度字段为 2 字节（最大 65535），剩余长度 varint 最大 268435455。
+    // 超限直接拒绝，避免产出协议非法的包。
+    if (topic.toUtf8().size() > 65535 || payload.size() > kMaxRemainingLength - 65540) {
+        emit errorOccurred(tr("MQTT message too large (topic %1 bytes, payload %2 bytes), rejected")
+                               .arg(topic.toUtf8().size()).arg(payload.size()));
+        return false;
+    }
+
+    if (!m_brokerConnected)
+        return enqueueToOutbox(topic, payload, retain, m_publishQos, priority);
+
+    if (m_publishQos >= 1) {
+        // 在途消息上限：broker 永不回 PUBACK 时 m_pending 会无界增长。
+        // 有离线队列时转入队列等待窗口，而不是直接丢弃。
+        if (m_pending.size() >= kMaxPendingPublish) {
+            if (m_outbox && m_outbox->isOpen())
+                return enqueueToOutbox(topic, payload, retain, 1, priority);
+            emit errorOccurred(tr("MQTT too many unacknowledged QoS1 messages (%1), message dropped")
+                                   .arg(m_pending.size()));
+            return false;
+        }
+        return sendQos1(topic, payload, retain, priority, 0);
+    }
+
+    return sendQos0(topic, payload, retain);
+}
+
+bool MqttClient::publishJson(const QString &topic, const QJsonObject &object, bool retain, int priority)
+{
+    const QJsonDocument doc(object);
+    return publish(topic, doc.toJson(QJsonDocument::Compact), retain, priority);
+}
+
+bool MqttClient::enqueueToOutbox(const QString &topic, const QByteArray &payload,
+                                 bool retain, int qos, int priority)
+{
+    if (!m_outbox || !m_outbox->isOpen()) {
+        // 未启用离线队列：保持原有行为，断连期间只在每个周期告警一次。
         ++m_droppedCount;
         if (!m_dropWarningEmitted) {
             m_dropWarningEmitted = true;
@@ -376,64 +521,25 @@ bool MqttClient::publish(const QString &topic, const QByteArray &payload, bool r
         return false;
     }
 
-    // MQTT 字符串长度字段为 2 字节（最大 65535），剩余长度 varint 最大 268435455。
-    // 超限直接拒绝，避免产出协议非法的包。
-    if (topic.toUtf8().size() > 65535 || payload.size() > kMaxRemainingLength - 65540) {
-        emit errorOccurred(tr("MQTT message too large (topic %1 bytes, payload %2 bytes), rejected")
-                               .arg(topic.toUtf8().size()).arg(payload.size()));
+    qint64 id = 0;
+    if (!m_outbox->enqueue(topic, payload, retain, qos, priority, &id)) {
+        emit errorOccurred(tr("MQTT offline queue rejected message (queue %1, %2 bytes): %3")
+                               .arg(m_outbox->count())
+                               .arg(m_outbox->bytes())
+                               .arg(m_outbox->lastError()));
         return false;
     }
 
-    // QoS1：固定头 0x32|retain（重发时另置 DUP）+ 报文标识符，等待 PUBACK 确认
-    if (m_publishQos >= 1) {
-        // 在途消息上限：broker 永不回 PUBACK 时 m_pending 会无界增长
-        if (m_pending.size() >= kMaxPendingPublish) {
-            emit errorOccurred(tr("MQTT too many unacknowledged QoS1 messages (%1), message dropped")
-                                   .arg(m_pending.size()));
-            return false;
-        }
+    emit messageQueued(topic, payload.size(), m_outbox->count());
+    emitQueueSize();
+    // 已连接但正好处于 QoS1 在途上限时，等窗口释放后由定时器继续补发。
+    if (m_brokerConnected)
+        m_outboxFlushTimer.start();
+    return true;
+}
 
-        // 报文标识符分配：必须跳过仍在等待 PUBACK 的 ID。
-        // MQTT 3.1.1 §3.3.1.4 规定不得对未确认报文复用 Packet Identifier；
-        // 直接复用会覆盖 m_pending 中的旧消息，导致它既不会被重发、
-        // 也永远不会触发 published 信号 —— 数据静默丢失。
-        quint16 packetId = m_nextPacketId;
-        for (int guard = 0; guard < 65535; ++guard) {
-            if (!m_pending.contains(packetId))
-                break;
-            packetId = static_cast<quint16>((packetId % 65535) + 1);   // 跳过保留值 0
-        }
-        if (m_pending.contains(packetId)) {
-            // 65535 条全部在途：无法再分配新 ID
-            emit errorOccurred(tr("MQTT no free packet identifier available, message dropped"));
-            return false;
-        }
-        m_nextPacketId = static_cast<quint16>((packetId % 65535) + 1);   // 跳过保留值 0
-
-        const QByteArray topicBytes = encodeString(topic);
-        const int remaining = topicBytes.size() + 2 + payload.size();
-
-        QByteArray packet;
-        packet.append(static_cast<char>(0x32 | (retain ? 0x01 : 0x00)));
-        packet += encodeRemainingLength(remaining);
-        packet += topicBytes;
-        packet.append(static_cast<char>((packetId >> 8) & 0xFF));
-        packet.append(static_cast<char>(packetId & 0xFF));
-        packet += payload;
-        m_socket->write(packet);
-
-        PendingPublish pending;
-        pending.packet = packet;
-        pending.topic = topic;
-        pending.payloadSize = payload.size();
-        pending.firstSentMs = QDateTime::currentMSecsSinceEpoch();
-        pending.retries = 0;
-        m_pending.insert(packetId, pending);
-        if (!m_retransmitTimer.isActive())
-            m_retransmitTimer.start();
-        return true;   // published 信号延后到收到 PUBACK 时发出
-    }
-
+bool MqttClient::sendQos0(const QString &topic, const QByteArray &payload, bool retain)
+{
     // PUBLISH QoS0：固定头 0x30|retain + 剩余长度 + 主题(变长字符串) + 载荷
     const QByteArray topicBytes = encodeString(topic);
     const int remaining = topicBytes.size() + payload.size();
@@ -449,10 +555,122 @@ bool MqttClient::publish(const QString &topic, const QByteArray &payload, bool r
     return true;
 }
 
-bool MqttClient::publishJson(const QString &topic, const QJsonObject &object, bool retain)
+bool MqttClient::sendQos1(const QString &topic, const QByteArray &payload, bool retain,
+                          int priority, qint64 outboxId)
 {
-    const QJsonDocument doc(object);
-    return publish(topic, doc.toJson(QJsonDocument::Compact), retain);
+    if (m_pending.size() >= kMaxPendingPublish)
+        return false;
+
+    // 报文标识符分配：必须跳过仍在等待 PUBACK 的 ID。
+    // MQTT 3.1.1 §3.3.1.4 规定不得对未确认报文复用 Packet Identifier；
+    // 直接复用会覆盖 m_pending 中的旧消息，导致它既不会被重发、
+    // 也永远不会触发 published 信号 —— 数据静默丢失。
+    quint16 packetId = m_nextPacketId;
+    for (int guard = 0; guard < 65535; ++guard) {
+        if (!m_pending.contains(packetId))
+            break;
+        packetId = static_cast<quint16>((packetId % 65535) + 1);   // 跳过保留值 0
+    }
+    if (m_pending.contains(packetId)) {
+        emit errorOccurred(tr("MQTT no free packet identifier available, message dropped"));
+        return false;
+    }
+    m_nextPacketId = static_cast<quint16>((packetId % 65535) + 1);   // 跳过保留值 0
+
+    const QByteArray topicBytes = encodeString(topic);
+    const int remaining = topicBytes.size() + 2 + payload.size();
+
+    QByteArray packet;
+    packet.append(static_cast<char>(0x32 | (retain ? 0x01 : 0x00)));
+    packet += encodeRemainingLength(remaining);
+    packet += topicBytes;
+    packet.append(static_cast<char>((packetId >> 8) & 0xFF));
+    packet.append(static_cast<char>(packetId & 0xFF));
+    packet += payload;
+    m_socket->write(packet);
+
+    PendingPublish pending;
+    pending.packet = packet;
+    pending.topic = topic;
+    pending.payload = payload;
+    pending.payloadSize = payload.size();
+    pending.qos = 1;
+    pending.retain = retain;
+    pending.priority = priority;
+    pending.outboxId = outboxId;
+    pending.firstSentMs = QDateTime::currentMSecsSinceEpoch();
+    pending.retries = 0;
+    m_pending.insert(packetId, pending);
+    if (outboxId > 0)
+        m_outboxInFlight.insert(outboxId);
+    if (!m_retransmitTimer.isActive())
+        m_retransmitTimer.start();
+    return true;   // published 信号延后到收到 PUBACK 时发出
+}
+
+void MqttClient::flushOutbox()
+{
+    if (!m_brokerConnected || !m_outbox || !m_outbox->isOpen())
+        return;
+
+    const int before = m_outbox->count();
+    const QVector<MqttOutboxMessage> batch = m_outbox->peek(kOutboxFlushBatch * 2);
+    int sent = 0;
+    for (const MqttOutboxMessage &message : batch) {
+        if (m_pending.size() >= kMaxPendingPublish)
+            break;
+        if (m_outboxInFlight.contains(message.id))
+            continue;
+        if (message.qos >= 1) {
+            if (!sendQos1(message.topic, message.payload, message.retain,
+                          message.priority, message.id)) {
+                break;
+            }
+        } else {
+            if (!sendQos0(message.topic, message.payload, message.retain))
+                break;
+            if (!m_outbox->remove(message.id))
+                break;
+        }
+        if (++sent >= kOutboxFlushBatch)
+            break;
+    }
+
+    emitQueueSize();
+    const int remaining = m_outbox->count();
+    // 仅剩在途消息时不再空转定时器；PUBACK/重发失败会重新触发补发。
+    if (remaining > m_outboxInFlight.size() && m_brokerConnected)
+        m_outboxFlushTimer.start();
+    // QoS0 消息在本次循环里直接删除，只有真正发过消息才宣告补发完成，
+    // 避免连接建立时对空队列发一次误报。
+    if (remaining == 0 && before > 0)
+        emit outboxDrained();
+}
+
+void MqttClient::requeuePendingToOutbox()
+{
+    if (m_pending.isEmpty())
+        return;
+    if (!m_outbox || !m_outbox->isOpen()) {
+        m_pending.clear();
+        return;
+    }
+
+    for (auto it = m_pending.begin(); it != m_pending.end(); ++it) {
+        // 来自离线队列的消息，数据库行还在（PUBACK 后才删除），无需重复入队。
+        if (it->outboxId > 0)
+            continue;
+        m_outbox->enqueue(it->topic, it->payload, it->retain, it->qos, it->priority);
+    }
+    m_pending.clear();
+    m_outboxInFlight.clear();
+    m_retransmitTimer.stop();
+    emitQueueSize();
+}
+
+void MqttClient::emitQueueSize()
+{
+    emit queueSizeChanged(m_outbox ? m_outbox->count() : 0);
 }
 
 // ---------------- 接收解析 ----------------
@@ -557,7 +775,7 @@ void MqttClient::processBuffer()
 void MqttClient::handleConnack(const QByteArray &body)
 {
     if (body.size() < 2) {
-        emit errorOccurred(QStringLiteral("MQTT CONNACK 格式非法"));
+        emit errorOccurred(tr("MQTT CONNACK frame is invalid"));
         m_socket->disconnectFromHost();
         return;
     }
@@ -574,6 +792,8 @@ void MqttClient::handleConnack(const QByteArray &body)
 
     m_brokerConnected = true;
     m_pingTimer.start();
+    // 先补发离线队列中的历史消息（报警优先），再通知上层"已连接"。
+    flushOutbox();
     emit connected();
 }
 
@@ -589,8 +809,21 @@ void MqttClient::handlePuback(const QByteArray &body)
     emit published(pending.topic, pending.payloadSize);
     // 注意：QMap::erase 只接受 iterator（const_iterator 不可用），直接按 key 移除
     m_pending.remove(packetId);
+    if (pending.outboxId > 0) {
+        if (m_outbox) {
+            m_outbox->remove(pending.outboxId);
+            emitQueueSize();
+        }
+        m_outboxInFlight.remove(pending.outboxId);
+        // QoS1 的 outbox 行在 PUBACK 时才删除，补发完成的判定必须放在这里。
+        if (m_outbox && m_outbox->count() == 0 && m_outboxInFlight.isEmpty())
+            emit outboxDrained();
+    }
     if (m_pending.isEmpty())
         m_retransmitTimer.stop();
+    // 释放了一个在途窗口，继续补发离线队列。
+    if (m_outbox && m_outbox->count() > 0 && m_brokerConnected)
+        m_outboxFlushTimer.start();
 }
 
 void MqttClient::sendPendingRetransmits()
@@ -620,8 +853,18 @@ void MqttClient::sendPendingRetransmits()
     for (const quint16 id : dropped) {
         emit errorOccurred(tr("MQTT QoS1 message dropped after %1 retries (packet id %2)")
                                .arg(kMaxRetransmits).arg(id));
+        const PendingPublish pending = m_pending.value(id);
+        if (pending.outboxId > 0) {
+            if (m_outbox)
+                m_outbox->remove(pending.outboxId);
+            m_outboxInFlight.remove(pending.outboxId);
+        }
         m_pending.remove(id);
     }
+    if (!dropped.isEmpty())
+        emitQueueSize();
     if (m_pending.isEmpty())
         m_retransmitTimer.stop();
+    if (m_outbox && m_outbox->count() > 0 && m_brokerConnected)
+        m_outboxFlushTimer.start();
 }

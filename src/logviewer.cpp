@@ -13,7 +13,7 @@ LogViewer::LogViewer(QWidget *parent)
     , m_currentFilter(LogLevel::All)
 {
     setupUi();
-    setWindowTitle("日志查看器");
+    setWindowTitle(tr("Log Viewer"));
     resize(700, 500);
 }
 
@@ -22,26 +22,26 @@ void LogViewer::setupUi()
     auto *mainLayout = new QVBoxLayout(this);
 
     auto *topLayout = new QHBoxLayout();
-    topLayout->addWidget(new QLabel("日期:"));
+    topLayout->addWidget(new QLabel(tr("Date:")));
     m_dateSelector = new QDateEdit(QDate::currentDate());
     m_dateSelector->setCalendarPopup(true);
     topLayout->addWidget(m_dateSelector);
 
-    topLayout->addWidget(new QLabel("级别:"));
+    topLayout->addWidget(new QLabel(tr("Level:")));
     m_levelFilter = new QComboBox();
     m_levelFilter->addItems({"All", "DEBUG", "INFO", "WARNING", "ERROR"});
     topLayout->addWidget(m_levelFilter);
 
-    m_refreshBtn = new QPushButton("刷新");
+    m_refreshBtn = new QPushButton(tr("Refresh"));
     topLayout->addWidget(m_refreshBtn);
 
-    m_clearBtn = new QPushButton("清空");
+    m_clearBtn = new QPushButton(tr("Clear"));
     topLayout->addWidget(m_clearBtn);
 
-    m_exportBtn = new QPushButton("导出");
+    m_exportBtn = new QPushButton(tr("Export"));
     topLayout->addWidget(m_exportBtn);
 
-    m_autoScrollCheck = new QCheckBox("自动滚动");
+    m_autoScrollCheck = new QCheckBox(tr("Auto-scroll"));
     m_autoScrollCheck->setChecked(true);
     topLayout->addWidget(m_autoScrollCheck);
 
@@ -77,7 +77,7 @@ void LogViewer::loadLogFile()
 
     QFile file(filePath);
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        m_logDisplay->setPlainText("无法打开日志文件: " + filePath);
+        m_logDisplay->setPlainText(tr("Cannot open log file: ") + filePath);
         return;
     }
 
@@ -127,7 +127,7 @@ void LogViewer::clearDisplay()
 
 void LogViewer::exportLog()
 {
-    QString fileName = QFileDialog::getSaveFileName(this, "导出日志",
+    QString fileName = QFileDialog::getSaveFileName(this, tr("Export Log"),
         QDir::homePath() + "/modbus_log_" + m_dateSelector->date().toString("yyyyMMdd") + ".txt",
         "Text Files (*.txt);;All Files (*)");
 

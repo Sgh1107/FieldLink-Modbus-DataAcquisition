@@ -1,4 +1,5 @@
 #include "dataexporter.h"
+#include <QCoreApplication>
 #include <QFile>
 #include <QTextStream>
 #include <QDateTime>
@@ -73,7 +74,7 @@ bool DataExporter::exportToCsv(const QString &filePath, QString *errorMessage) c
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         if (errorMessage)
             *errorMessage = file.errorString().isEmpty()
-                ? QStringLiteral("无法打开文件: %1").arg(filePath)
+                ? QCoreApplication::translate("DataExporter", "Cannot open file: %1").arg(filePath)
                 : file.errorString();
         return false;
     }
@@ -111,7 +112,7 @@ bool DataExporter::exportToCsv(const QString &filePath, QString *errorMessage) c
     const bool fileOk = (file.error() == QFile::NoError);
     if (!streamOk || !fileOk) {
         const QString reason = file.errorString().isEmpty()
-            ? QStringLiteral("写入 CSV 失败（流状态异常）")
+            ? QCoreApplication::translate("DataExporter", "Failed to write CSV (stream error)")
             : file.errorString();
         if (errorMessage)
             *errorMessage = reason;

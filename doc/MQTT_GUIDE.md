@@ -6,7 +6,7 @@
 
 ## 一、功能概述
 
-FieldLink 内置了一个**极简 MQTT 3.1.1 发布端客户端**（QoS 0/1），无需引入任何第三方库，即可把采集数据与报警事件实时上送到 MQTT broker，供组态软件、IoT 平台、Python 脚本等订阅消费。（完整使用说明见 `doc/USAGE.md`）
+FieldLink 内置了一个**极简 MQTT 3.1.1 发布端客户端**（QoS 0/1），无需引入任何第三方库，即可把采集数据与报警事件实时上送到 MQTT broker，供组态软件、IoT 平台、Python 脚本等订阅消费。断线期间消息可落盘到本地离线队列，重连后自动补发。（完整使用说明见 `doc/USAGE.md`）
 
 **主题结构**（前缀可配置，默认 `fieldlink/`）：
 
@@ -28,9 +28,10 @@ FieldLink 内置了一个**极简 MQTT 3.1.1 发布端客户端**（QoS 0/1）�
 ## 二、配置与使用
 
 1. 菜单 **Advanced → MQTT Publishing**
-2. 填写 Broker 地址（默认 `127.0.0.1:1883`）、ClientID（留空自动生成）、可选的用户名/密码、主题前缀、KeepAlive
-3. 点「保存并连接」——状态标签显示连接结果；此后程序每次启动会**自动重连** broker
-4. 「断开」停止上送（`mqtt/enabled` 置为 false）
+2. 填写 Broker 地址（默认 `127.0.0.1:1883`）、ClientID（留空自动生成）、可选的用户名/密码、主题前缀、KeepAlive、发布 QoS（0/1）
+3. **离线队列**默认开启：断线消息写入 `mqtt_outbox.db`（默认 `AppDataLocation`，可用 `mqtt/outboxPath` 覆盖，或在 **Advanced → Database Settings** 中修改），重连后自动补发；对话框中可查看积压条数、调整上限或清空队列
+4. 点「保存并连接」——状态标签显示连接结果；此后程序每次启动会**自动重连** broker
+5. 「断开」停止上送（`mqtt/enabled` 置为 false）
 
 运行日志（Log Viewer）会记录连接/断开/错误事件；认证被拒等不可恢复错误不会无限重连。
 
@@ -38,8 +39,10 @@ FieldLink 内置了一个**极简 MQTT 3.1.1 发布端客户端**（QoS 0/1）�
 
 - **自动重连**：broker 断开后每 5 秒重试；CONNACK 拒绝（密码错误/未授权）时停止重试并报错
 - **心跳保活**：每 KeepAlive/2 秒发送 PINGREQ（默认 60s → 30s 一次）
-- **发送降级**：broker 未连接时 `publish` 返回 false 并记录日志，不阻塞采集主流程
-- **clean session**：每次连接使用全新会话，避免离线期消息堆积冲击订阅方
+- **离线队列**：断线消息写入独立 SQLite（WAL），重连后按 **报警 > 状态 > 遥测** 补发，同优先级按入队时间 FIFO；默认上限 10000 条 / 32 MB，超限优先淘汰最旧的低优先级消息；进程重启后仍会继续补发
+- **QoS1 可靠性**：PUBACK 确认 + 超时 DUP 重发；未确认消息在断线或程序退出时重新入队，不静默丢失；QoS1 的队列行保留到收到 PUBACK 才删除
+- **关闭队列时**：恢复旧的丢弃策略，`publish` 返回 false，每个断连周期只记录一次告警
+- **clean session**：每次连接使用全新会话，避免 broker 侧离线期消息堆积冲击订阅方
 
 ## 四、测试（无需真实 broker，也无需 MQTTX）
 

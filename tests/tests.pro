@@ -20,7 +20,10 @@ SOURCES += \
     test_alarm_export_history.cpp \
     test_security_config.cpp \
     test_p0_features.cpp \
+    test_p1_alarm_mqtt.cpp \
     ../src/alarmmanager.cpp \
+    ../src/alarmrepository.cpp \
+    ../src/mqttoutbox.cpp \
     ../src/securitymanager.cpp \
     ../src/reliabilitymanager.cpp \
     ../src/mqttclient.cpp \
@@ -37,6 +40,8 @@ SOURCES += \
 
 HEADERS += \
     ../header/alarmmanager.h \
+    ../header/alarmrepository.h \
+    ../header/mqttoutbox.h \
     ../header/securitymanager.h \
     ../header/reliabilitymanager.h \
     ../header/mqttclient.h \

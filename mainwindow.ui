@@ -72,7 +72,7 @@
          <item>
           <widget class="QLabel" name="brandTitle">
            <property name="text">
-            <string>FieldLink 采集平台</string>
+            <string>FieldLink Acquisition Platform</string>
            </property>
           </widget>
          </item>

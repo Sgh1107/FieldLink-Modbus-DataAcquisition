@@ -1,7 +1,10 @@
 #include "alarmmanager.h"
+#include "alarmrepository.h"
+
 #include <QMap>
 #include <QHash>
 #include <QSet>
+#include <QDebug>
 #include <cmath>
 
 AlarmManager::AlarmManager(QObject *parent)
@@ -9,6 +12,122 @@ AlarmManager::AlarmManager(QObject *parent)
     , m_nextRuleId(1)
     , m_nextEventId(1)
 {
+}
+
+void AlarmManager::setRepository(AlarmRepository *repository)
+{
+    if (m_repository == repository)
+        return;
+    m_repository = repository;
+    m_storageErrorReported = false;
+
+    // 启动阶段（内存为空）才自动恢复，避免在已有运行态上被磁盘快照覆盖。
+    if (m_repository && m_repository->isOpen()
+        && m_ruleOrder.isEmpty() && m_history.isEmpty()) {
+        reloadPersistedState();
+    }
+}
+
+bool AlarmManager::reloadPersistedState()
+{
+    if (!m_repository || !m_repository->isOpen())
+        return false;
+
+    const QVector<AlarmRule> rules = m_repository->loadRules();
+    if (!m_repository->lastError().isEmpty()) {
+        reportStorageError(m_repository->lastError());
+        return false;
+    }
+    const QVector<AlarmEvent> events = m_repository->loadEvents(qMax(1, m_maxHistory));
+    if (!m_repository->lastError().isEmpty()) {
+        reportStorageError(m_repository->lastError());
+        return false;
+    }
+    const QVector<AlarmRuleState> states = m_repository->loadStates();
+    if (!m_repository->lastError().isEmpty()) {
+        reportStorageError(m_repository->lastError());
+        return false;
+    }
+
+    m_ruleOrder.clear();
+    m_ruleMap.clear();
+    m_addressIndex.clear();
+    m_pointIndex.clear();
+    m_history.clear();
+    m_activeStates.clear();
+    m_lastTriggerTime.clear();
+    m_pendingNotifications.clear();
+
+    int maxRuleId = 0;
+    for (const AlarmRule &rule : rules) {
+        if (rule.id <= 0)
+            continue;
+        m_ruleMap.insert(rule.id, rule);
+        m_ruleOrder.append(rule.id);
+        m_activeStates.insert(rule.id, false);
+        maxRuleId = qMax(maxRuleId, rule.id);
+    }
+
+    for (const AlarmRuleState &state : states) {
+        if (state.ruleId <= 0 || !m_ruleMap.contains(state.ruleId))
+            continue;
+        m_activeStates[state.ruleId] = state.active;
+        if (state.lastTriggerTime.isValid())
+            m_lastTriggerTime[state.ruleId] = state.lastTriggerTime;
+    }
+
+    qint64 maxEventId = 0;
+    for (const AlarmEvent &event : events) {
+        if (event.id <= 0)
+            continue;
+        m_history.enqueue(event);
+        maxEventId = qMax(maxEventId, event.id);
+    }
+
+    m_nextRuleId = qMax(1, maxRuleId + 1);
+    m_nextEventId = qMax<qint64>(1, maxEventId + 1);
+    rebuildIndex();
+    m_storageErrorReported = false;
+    return true;
+}
+
+void AlarmManager::reportStorageError(const QString &message)
+{
+    if (m_storageErrorReported)
+        return;
+    m_storageErrorReported = true;
+    qWarning() << "AlarmManager persistence:" << message;
+    emit storageError(message);
+}
+
+void AlarmManager::persistRule(const AlarmRule &rule)
+{
+    if (!m_repository || !m_repository->isOpen())
+        return;
+    if (m_repository->saveRule(rule))
+        m_storageErrorReported = false;
+    else
+        reportStorageError(m_repository->lastError());
+}
+
+void AlarmManager::persistEvent(const AlarmEvent &event)
+{
+    if (!m_repository || !m_repository->isOpen())
+        return;
+    if (m_repository->saveEvent(event))
+        m_storageErrorReported = false;
+    else
+        reportStorageError(m_repository->lastError());
+}
+
+void AlarmManager::persistState(int ruleId, bool active, const QDateTime &lastTriggerTime)
+{
+    if (!m_repository || !m_repository->isOpen())
+        return;
+    if (m_repository->saveState(ruleId, active, lastTriggerTime))
+        m_storageErrorReported = false;
+    else
+        reportStorageError(m_repository->lastError());
 }
 
 quint64 AlarmManager::addressKey(int registerType, int address)
@@ -47,6 +166,9 @@ int AlarmManager::addRule(const AlarmRule &rule)
     m_ruleOrder.append(r.id);
     m_activeStates[r.id] = false;
     rebuildIndex();
+    persistRule(r);
+    // 清除可能残留的同 ID 状态（理论上 ID 不复用，这里做防御）。
+    persistState(r.id, false, QDateTime());
     return r.id;
 }
 
@@ -69,6 +191,12 @@ void AlarmManager::removeRule(int ruleId)
     }
 
     rebuildIndex();
+    if (m_repository && m_repository->isOpen()) {
+        if (m_repository->deleteRule(ruleId))
+            m_storageErrorReported = false;
+        else
+            reportStorageError(m_repository->lastError());
+    }
 }
 
 void AlarmManager::updateRule(const AlarmRule &rule)
@@ -87,6 +215,8 @@ void AlarmManager::updateRule(const AlarmRule &rule)
 
     // 规则的地址/类型可能变化，索引需重建
     rebuildIndex();
+    persistRule(it.value());
+    persistState(rule.id, false, QDateTime());
 }
 
 void AlarmManager::setRuleEnabled(int ruleId, bool enabled)
@@ -106,6 +236,8 @@ void AlarmManager::setRuleEnabled(int ruleId, bool enabled)
         if (wasActive)
             emit alarmCleared(ruleId);
     }
+    persistRule(it.value());
+    persistState(ruleId, m_activeStates.value(ruleId, false), m_lastTriggerTime.value(ruleId));
 }
 
 AlarmRule AlarmManager::getRule(int ruleId) const
@@ -156,17 +288,26 @@ void AlarmManager::emitTriggered(const AlarmRule &rule, double value, const QDat
         : rule.message;
     event.value = value;
     event.acknowledged = false;
+    event.deviceId = rule.deviceId;
+    event.pointId = rule.pointId;
+    event.serverAddress = rule.serverAddress;
+    event.registerType = rule.registerType;
+    event.address = rule.address;
+    event.condition = rule.condition;
 
     appendHistory(event);
+    persistState(rule.id, true, now);
     emit alarmTriggered(event);
 }
 
 void AlarmManager::appendHistory(const AlarmEvent &event)
 {
     m_history.enqueue(event);
+    persistEvent(event);
 
     // P2-67：历史条数上限。QQueue 的 dequeue() 是 O(1)，
     // 稳态下每条记录只搬移常数个元素，不会出现 O(n²) 的整体前移。
+    // 注意：只裁剪内存中的展示窗口，数据库保留完整事件用于审计。
     const int limit = qMax(1, m_maxHistory);
     while (m_history.size() > limit)
         m_history.dequeue();
@@ -248,6 +389,7 @@ void AlarmManager::evaluateCandidates(const QVector<int> &candidateIds, double v
         } else if (wasActive) {
             m_activeStates[rule.id] = false;
             m_pendingNotifications.remove(rule.id);
+            persistState(rule.id, false, m_lastTriggerTime.value(rule.id));
             emit alarmCleared(rule.id);
         }
     }
@@ -259,6 +401,12 @@ void AlarmManager::acknowledgeAlarm(qint64 eventId)
         if (event.id == eventId) {
             event.acknowledged = true;
             event.acknowledgedTime = QDateTime::currentDateTime();
+            if (m_repository && m_repository->isOpen()) {
+                if (m_repository->updateEventAck(event.id, true, event.acknowledgedTime))
+                    m_storageErrorReported = false;
+                else
+                    reportStorageError(m_repository->lastError());
+            }
             emit alarmAcknowledged(eventId);
             break;
         }
@@ -267,18 +415,33 @@ void AlarmManager::acknowledgeAlarm(qint64 eventId)
 
 void AlarmManager::acknowledgeAll()
 {
+    const QDateTime now = QDateTime::currentDateTime();
+    bool changed = false;
     for (auto &event : m_history) {
         if (!event.acknowledged) {
             event.acknowledged = true;
-            event.acknowledgedTime = QDateTime::currentDateTime();
+            event.acknowledgedTime = now;
+            changed = true;
             emit alarmAcknowledged(event.id);
         }
+    }
+    if (changed && m_repository && m_repository->isOpen()) {
+        if (m_repository->acknowledgeAllEvents())
+            m_storageErrorReported = false;
+        else
+            reportStorageError(m_repository->lastError());
     }
 }
 
 void AlarmManager::clearHistory()
 {
     m_history.clear();
+    if (m_repository && m_repository->isOpen()) {
+        if (m_repository->deleteAllEvents())
+            m_storageErrorReported = false;
+        else
+            reportStorageError(m_repository->lastError());
+    }
 }
 
 QVector<AlarmEvent> AlarmManager::activeAlarms() const

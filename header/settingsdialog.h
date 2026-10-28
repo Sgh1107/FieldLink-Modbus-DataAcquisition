@@ -36,6 +36,9 @@ public:
     void loadFromQSettings(QSettings &qs);
     void saveToQSettings(QSettings &qs) const;
 
+protected:
+    void changeEvent(QEvent *event) override;
+
 private:
     // 校验位下拉框与 QSerialPort::Parity 枚举的显式双向映射。
     // 不能用"下标 + 1"：下拉框顺序是 No/Even/Odd/Space/Mark，

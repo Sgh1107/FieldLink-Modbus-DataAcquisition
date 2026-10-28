@@ -14,6 +14,7 @@
 #include "historydata.h"
 #include "pluginmanager.h"
 #include "alarmmanager.h"
+#include "alarmrepository.h"
 #include "batchtaskmanager.h"
 #include "dashboard.h"
 #include "configprofile.h"
@@ -211,6 +212,12 @@ MainWindow::~MainWindow()
 
     saveSettings();
 
+    // 报警仓库是 MainWindow 的成员，析构顺序上先于 QObject 子对象（AlarmManager）。
+    // 先解除引用，避免析构期间 AlarmManager 再访问已销毁的仓库。
+    if (m_alarmManager)
+        m_alarmManager->setRepository(nullptr);
+    m_alarmRepository.reset();
+
     delete ui;
 }
 
@@ -274,7 +281,7 @@ void MainWindow::on_connectButton_clicked()
         if (m_reliabilityManager->userIntentConnected()) {
             m_reliabilityManager->setUserIntentConnected(false);
             statusBar()->showMessage(tr("Auto-reconnect stopped"), 3000);
-            logMessage(QStringLiteral("已取消自动重连"), 2);
+            logMessage(tr("Automatic reconnect cancelled"), 2);
             return;
         }
         // 用户明确要求连接：置位意图，意外断线时才会自动重连
@@ -287,7 +294,7 @@ void MainWindow::on_connectButton_clicked()
         modbusDevice->disconnectDevice();
         ui->actionConnect->setEnabled(true);
         ui->actionDisconnect->setEnabled(false);
-        logMessage(QStringLiteral("已断开连接"));
+        logMessage(tr("Disconnected"));
     }
 }
 
@@ -329,7 +336,7 @@ void MainWindow::attemptModbusConnection(bool manual)
         ui->actionDisconnect->setEnabled(true);
         ui->connectButton->setText(tr("Disconnect"));
         // 记录连接成功日志
-        logMessage(QStringLiteral("连接成功: %1").arg(ui->portEdit->currentText()));
+        logMessage(tr("Connected: %1").arg(ui->portEdit->currentText()));
     }
 }
 
@@ -370,7 +377,7 @@ void MainWindow::onStateChanged(int state)
 
     if (m_dashboard) {
         m_dashboard->setConnectionStatus(connected,
-            QStringLiteral("%1 %2").arg(connected ? "已连接" : "已断开", ui->portEdit->currentText()));
+            QStringLiteral("%1 %2").arg(connected ? tr("Connected") : tr("Disconnected"), ui->portEdit->currentText()));
         m_dashboard->setServerAddress(ui->serverEdit->value());
     }
     if (m_reliabilityManager) {
@@ -405,7 +412,7 @@ void MainWindow::onStateChanged(int state)
 void MainWindow::askReconnectAfterRemoteClose()
 {
     const QString addr = ui->portEdit->currentText();
-    logMessage(QStringLiteral("设备连接被对端断开: %1").arg(addr), 2);
+    logMessage(tr("Device connection closed by peer: %1").arg(addr), 2);
 
     const QMessageBox::StandardButton choice = QMessageBox::question(
         this, tr("Connection Closed"),
@@ -413,13 +420,13 @@ void MainWindow::askReconnectAfterRemoteClose()
         QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
 
     if (choice == QMessageBox::Yes) {
-        logMessage(QStringLiteral("用户选择重新连接"));
+        logMessage(tr("User chose to reconnect"));
         m_reliabilityManager->setUserIntentConnected(true);
         attemptModbusConnection(false);   // 失败仅状态栏提示，自动重连循环接管后续重试
         if (modbusDevice && modbusDevice->state() == QModbusDevice::UnconnectedState)
             m_reliabilityManager->notifyDisconnected();   // 立即失败时兜底启动重连循环
     } else {
-        logMessage(QStringLiteral("用户选择不重连，等待手动连接"), 2);
+        logMessage(tr("User chose not to reconnect; waiting for manual connection"), 2);
         statusBar()->showMessage(tr("Reconnect declined; press Connect to dial again"), 5000);
     }
 }
@@ -622,14 +629,14 @@ void MainWindow::onAutoReadToggled(bool checked)
         updateAutoReadIndicator(true);
         statusBar()->showMessage(tr("Auto reading every %1 ms (uncheck to stop)")
                                      .arg(ui->autoReadInterval->value()), 4000);
-        logMessage(QStringLiteral("定时读取已开启：每 %1 ms").arg(ui->autoReadInterval->value()));
+        logMessage(tr("Timed reading started: every %1 ms").arg(ui->autoReadInterval->value()));
         // 立即触发第一次读取，不用干等一个周期就能看到值刷新
         QTimer::singleShot(0, this, &MainWindow::onAutoReadTimeout);
     } else {
         m_autoReadTimer->stop();
         m_autoReadBusy = false;
         updateAutoReadIndicator(false);
-        logMessage(QStringLiteral("定时读取已关闭"));
+        logMessage(tr("Timed reading stopped"));
     }
 }
 
@@ -686,7 +693,7 @@ void MainWindow::on_writeButton_clicked()
     const int count = static_cast<int>(writeUnit.valueCount());
     if (count <= 0 || start < 0 || start + count > 65536) {
         statusBar()->showMessage(tr("Write range exceeds the Modbus address space (0~65535)"), 5000);
-        logMessage(QStringLiteral("WRITE 越界被拒绝：addr=%1 count=%2").arg(start).arg(count), 3);
+        logMessage(tr("WRITE rejected out of range: addr=%1 count=%2").arg(start).arg(count), 3);
         return;
     }
 
@@ -930,7 +937,7 @@ void MainWindow::initAdvancedFeatures()
     m_dataExporter = new DataExporter(this);
     m_dataExporter->setMaxRecords(10000);
     m_chart = new RealTimeChart();
-    m_chart->setWindowTitle("实时数据曲线");
+    m_chart->setWindowTitle(tr("Real-time Data Chart"));
     m_chart->resize(600, 400);
     m_deviceManager = new DeviceManager(this);
     m_templateManager = new DeviceTemplateManager(this);
@@ -958,21 +965,43 @@ void MainWindow::initAdvancedFeatures()
         QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + "/history.db").toString();
     if (!m_historyData->openDatabase(historyPath)) {
         const QString err = m_historyData->lastError();
-        logMessage(QStringLiteral("历史数据库打开失败：%1（历史归档不可用）").arg(err), 3);
+        logMessage(tr("Failed to open history database: %1 (history archiving unavailable)").arg(err), 3);
         statusBar()->showMessage(tr("Cannot open history database: %1").arg(err), 8000);
     }
     m_pluginManager = new PluginManager(this);
     m_pluginManager->setPluginDirectory(QCoreApplication::applicationDirPath() + "/plugins");
     m_alarmManager = new AlarmManager(this);
+
+    // 报警规则/事件/活跃状态持久化：独立 alarms.db，避免与高频历史写入争锁。
+    const QString alarmPath = m_appSettings.value(
+        QStringLiteral("alarm/dbPath"),
+        QFileInfo(historyPath).absolutePath() + QStringLiteral("/alarms.db")).toString();
+    m_alarmRepository.reset(new AlarmRepository());
+    if (m_alarmRepository->open(alarmPath)) {
+        connect(m_alarmManager, &AlarmManager::storageError, this, [this](const QString &message) {
+            logMessage(tr("Alarm persistence failed: %1 (in-memory alarms continue)").arg(message), 3);
+        });
+        m_alarmManager->setRepository(m_alarmRepository.data());
+        logMessage(tr("Alarm persistence enabled: %1 (%2 rules, %3 events)")
+                       .arg(alarmPath)
+                       .arg(m_alarmRepository->ruleCount())
+                       .arg(m_alarmRepository->eventCount()));
+    } else {
+        const QString error = m_alarmRepository->lastError();
+        m_alarmRepository.reset();
+        logMessage(tr("Failed to open alarm database: %1 (rules/events are in memory only and will be lost on restart)")
+                       .arg(error), 3);
+    }
+
     m_batchTaskManager = new BatchTaskManager(this);
     connect(m_batchTaskManager, &BatchTaskManager::executeReadTask, this, &MainWindow::onBatchReadTask);
     connect(m_batchTaskManager, &BatchTaskManager::executeWriteTask, this, &MainWindow::onBatchWriteTask);
     m_dashboard = new Dashboard();
-    m_dashboard->setWindowTitle("工业数据监控大屏");
+    m_dashboard->setWindowTitle(tr("Industrial Data Dashboard"));
     m_dashboard->resize(900, 650);
 
     GaugeConfig valueGauge;
-    valueGauge.name = "当前值";
+    valueGauge.name = tr("Current Value");
     valueGauge.unit = "raw";
     valueGauge.minValue = 0;
     valueGauge.maxValue = 65535;
@@ -985,7 +1014,7 @@ void MainWindow::initAdvancedFeatures()
     m_dashboard->addGauge(valueGauge);
 
     GaugeConfig addressGauge = valueGauge;
-    addressGauge.name = "起始地址";
+    addressGauge.name = tr("Start Address");
     addressGauge.unit = "addr";
     addressGauge.maxValue = 65535;
     addressGauge.warningThreshold = 50000;
@@ -994,7 +1023,7 @@ void MainWindow::initAdvancedFeatures()
     m_dashboard->addGauge(addressGauge);
 
     GaugeConfig countGauge = valueGauge;
-    countGauge.name = "读取数量";
+    countGauge.name = tr("Read Count");
     countGauge.unit = "count";
     countGauge.maxValue = 2000;
     countGauge.warningThreshold = 1000;
@@ -1003,19 +1032,19 @@ void MainWindow::initAdvancedFeatures()
     m_dashboard->addGauge(countGauge);
 
     GaugeConfig alarmGauge = valueGauge;
-    alarmGauge.name = "活跃报警";
-    alarmGauge.unit = "个";
+    alarmGauge.name = tr("Active Alarms");
+    alarmGauge.unit = tr("count");
     alarmGauge.maxValue = 100;
     alarmGauge.warningThreshold = 1;
     alarmGauge.criticalThreshold = 5;
     alarmGauge.currentValue = 0;
     m_dashboard->addGauge(alarmGauge);
-    m_dashboard->setConnectionStatus(false, QStringLiteral("等待连接"));
+    m_dashboard->setConnectionStatus(false, tr("Waiting for connection"));
     m_dashboard->setPollingStatus(false);
     m_dashboard->setLastUpdateTime(QDateTime());
     m_dashboard->setServerAddress(ui->serverEdit->value());
     m_dashboard->setAlarmCount(0);
-    m_dashboard->appendCommunicationLog(QStringLiteral("监控大屏初始化完成"));
+    m_dashboard->appendCommunicationLog(tr("Dashboard initialized"));
     m_configProfileManager = new ConfigProfileManager(this);
     m_configProfileManager->setProfileDirectory(QCoreApplication::applicationDirPath() + "/profiles");
 
@@ -1028,7 +1057,7 @@ void MainWindow::initAdvancedFeatures()
     const QString pointFile = QCoreApplication::applicationDirPath() + "/points.json";
     if (!m_pointModel->loadFromFile(pointFile)) {
         PointDefinition point;
-        point.name = QStringLiteral("默认保持寄存器0");
+        point.name = tr("Default holding register 0");
         point.serverAddress = ui->serverEdit->value();
         point.registerType = QModbusDataUnit::HoldingRegisters;
         point.address = 0;
@@ -1068,17 +1097,17 @@ void MainWindow::initAdvancedFeatures()
         if (m_pointModel)
             m_pointModel->markDeviceBad(deviceId, DataQuality::Bad,
                                         QStringLiteral("device %1 disconnected").arg(deviceId));
-        logMessage(QStringLiteral("多设备 %1 已断开，关联点位质量码置 Bad").arg(deviceId), 2);
+        logMessage(tr("Device %1 disconnected; related point quality set to Bad").arg(deviceId), 2);
     });
     connect(m_deviceManager, &DeviceManager::deviceError, this, [this](int deviceId, const QString &error) {
-        logMessage(QStringLiteral("多设备 %1 通信错误: %2").arg(deviceId).arg(error), 3);
+        logMessage(tr("Device %1 communication error: %2").arg(deviceId).arg(error), 3);
     });
     m_verificationManager = new VerificationManager(this);
     m_deliveryManager = new DeliveryManager(this);
 
     connect(m_reliabilityManager, &ReliabilityManager::reconnectRequested, this, [this]() {
         if (modbusDevice && modbusDevice->state() == QModbusDevice::UnconnectedState) {
-            logMessage(QStringLiteral("意外断线，正在自动重连..."), 2);
+            logMessage(tr("Unexpected disconnect, reconnecting automatically..."), 2);
             // 直接执行连接动作（非手动：失败不弹窗）；用户意图已在重连门控中校验
             attemptModbusConnection(false);
         }
@@ -1099,8 +1128,8 @@ void MainWindow::initAdvancedFeatures()
         }
     });
     connect(m_reliabilityManager, &ReliabilityManager::continuousFailureAlarm, this, [this](int count, const QString &reason) {
-        m_dashboard->appendAlarmLog(QStringLiteral("连续通信失败 %1 次: %2").arg(count).arg(reason));
-        logMessage(QStringLiteral("连续通信失败 %1 次: %2").arg(count).arg(reason), 3);
+        m_dashboard->appendAlarmLog(tr("Consecutive communication failures: %1 (%2)").arg(count).arg(reason));
+        logMessage(tr("Consecutive communication failures: %1 (%2)").arg(count).arg(reason), 3);
     });
     m_reliabilityManager->start();
 
@@ -1144,7 +1173,7 @@ void MainWindow::initMenus()
     const QString currentLang = m_appSettings.value(
         QStringLiteral("ui/language"), QLocale::system().name()).toString();
     const bool english = currentLang.startsWith(QLatin1String("en"));
-    QAction *zhAction = langMenu->addAction(QStringLiteral("简体中文"));
+    QAction *zhAction = langMenu->addAction(tr("Simplified Chinese"));
     QAction *enAction = langMenu->addAction(QStringLiteral("English"));
     zhAction->setCheckable(true);
     enAction->setCheckable(true);
@@ -1175,6 +1204,7 @@ void MainWindow::initMenus()
     advMenu->addAction(tr("Script Console"), this, &MainWindow::showScriptConsole);
     advMenu->addAction(tr("Remote Service"), this, &MainWindow::toggleRemoteServer);
     advMenu->addAction(tr("MQTT Publishing"), this, &MainWindow::showMqttSettings);
+    advMenu->addAction(tr("Database Settings"), this, &MainWindow::showDatabaseSettings);
     advMenu->addAction(tr("Simulator (Modbus Slave)"), this, &MainWindow::showDeviceSimulator);
     advMenu->addAction(tr("Plugin Manager"), this, &MainWindow::showPluginManager);
     advMenu->addAction(tr("Point Manager"), this, &MainWindow::showPointManager);

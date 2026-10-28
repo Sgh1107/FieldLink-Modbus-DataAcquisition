@@ -162,11 +162,11 @@ Dashboard::Dashboard(QWidget *parent)
 
     m_statusLayout = new QHBoxLayout();
     m_statusLayout->setSpacing(10);
-    m_connectionStatus = createStatusCard(QStringLiteral("设备状态"), QStringLiteral("DISCONNECTED"), QColor(255, 77, 79));
-    m_pollingStatus = createStatusCard(QStringLiteral("轮询状态"), QStringLiteral("STOPPED"), QColor(148, 166, 190));
-    m_updateTimeStatus = createStatusCard(QStringLiteral("最近更新时间"), QStringLiteral("--"), QColor(0, 209, 178));
-    m_serverStatus = createStatusCard(QStringLiteral("从站地址"), QStringLiteral("1"), QColor(64, 169, 255));
-    m_alarmStatus = createStatusCard(QStringLiteral("报警数量"), QStringLiteral("0"), QColor(0, 209, 178));
+    m_connectionStatus = createStatusCard(tr("Device status"), QStringLiteral("DISCONNECTED"), QColor(255, 77, 79));
+    m_pollingStatus = createStatusCard(tr("Polling status"), QStringLiteral("STOPPED"), QColor(148, 166, 190));
+    m_updateTimeStatus = createStatusCard(tr("Last update"), QStringLiteral("--"), QColor(0, 209, 178));
+    m_serverStatus = createStatusCard(tr("Slave address"), QStringLiteral("1"), QColor(64, 169, 255));
+    m_alarmStatus = createStatusCard(tr("Alarm count"), QStringLiteral("0"), QColor(0, 209, 178));
     m_statusLayout->addWidget(m_connectionStatus);
     m_statusLayout->addWidget(m_pollingStatus);
     m_statusLayout->addWidget(m_updateTimeStatus);
@@ -184,12 +184,12 @@ Dashboard::Dashboard(QWidget *parent)
     m_alarmLog = new QPlainTextEdit(this);
     m_alarmLog->setReadOnly(true);
     m_alarmLog->setMaximumBlockCount(200);
-    m_alarmLog->setPlaceholderText(QStringLiteral("报警摘要"));
+    m_alarmLog->setPlaceholderText(tr("Alarm summary"));
 
     m_commLog = new QPlainTextEdit(this);
     m_commLog->setReadOnly(true);
     m_commLog->setMaximumBlockCount(300);
-    m_commLog->setPlaceholderText(QStringLiteral("通信日志摘要"));
+    m_commLog->setPlaceholderText(tr("Communication log"));
 
     m_bottomLayout->addWidget(m_alarmLog, 1);
     m_bottomLayout->addWidget(m_commLog, 1);
@@ -250,35 +250,35 @@ void Dashboard::clearAll()
 
 void Dashboard::setConnectionStatus(bool connected, const QString &deviceText)
 {
-    updateStatusCard(m_connectionStatus, QStringLiteral("设备状态"),
+    updateStatusCard(m_connectionStatus, tr("Device status"),
                      connected ? QStringLiteral("CONNECTED") : QStringLiteral("DISCONNECTED"),
                      connected ? QColor(0, 209, 178) : QColor(255, 77, 79));
     if (!deviceText.isEmpty())
-        appendCommunicationLog(QStringLiteral("设备状态: %1").arg(deviceText));
+        appendCommunicationLog(tr("Device status: %1").arg(deviceText));
 }
 
 void Dashboard::setPollingStatus(bool running)
 {
-    updateStatusCard(m_pollingStatus, QStringLiteral("轮询状态"),
+    updateStatusCard(m_pollingStatus, tr("Polling status"),
                      running ? QStringLiteral("RUNNING") : QStringLiteral("STOPPED"),
                      running ? QColor(0, 209, 178) : QColor(148, 166, 190));
 }
 
 void Dashboard::setLastUpdateTime(const QDateTime &time)
 {
-    updateStatusCard(m_updateTimeStatus, QStringLiteral("最近更新时间"),
+    updateStatusCard(m_updateTimeStatus, tr("Last update"),
                      time.isValid() ? time.toString("HH:mm:ss") : QStringLiteral("--"),
                      QColor(64, 169, 255));
 }
 
 void Dashboard::setServerAddress(int address)
 {
-    updateStatusCard(m_serverStatus, QStringLiteral("从站地址"), QString::number(address), QColor(64, 169, 255));
+    updateStatusCard(m_serverStatus, tr("Slave address"), QString::number(address), QColor(64, 169, 255));
 }
 
 void Dashboard::setAlarmCount(int count)
 {
-    updateStatusCard(m_alarmStatus, QStringLiteral("报警数量"), QString::number(count),
+    updateStatusCard(m_alarmStatus, tr("Alarm count"), QString::number(count),
                      count > 0 ? QColor(255, 77, 79) : QColor(0, 209, 178));
 }
 

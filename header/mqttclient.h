@@ -22,6 +22,10 @@
 #include <QByteArray>
 #include <QString>
 #include <QMap>
+#include <QSet>
+#include <QScopedPointer>
+
+class MqttOutbox;
 
 class MqttClient : public QObject
 {
@@ -39,21 +43,36 @@ public:
     void setAutoReconnect(bool enabled);       // 默认 true
     void setPublishQos(int qos);               // PUBLISH QoS：0 或 1，默认 0
 
+    // 离线队列：启用后断线发布不再丢弃，而是落盘，重连后自动补发。
+    bool enableOutbox(const QString &dbPath);
+    void disableOutbox();
+    bool isOutboxEnabled() const;
+    MqttOutbox *outbox() const;
+    void setOutboxLimits(int maxMessages, qint64 maxBytes);
+    int outboxCount() const;
+    qint64 outboxBytes() const;
+    int outboxDroppedCount() const;
+    bool clearOutbox();
+
     bool isConnectedToBroker() const;          // 已完成 CONNACK 握手
     QString brokerInfo() const;                // "host:port"
 
 public slots:
     void connectToBroker();
     void disconnectFromBroker();
-    // QoS0 发布；未连接时返回 false 并发 errorOccurred
-    bool publish(const QString &topic, const QByteArray &payload, bool retain = false);
-    bool publishJson(const QString &topic, const QJsonObject &object, bool retain = false);
+    // priority：0=遥测、1=状态、2=报警（离线补发时高优先级先发）。
+    // 未连接且未启用离线队列时返回 false 并发 errorOccurred。
+    bool publish(const QString &topic, const QByteArray &payload, bool retain = false, int priority = 0);
+    bool publishJson(const QString &topic, const QJsonObject &object, bool retain = false, int priority = 0);
 
 signals:
     void connected();
     void disconnected();
     void errorOccurred(const QString &message);
     void published(const QString &topic, int payloadBytes);
+    void messageQueued(const QString &topic, int payloadBytes, int queueSize);
+    void queueSizeChanged(int count);
+    void outboxDrained();
 
 private slots:
     void onSocketConnected();
@@ -86,11 +105,26 @@ private:
     void sendPendingRetransmits();                 // QoS1：超时未确认的消息以 DUP=1 重发
     void resetSessionState();
 
+    // 离线队列
+    bool enqueueToOutbox(const QString &topic, const QByteArray &payload,
+                         bool retain, int qos, int priority);
+    bool sendQos0(const QString &topic, const QByteArray &payload, bool retain);
+    bool sendQos1(const QString &topic, const QByteArray &payload, bool retain,
+                  int priority, qint64 outboxId = 0);
+    void flushOutbox();
+    void requeuePendingToOutbox();
+    void emitQueueSize();
+
     // QoS1 待确认消息（原始 PUBLISH 包 DUP=0，重发时置位）
     struct PendingPublish {
         QByteArray packet;
         QString topic;
+        QByteArray payload;
         int payloadSize = 0;
+        int qos = 1;                   // 该消息发送时使用的 QoS，断线重入队时保持
+        bool retain = false;
+        int priority = 0;
+        qint64 outboxId = 0;           // >0 表示该消息来自离线队列
         int retries = 0;
         qint64 firstSentMs = 0;        // 首次发送时间戳：只有到期才允许带 DUP=1 重发
     };
@@ -119,8 +153,13 @@ private:
     QTimer m_reconnectTimer;      // 断线后 5 秒重连
     QTimer m_retransmitTimer;     // QoS1 重发定时器
     QTimer m_connectTimeoutTimer; // 连接超时（10s 无 CONNACK → 断开重试）
+    QTimer m_outboxFlushTimer;    // 离线队列补发节拍
     qint64 m_lastPingRespMs = 0;  // 最近一次 PINGREQ/PINGRESP 时间戳（看门狗）
     bool m_pingOutstanding = false; // 已发出 PINGREQ 且尚未收到 PINGRESP
+    QScopedPointer<MqttOutbox> m_outbox;
+    QSet<qint64> m_outboxInFlight;   // 已发出、等待 PUBACK 的 outbox 行，补发时跳过
+    int m_outboxMaxMessages = 10000;
+    qint64 m_outboxMaxBytes = 32LL * 1024 * 1024;
 };
 
 #endif // MQTTCLIENT_H

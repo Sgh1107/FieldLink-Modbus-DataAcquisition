@@ -20,6 +20,7 @@
 #include <QDialogButtonBox>
 #include <QTimer>
 #include <QDateTime>
+#include <QCoreApplication>
 
 namespace {
 
@@ -28,25 +29,26 @@ struct FuncCodeEntry {
     const char *label;
 };
 
-// 常用功能码速查表（与 Modbus 规范一致）
+// 常用功能码速查表（与 Modbus 规范一致）。
+// 字符串用 QT_TRANSLATE_NOOP 标记，运行时按当前语言翻译。
 const FuncCodeEntry kFuncCodes[] = {
-    { 0x01, "01 读线圈 Read Coils" },
-    { 0x02, "02 读离散输入 Read Discrete Inputs" },
-    { 0x03, "03 读保持寄存器 Read Holding Registers" },
-    { 0x04, "04 读输入寄存器 Read Input Registers" },
-    { 0x05, "05 写单个线圈 Write Single Coil" },
-    { 0x06, "06 写单个寄存器 Write Single Register" },
-    { 0x07, "07 读异常状态 Read Exception Status" },
-    { 0x08, "08 诊断 Diagnostics" },
-    { 0x0B, "0B 取通信事件计数 Get Comm Event Counter" },
-    { 0x0C, "0C 取通信事件日志 Get Comm Event Log" },
-    { 0x0F, "0F 写多个线圈 Write Multiple Coils" },
-    { 0x10, "10 写多个寄存器 Write Multiple Registers" },
-    { 0x11, "11 报告从站ID Report Server ID" },
-    { 0x16, "16 掩码写寄存器 Mask Write Register" },
-    { 0x17, "17 读写多个寄存器 Read/Write Multiple Registers" },
-    { 0x18, "18 读 FIFO 队列 Read FIFO Queue" },
-    { 0x2B, "2B 读设备标识 Read Device Identification (MEI 0E)" },
+    { 0x01, QT_TRANSLATE_NOOP("RawRequestDialog", "01 Read Coils") },
+    { 0x02, QT_TRANSLATE_NOOP("RawRequestDialog", "02 Read Discrete Inputs") },
+    { 0x03, QT_TRANSLATE_NOOP("RawRequestDialog", "03 Read Holding Registers") },
+    { 0x04, QT_TRANSLATE_NOOP("RawRequestDialog", "04 Read Input Registers") },
+    { 0x05, QT_TRANSLATE_NOOP("RawRequestDialog", "05 Write Single Coil") },
+    { 0x06, QT_TRANSLATE_NOOP("RawRequestDialog", "06 Write Single Register") },
+    { 0x07, QT_TRANSLATE_NOOP("RawRequestDialog", "07 Read Exception Status") },
+    { 0x08, QT_TRANSLATE_NOOP("RawRequestDialog", "08 Diagnostics") },
+    { 0x0B, QT_TRANSLATE_NOOP("RawRequestDialog", "0B Get Comm Event Counter") },
+    { 0x0C, QT_TRANSLATE_NOOP("RawRequestDialog", "0C Get Comm Event Log") },
+    { 0x0F, QT_TRANSLATE_NOOP("RawRequestDialog", "0F Write Multiple Coils") },
+    { 0x10, QT_TRANSLATE_NOOP("RawRequestDialog", "10 Write Multiple Registers") },
+    { 0x11, QT_TRANSLATE_NOOP("RawRequestDialog", "11 Report Server ID") },
+    { 0x16, QT_TRANSLATE_NOOP("RawRequestDialog", "16 Mask Write Register") },
+    { 0x17, QT_TRANSLATE_NOOP("RawRequestDialog", "17 Read/Write Multiple Registers") },
+    { 0x18, QT_TRANSLATE_NOOP("RawRequestDialog", "18 Read FIFO Queue") },
+    { 0x2B, QT_TRANSLATE_NOOP("RawRequestDialog", "2B Read Device Identification (MEI 0E)") },
 };
 
 QString timestamp()
@@ -60,44 +62,40 @@ RawRequestDialog::RawRequestDialog(std::function<QModbusClient *()> clientProvid
     : QDialog(parent)
     , m_clientProvider(std::move(clientProvider))
 {
-    setWindowTitle(QStringLiteral("原始功能码 / 报文发送"));
+    setWindowTitle(tr("Raw Function Code / PDU Sender"));
     resize(760, 560);
 
     auto *layout = new QVBoxLayout(this);
 
     // ---------- 请求参数 ----------
-    auto *reqGroup = new QGroupBox(QStringLiteral("请求"), this);
+    auto *reqGroup = new QGroupBox(tr("Request"), this);
     auto *form = new QFormLayout(reqGroup);
 
     m_serverSpin = new QSpinBox(reqGroup);
     m_serverSpin->setRange(0, 247);
     m_serverSpin->setValue(1);
-    m_serverSpin->setToolTip(QStringLiteral("从站地址（Unit ID）；0 = 广播，广播写不会收到响应"));
-    form->addRow(QStringLiteral("从站地址"), m_serverSpin);
+    m_serverSpin->setToolTip(tr("Slave address (Unit ID); 0 = broadcast, broadcast writes receive no response"));
+    form->addRow(tr("Slave address"), m_serverSpin);
 
     m_funcCombo = new QComboBox(reqGroup);
     m_funcCombo->setEditable(true);
     for (const FuncCodeEntry &e : kFuncCodes)
-        m_funcCombo->addItem(QString::fromUtf8(e.label), e.code);
+        m_funcCombo->addItem(QCoreApplication::translate("RawRequestDialog", e.label), e.code);
     m_funcCombo->setCurrentIndex(2);   // 默认 03 读保持寄存器
-    m_funcCombo->setToolTip(QStringLiteral("可直接从列表选择，也可手动输入十六进制功能码（如 2B）"));
-    form->addRow(QStringLiteral("功能码"), m_funcCombo);
+    m_funcCombo->setToolTip(tr("Pick from the list or type a hexadecimal function code (e.g. 2B)"));
+    form->addRow(tr("Function code"), m_funcCombo);
 
     m_payloadEdit = new QLineEdit(reqGroup);
-    m_payloadEdit->setPlaceholderText(QStringLiteral("PDU 数据域（十六进制），如：00 00 00 0A"));
-    form->addRow(QStringLiteral("数据(PDU)"), m_payloadEdit);
+    m_payloadEdit->setPlaceholderText(tr("PDU data field (hex), e.g. 00 00 00 0A"));
+    form->addRow(tr("Data (PDU)"), m_payloadEdit);
 
-    auto *hint = new QLabel(QStringLiteral(
-        "示例：<b>03</b> 读保持寄存器 → <code>起始地址Hi Lo 数量Hi Lo</code>，如 <code>00 00 00 0A</code>；"
-        "<b>08</b> 诊断 → <code>子功能Hi Lo 数据Hi Lo</code>；"
-        "<b>16</b> 掩码写 → <code>地址Hi Lo ANDHi Lo ORHi Lo</code>；"
-        "<b>2B</b> 读设备标识 → <code>0E 01 00</code>。"), reqGroup);
+    auto *hint = new QLabel(tr("Examples: <b>03</b> Read Holding Registers → <code>start Hi Lo, count Hi Lo</code>, e.g. <code>00 00 00 0A</code>; <b>08</b> Diagnostics → <code>sub-function Hi Lo, data Hi Lo</code>; <b>16</b> Mask Write → <code>address Hi Lo, AND Hi Lo, OR Hi Lo</code>; <b>2B</b> Read Device Identification → <code>0E 01 00</code>."), reqGroup);
     hint->setWordWrap(true);
     form->addRow(QString(), hint);
 
     auto *opRow = new QHBoxLayout();
-    m_sendBtn = new QPushButton(QStringLiteral("发送"), reqGroup);
-    m_loopCheck = new QCheckBox(QStringLiteral("循环发送"), reqGroup);
+    m_sendBtn = new QPushButton(tr("Send"), reqGroup);
+    m_loopCheck = new QCheckBox(tr("Send in loop"), reqGroup);
     m_intervalSpin = new QSpinBox(reqGroup);
     m_intervalSpin->setRange(50, 600000);
     m_intervalSpin->setValue(1000);
@@ -112,7 +110,7 @@ RawRequestDialog::RawRequestDialog(std::function<QModbusClient *()> clientProvid
     layout->addWidget(reqGroup);
 
     // ---------- 响应 / 日志 ----------
-    auto *respGroup = new QGroupBox(QStringLiteral("响应与日志"), this);
+    auto *respGroup = new QGroupBox(tr("Response & Log"), this);
     auto *respLayout = new QVBoxLayout(respGroup);
     m_log = new QPlainTextEdit(respGroup);
     m_log->setReadOnly(true);
@@ -122,11 +120,11 @@ RawRequestDialog::RawRequestDialog(std::function<QModbusClient *()> clientProvid
 
     // ---------- 状态与关闭 ----------
     auto *bottom = new QHBoxLayout();
-    m_status = new QLabel(QStringLiteral("发送: 0  成功: 0  失败: 0"), this);
+    m_status = new QLabel(tr("Sent: 0  OK: 0  Failed: 0"), this);
     bottom->addWidget(m_status);
     bottom->addStretch();
-    auto *clearBtn = new QPushButton(QStringLiteral("清空日志"), this);
-    auto *closeBtn = new QPushButton(QStringLiteral("关闭"), this);
+    auto *clearBtn = new QPushButton(tr("Clear Log"), this);
+    auto *closeBtn = new QPushButton(tr("Close"), this);
     bottom->addWidget(clearBtn);
     bottom->addWidget(closeBtn);
     layout->addLayout(bottom);
@@ -142,7 +140,7 @@ RawRequestDialog::RawRequestDialog(std::function<QModbusClient *()> clientProvid
     connect(clearBtn, &QPushButton::clicked, m_log, &QPlainTextEdit::clear);
     connect(closeBtn, &QPushButton::clicked, this, &QDialog::accept);
 
-    appendLog(QStringLiteral("提示：带下划线的示例见上方；发送前请先在主界面完成连接。"), false);
+    appendLog(tr("Tip: see the underlined examples above; connect from the main window before sending."), false);
 }
 
 RawRequestDialog::~RawRequestDialog()
@@ -178,7 +176,7 @@ void RawRequestDialog::appendLog(const QString &line, bool isError)
 
 void RawRequestDialog::updateStats()
 {
-    m_status->setText(QStringLiteral("发送: %1  成功: %2  失败: %3")
+    m_status->setText(tr("Sent: %1  OK: %2  Failed: %3")
                           .arg(m_sent).arg(m_ok).arg(m_fail));
 }
 
@@ -189,7 +187,7 @@ void RawRequestDialog::sendRequest()
 
     QModbusClient *client = m_clientProvider ? m_clientProvider() : nullptr;
     if (!client || client->state() != QModbusDevice::ConnectedState) {
-        appendLog(QStringLiteral("[%1] 未连接设备，请先在主界面连接后再发送。").arg(timestamp()), true);
+        appendLog(tr("[%1] No device connected; connect from the main window first.").arg(timestamp()), true);
         if (m_loopCheck->isChecked())
             m_loopCheck->setChecked(false);
         return;
@@ -198,7 +196,7 @@ void RawRequestDialog::sendRequest()
     QByteArray payload;
     QString err;
     if (!ModbusDiagnostics::parseHexBytes(m_payloadEdit->text(), &payload, &err)) {
-        appendLog(QStringLiteral("[%1] PDU 解析失败：%2").arg(timestamp(), err), true);
+        appendLog(tr("[%1] PDU parse failed: %2").arg(timestamp(), err), true);
         if (m_loopCheck->isChecked())
             m_loopCheck->setChecked(false);
         return;
@@ -206,7 +204,7 @@ void RawRequestDialog::sendRequest()
 
     const quint8 code = currentFunctionCode();
     if (!ModbusDiagnostics::isValidFunctionCode(code)) {
-        appendLog(QStringLiteral("[%1] 功能码无效，请输入 01~7F 的十六进制值。").arg(timestamp()), true);
+        appendLog(tr("[%1] Invalid function code; enter a hex value in 01~7F.").arg(timestamp()), true);
         if (m_loopCheck->isChecked())
             m_loopCheck->setChecked(false);
         return;
@@ -216,7 +214,7 @@ void RawRequestDialog::sendRequest()
     QModbusRequest request(static_cast<QModbusPdu::FunctionCode>(code), payload);
     m_inFlight = client->sendRawRequest(request, server);
     if (!m_inFlight) {
-        appendLog(QStringLiteral("[%1] 发送失败：%2").arg(timestamp(), client->errorString()), true);
+        appendLog(tr("[%1] Send failed: %2").arg(timestamp(), client->errorString()), true);
         ++m_fail;
         updateStats();
         return;
@@ -249,7 +247,7 @@ void RawRequestDialog::onReplyFinished()
 
     if (reply->error() != QModbusDevice::NoError) {
         ++m_fail;
-        appendLog(QStringLiteral("[%1] 从站 %2  FC %3  → 失败：%4  (%5 ms)")
+        appendLog(tr("[%1] Slave %2  FC %3  -> failed: %4  (%5 ms)")
                       .arg(timestamp())
                       .arg(m_serverSpin->value())
                       .arg(fc, reply->errorString())
@@ -261,15 +259,15 @@ void RawRequestDialog::onReplyFinished()
         QString extra;
         if (resp.isException()) {
             const int ex = static_cast<int>(resp.exceptionCode());
-            extra = QStringLiteral("   ← 异常码 %1 (%2)").arg(ModbusDiagnostics::hexByte(static_cast<quint8>(ex)),
+            extra = tr("   <- exception code %1 (%2)").arg(ModbusDiagnostics::hexByte(static_cast<quint8>(ex)),
                                                  ModbusDiagnostics::exceptionName(ex));
         }
-        appendLog(QStringLiteral("[%1] 从站 %2  FC %3  → OK  响应功能码 %4  数据(%5字节)= %6%7  (%8 ms)")
+        appendLog(tr("[%1] Slave %2  FC %3  -> OK  response FC %4  data (%5 bytes) = %6%7  (%8 ms)")
                       .arg(timestamp())
                       .arg(m_serverSpin->value())
                       .arg(fc, ModbusDiagnostics::hexByte(static_cast<quint8>(resp.functionCode())))
                       .arg(resp.data().size())
-                      .arg(hex.isEmpty() ? QStringLiteral("(空)") : hex)
+                      .arg(hex.isEmpty() ? tr("(empty)") : hex)
                       .arg(extra)
                       .arg(ms), false);
     }
@@ -286,7 +284,7 @@ void RawRequestDialog::onGuardTimeout()
     m_inFlight = nullptr;
     m_busy = false;
     ++m_fail;
-    appendLog(QStringLiteral("[%1] 从站 %2  FC %3  → 超时无响应（广播或被静默丢弃）")
+    appendLog(tr("[%1] Slave %2  FC %3  -> timeout, no response (broadcast or silently dropped)")
                   .arg(timestamp())
                   .arg(m_serverSpin->value())
                   .arg(ModbusDiagnostics::hexByte(currentFunctionCode())), true);
