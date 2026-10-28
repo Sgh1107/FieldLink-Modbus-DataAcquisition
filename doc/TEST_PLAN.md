@@ -139,10 +139,20 @@ python slave/modbus_tcp_simulator.py --unit 3          # 多从站联调
 **自动化（推荐先跑这个）**：
 
 ```bash
-bash tools/mqtt_test.sh              # 两层全跑（协议单元 + 端到端）
-bash tools/mqtt_test.sh --unit         # 只跑协议单元层（最快）
-bash tools/mqtt_test.sh --e2e          # 只跑端到端层（自动拉起 broker）
-bash tools/mqtt_test.sh --manual       # 额外保留 broker 60 秒，供手工观察
+# Linux / macOS / Git Bash / WSL
+bash tools/mqtt_test.sh                  # 两层全跑（协议单元 + 端到端）
+bash tools/mqtt_test.sh --unit           # 只跑协议单元层（最快）
+bash tools/mqtt_test.sh --e2e            # 只跑端到端层（自动拉起 broker）
+bash tools/mqtt_test.sh --manual         # 额外保留 broker 60 秒，供手工观察
+```
+
+```powershell
+# Windows（无需 Git Bash；只依赖 Python 3 与本地 Qt 套件）
+powershell -ExecutionPolicy Bypass -File tools\mqtt_test.ps1            # 两层全跑
+powershell -ExecutionPolicy Bypass -File tools\mqtt_test.ps1 -Mode unit # 只跑协议单元层
+powershell -ExecutionPolicy Bypass -File tools\mqtt_test.ps1 -Mode e2e  # 只跑端到端层（自动拉起 broker）
+powershell -ExecutionPolicy Bypass -File tools\mqtt_test.ps1 -Mode manual -Port 18883  # 保留 broker 供手工观察
+# 单元层默认跑全量（含 MQTT 连接超时/重连等依赖真实时间的用例）；加 -Fast 跳过慢速用例
 ```
 
 两层职责：
@@ -152,9 +162,9 @@ bash tools/mqtt_test.sh --manual       # 额外保留 broker 60 秒，供手工�
 | 协议单元层 | `tests/` 内置 FakeBroker（进程内） | CONNECT/PUBLISH/PINGREQ/PUBACK 编解码、retain 标志、QoS1 的 PUBACK 闭环、未连接丢弃告警合并、自动重连循环 |
 | 端到端层 | `slave/mqtt_test_broker.py` 真实子进程 | 真实 socket 路径、QoS0/1、认证接受与拒绝、用户意图门控、8KB 大载荷（多字节 Remaining Length）、UTF-8 中文主题、含 0x00/0xFF 的二进制载荷；并核对 broker 侧实际收到的条数与 qos/retain 标志 |
 
-端到端层由 `tools/mqtt_e2e.cpp`（客户端侧）+ `tools/mqtt_test.sh`（拉起 broker）组成，
-共 24 项断言。**broker 由脚本外部启动而非 QProcess 拉起**——受限环境（IDE/沙箱）下
-QProcess 启动子进程会被系统拒绝，且 broker 本就是独立外部服务，分离更贴近真实部署。
+端到端层由 `tools/mqtt_e2e.cpp`（客户端侧）+ `tools/mqtt_test.sh` / `tools/mqtt_test.ps1`
+（拉起 broker）组成，共 24 项断言。**broker 由脚本外部启动而非 QProcess 拉起**——受限环境
+（IDE/沙箱）下 QProcess 启动子进程会被系统拒绝，且 broker 本就是独立外部服务，分离更贴近真实部署。
 
 **手工联调**：
 

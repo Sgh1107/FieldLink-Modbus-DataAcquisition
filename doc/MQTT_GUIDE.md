@@ -38,14 +38,39 @@ FieldLink 内置了一个**极简 MQTT 3.1.1 发布端客户端**（QoS 0/1）�
 - **发送降级**：broker 未连接时 `publish` 返回 false 并记录日志，不阻塞采集主流程
 - **clean session**：每次连接使用全新会话，避免离线期消息堆积冲击订阅方
 
-## 四、测试（无需真实 broker）
+## 四、测试（无需真实 broker，也无需 MQTTX）
 
-仓库附带标准库实现的迷你 broker `slave/mqtt_test_broker.py`，会打印收到的每条消息：
+**不需要安装 mosquitto / EMQX，也不需要 MQTTX 之类的客户端。** 仓库自带一个纯标准库实现的
+迷你 broker `slave/mqtt_test_broker.py`（零第三方依赖，只要 Python 3），并提供了三层验证：
+
+| 层 | 怎么跑 | 验什么 | 耗时 |
+| --- | --- | --- | --- |
+| 协议单元层 | 测试套件里的 FakeBroker（进程内） | CONNECT/PUBLISH/PINGREQ/PUBACK 编解码、retain、QoS1 闭环、未连接丢弃告警合并 | 秒级 |
+| 端到端层 | `tools/mqtt_e2e.cpp` + 迷你 broker 子进程 | 真实 socket 路径、认证接受/拒绝、用户意图门控、8KB 大载荷、UTF-8 主题、二进制载荷 | ~20s |
+| 手工联调层 | 手动起 broker + 主程序界面 | 真实采集数据是否按主题上送、QoS/retain 是否符合预期 | 看情况 |
+
+一键脚本（会自动编译、拉起 broker、跑完并核对 broker 侧实际收到的条数）：
 
 ```powershell
-# 终端 1：启动测试 broker（可选开启认证）
-python slave\mqtt_test_broker.py --port 1883
-python slave\mqtt_test_broker.py --port 1883 --user test --pass secret
+# Windows（PowerShell，无需 Git Bash）
+powershell -ExecutionPolicy Bypass -File tools\mqtt_test.ps1                 # 两层全跑
+powershell -ExecutionPolicy Bypass -File tools\mqtt_test.ps1 -Mode e2e      # 只跑端到端
+powershell -ExecutionPolicy Bypass -File tools\mqtt_test.ps1 -Mode manual -Port 18883  # 手工联调
+```
+
+```bash
+# Linux / macOS / Git Bash / WSL
+bash tools/mqtt_test.sh              # 两层全跑
+bash tools/mqtt_test.sh --e2e        # 只跑端到端
+bash tools/mqtt_test.sh --manual     # 手工联调
+```
+
+手工联调（只想亲眼看报文时）：
+
+```powershell
+# 终端 1：启动测试 broker（可选开启认证），会实时打印收到的每条 PUBLISH
+python -u slave\mqtt_test_broker.py --port 1883
+python -u slave\mqtt_test_broker.py --port 1883 --user test --pass secret
 
 # 终端 2：FieldLink MQTT 设置里指向 127.0.0.1:1883 连接，启动轮询任务
 # broker 终端将实时打印：
@@ -54,7 +79,13 @@ python slave\mqtt_test_broker.py --port 1883 --user test --pass secret
 # PINGREQ client=fieldlink-xxxx
 ```
 
-有 mosquitto 的话用 `mosquitto_sub -t "fieldlink/#" -v` 观察效果相同。
+有 mosquitto 的话用 `mosquitto_sub -t "fieldlink/#" -v` 观察效果相同；迷你 broker 也支持
+SUBSCRIBE 与 `+`/`#` 通配符，会按订阅把匹配的 PUBLISH 转发回来，所以不装 MQTTX 也能用
+一个小脚本当订阅端。
+
+**什么情况才需要真实 broker**：验证与第三方 broker 的兼容性（mosquitto/EMQX/HiveMQ）、
+TLS/WebSocket、集群与 ACL、以及订阅端的真实投递行为。迷你 broker 只实现发布端所能触发的
+最小子集（CONNECT/CONNACK、PUBLISH、PUBACK、PINGREQ/PINGRESP、SUBSCRIBE 转发）。
 
 ## 五、已知边界（刻意精简）
 
