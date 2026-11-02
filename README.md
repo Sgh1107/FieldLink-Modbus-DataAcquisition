@@ -40,8 +40,11 @@
 - ✅ **Modbus 调试工具**：原始功能码/报文发送窗（基于 `sendRawRequest`，覆盖 FC07/08/0B/0C/11/16(22)/17(23)/18(24)/2B·0E 等 Qt SerialBus 未封装功能，支持循环发送与异常码解析）+ **总线扫描器**（区间扫描在线从站、可一键生成轮询任务）
 - ✅ **点表批量导入导出**：CSV / JSON 双向，表头自适应定位列、支持「追加 / 覆盖」、严格校验（解析失败不破坏现有点位），CSV 带 BOM 且正确转义
 - ✅ **三库分离的内置 SQLite**：历史 `history.db`、报警 `alarms.db`、MQTT 离线队列 `mqtt_outbox.db` 各自独立（WAL），首次打开自动建库建表、免安装免配置；菜单 **Advanced → Database Settings** 可修改路径、自检连通性并即时切换
+- ✅ **定时报表 + 数据库自动备份**：按分钟周期生成 Markdown 报表（点位样本数/min/max/avg/最新值/异常样本 + 报警汇总），并用 SQLite **`VACUUM INTO`** 对三个库做运行中一致性快照备份，按保留数自动轮换，无需停机、无需手工拷贝 WAL 文件
+- ✅ **整站配置一键迁移**：单 JSON 配置包导出/导入（点位、模板、设备、串口、MQTT、安全、界面等全部设置），逐文件 SHA-256 校验 + 路径穿越防护，覆盖前自动备份到 `config_backups/`，适合批量部署与现场备份
+- ✅ **点位级写保护 / 联锁**：点位可设写锁定与联锁条件（联锁点位质量 Good 且工程值在允许区间才放行），手动写、读写、批量写、远程 API 四个入口统一拦截并审计，保护优先于联锁、联锁缺失/质量异常一律 fail-safe 拒绝
 - ✅ **主题与本地化**：深色/浅色工业风主题一键切换（Fusion + QSS），配置自动记忆；界面**中英双语**（菜单 Options → Language，切换立即重译所有窗口），源码以英文为翻译源、`translations/fieldlink_zh_CN.ts` 提供简体中文，lrelease 构建期编译并嵌入资源
-- ✅ **内置测试套件**：`tests/` 下 **592 项**无 GUI 断言（报警条件/位号越界防护/加盐哈希/权限模型/MQTT QoS0+QoS1 协议/字节序换算/任务调度/CSV 转义/点表 CSV·JSON 导入导出往返与原子性/Modbus 调试工具 PDU 解析·异常码·报文构造·扫描区间校验/多设备点位隔离·工程值历史与聚合·工程值报警·质量降级/报警持久化与重启恢复/MQTT 离线队列·优先级补发·在途重入队），`qmake + make` 一键回归；另附 `tools/run_tests.sh` 一键跑全量回归、`tools/mqtt_test.sh`（Windows 用 `tools/mqtt_test.ps1`）一键跑 MQTT 两层测试（协议单元 + 真实 broker 端到端）
+- ✅ **内置测试套件**：`tests/` 下 **765 项**无 GUI 断言（报警条件/位号越界防护/加盐哈希/权限模型/MQTT QoS0+QoS1 协议/字节序换算/任务调度/CSV 转义/点表 CSV·JSON 导入导出往返与原子性/Modbus 调试工具 PDU 解析·异常码·报文构造·扫描区间校验/多设备点位隔离·工程值历史与聚合·工程值报警·质量降级/报警持久化与重启恢复/MQTT 离线队列·优先级补发·在途重入队/定时报表与 VACUUM INTO 备份·保留轮换/整站配置包校验·路径穿越防护·覆盖前备份/点位写保护与联锁判定·JSON·CSV 持久化），`qmake + make` 一键回归；另附 `tools/run_tests.sh` 一键跑全量回归、`tools/mqtt_test.sh`（Windows 用 `tools/mqtt_test.ps1`）一键跑 MQTT 两层测试（协议单元 + 真实 broker 端到端）
 - ✅ **交付工具链内置**：交付清单、运行环境检查、日志打包、发布说明/用户手册/维护手册自动生成、Windows 打包脚本一键产出
 
 ---
@@ -156,6 +159,8 @@ FieldLink-Modbus-DataAcquisition/
 │   ├── historydata.h         # 历史数据：SQLite 存储与查询
 │   ├── dataexporter.h        # 数据导出（CSV）
 │   ├── configprofile.h       # 配置档案：整站配置保存/恢复
+│   ├── siteconfigbundle.h    # 整站配置包：单 JSON 导出/导入、SHA-256 校验、路径安全
+│   ├── reportscheduler.h     # 定时报表 + 数据库自动备份（VACUUM INTO / 保留轮换）
 │   ├── alarmmanager.h        # 报警管理：规则触发/去抖/确认/历史
 │   ├── alarmrepository.h     # 报警持久化：规则/事件/活动状态（SQLite alarms.db）
 │   │
@@ -163,6 +168,7 @@ FieldLink-Modbus-DataAcquisition/
 │   ├── realtimechart.h       # 实时曲线
 │   ├── dashboard.h           # 仪表盘
 │   ├── pointmodel.h          # 点位管理：设备维度、质量码、归档门控与图表/仪表绑定
+│   ├── writeguard.h          # 点位级写保护/联锁统一判定（手动/批量/远程共用）
 │   │
 │   ├── ── 扩展与远程 ──
 │   ├── remoteserver.h        # 内置 HTTP JSON API 服务（状态/读/写）
@@ -204,7 +210,7 @@ FieldLink-Modbus-DataAcquisition/
 ├── images/                   # 界面图标资源
 ├── deploy/                   # Windows 发布打包脚本（package_windows.ps1）
 ├── slave/                    # 测试用模拟服务端：Modbus 从站模拟器 / MQTT 测试 broker
-├── tests/                    # 单元/集成测试套件（无 GUI，665 项断言）
+├── tests/                    # 单元/集成测试套件（无 GUI，765 项断言）
 ├── tools/                    # 工程脚本：run_tests.sh 全量回归 / mqtt_test.sh·mqtt_test.ps1 MQTT 专项
 ├── .github/workflows/        # CI：Qt 6 自动构建 + 测试回归 + ASan/UBSan 内存与未定义行为检查
 ├── doc/                      # USAGE 使用手册 / MQTT 指南 / Code Review 报告 / AI 集成设计

@@ -50,6 +50,7 @@ class VerificationManager;
 class DeliveryManager;
 class MqttClient;
 class DeviceSimulatorPanel;
+class ReportScheduler;
 
 struct PollTask;
 struct BatchTask;
@@ -116,6 +117,9 @@ private slots:
     void toggleRemoteServer();
     void showMqttSettings();
     void showDatabaseSettings();               // SQLite 数据库文件路径 / 连接状态配置
+    void showScheduledTasks();                 // 定时报表 + 数据库自动备份
+    void exportSiteConfig();                   // 整站配置一键导出
+    void importSiteConfig();                   // 整站配置一键导入
     void showDeviceSimulator();
     void showPluginManager();
     void showPointManager();
@@ -152,6 +156,12 @@ private:
     void executeRemoteWrite(int serverAddress, int registerType, int startAddress,
                             const QVector<quint16> &values,
                             const std::function<void(const QJsonObject &)> &callback);
+
+    // ---------- 点位级写保护 / 联锁 ----------
+    // 所有真正下发写请求的入口都必须先调用；返回 false 时 reason 为可显示的原因。
+    bool checkPointWriteAllowed(int deviceId, int serverAddress, int registerType,
+                                int startAddress, int count, QString *reason) const;
+    void configureReportScheduler();           // 从 QSettings 装载报表/备份配置并启动定时器
 
     // ---------- 多设备 / 点表驱动采集 ----------
     // deviceId 0 = 主连接；>0 = DeviceManager 中的设备（返回 nullptr 表示设备不存在）
@@ -193,6 +203,7 @@ private:
     PointModel *m_pointModel;
     VerificationManager *m_verificationManager;
     DeliveryManager *m_deliveryManager;
+    ReportScheduler *m_reportScheduler = nullptr;  // 定时报表 + 数据库自动备份
     MqttClient *m_mqttClient = nullptr;            // MQTT 发布端客户端
     DeviceSimulatorPanel *m_deviceSimulatorPanel = nullptr;   // 模拟设备面板
     class QTimer *m_autoReadTimer = nullptr;       // 实时读取定时轮询

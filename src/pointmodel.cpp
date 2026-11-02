@@ -298,6 +298,13 @@ QJsonObject PointModel::pointToJson(const PointDefinition &point) const
     obj["archiveIntervalSec"] = point.archiveIntervalSec;
     obj["archiveDeadband"] = point.archiveDeadband;
     obj["pollIntervalSec"] = point.pollIntervalSec;
+    // 写保护 / 联锁（旧文件缺字段时 pointFromJson 使用默认值，保持向后兼容）
+    obj["writeProtected"] = point.writeProtected;
+    obj["writeProtectNote"] = point.writeProtectNote;
+    obj["interlockEnabled"] = point.interlockEnabled;
+    obj["interlockPointId"] = point.interlockPointId;
+    obj["interlockMin"] = point.interlockMin;
+    obj["interlockMax"] = point.interlockMax;
     return obj;
 }
 
@@ -325,6 +332,12 @@ PointDefinition PointModel::pointFromJson(const QJsonObject &obj) const
     point.archiveIntervalSec = obj["archiveIntervalSec"].toInt(5);
     point.archiveDeadband = obj["archiveDeadband"].toDouble(0.0);
     point.pollIntervalSec = obj["pollIntervalSec"].toInt(1);
+    point.writeProtected = obj["writeProtected"].toBool(false);
+    point.writeProtectNote = obj["writeProtectNote"].toString();
+    point.interlockEnabled = obj["interlockEnabled"].toBool(false);
+    point.interlockPointId = obj["interlockPointId"].toInt(0);
+    point.interlockMin = obj["interlockMin"].toDouble(0.0);
+    point.interlockMax = obj["interlockMax"].toDouble(0.0);
     return point;
 }
 
@@ -501,6 +514,12 @@ const ColumnAlias kColumnAliases[] = {
     { "deviceid",           "deviceid" },
     { "pollintervalsec",    "pollintervalsec" },
     { "archivedeadband",    "archivedeadband" },
+    { "writeprotected",     "writeprotected" },
+    { "writeprotectnote",   "writeprotectnote" },
+    { "interlockenabled",   "interlockenabled" },
+    { "interlockpointid",   "interlockpointid" },
+    { "interlockmin",       "interlockmin" },
+    { "interlockmax",       "interlockmax" },
     // 中文别名
     { "name",               "名称" },
     { "serveraddress",      "从站地址" },
@@ -526,6 +545,12 @@ const ColumnAlias kColumnAliases[] = {
     { "pollintervalsec",    "采集周期" },
     { "pollintervalsec",    "轮询周期" },
     { "archivedeadband",    "归档死区" },
+    { "writeprotected",     "写保护" },
+    { "writeprotectnote",   "写保护备注" },
+    { "interlockenabled",   "联锁" },
+    { "interlockpointid",   "联锁点位" },
+    { "interlockmin",       "联锁下限" },
+    { "interlockmax",       "联锁上限" },
 };
 
 // 把一个表头单元格文本映射到规范列名；不是已知列名则返回空串。
@@ -594,7 +619,7 @@ bool PointModel::exportToCsv(const QString &filePath, QString *error) const
     QTextStream out(&file);
     out.setGenerateByteOrderMark(true);
     // 列顺序与 defaultOrder 严格一致；新增列一律追加到末尾以保持旧文件兼容。
-    out << "id,name,serverAddress,registerType,address,count,dataType,scale,offset,unit,alarmLow,alarmHigh,archiveEnabled,archiveIntervalSec,byteOrder,deviceId,pollIntervalSec,archiveDeadband\n";
+    out << "id,name,serverAddress,registerType,address,count,dataType,scale,offset,unit,alarmLow,alarmHigh,archiveEnabled,archiveIntervalSec,byteOrder,deviceId,pollIntervalSec,archiveDeadband,writeProtected,writeProtectNote,interlockEnabled,interlockPointId,interlockMin,interlockMax\n";
     for (const auto &p : m_points) {
         QStringList cells;
         cells << QString::number(p.id)
@@ -615,7 +640,13 @@ bool PointModel::exportToCsv(const QString &filePath, QString *error) const
               << csvEscape(DataParser::byteOrderToToken(p.byteOrder))
               << QString::number(p.deviceId)
               << QString::number(p.pollIntervalSec)
-              << QString::number(p.archiveDeadband, 'g', 17);
+              << QString::number(p.archiveDeadband, 'g', 17)
+              << QString(p.writeProtected ? QLatin1String("1") : QLatin1String("0"))
+              << csvEscape(p.writeProtectNote)
+              << QString(p.interlockEnabled ? QLatin1String("1") : QLatin1String("0"))
+              << QString::number(p.interlockPointId)
+              << QString::number(p.interlockMin, 'g', 17)
+              << QString::number(p.interlockMax, 'g', 17);
         out << cells.join(QLatin1Char(',')) << '\n';
     }
     out.flush();
@@ -746,7 +777,9 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
     const QStringList defaultOrder = { "id", "name", "serveraddress", "registertype", "address",
                                        "count", "datatype", "scale", "offset", "unit",
                                        "alarmlow", "alarmhigh", "archiveenabled", "archiveintervalsec",
-                                       "byteorder", "deviceid", "pollintervalsec", "archivedeadband" };
+                                       "byteorder", "deviceid", "pollintervalsec", "archivedeadband",
+                                       "writeprotected", "writeprotectnote", "interlockenabled",
+                                       "interlockpointid", "interlockmin", "interlockmax" };
     if (!hasHeader) {
         for (int i = 0; i < defaultOrder.size(); ++i)
             col.insert(defaultOrder.at(i), i);
@@ -928,6 +961,51 @@ bool PointModel::importFromCsv(const QString &filePath, bool append, int *import
                 p.archiveDeadband = qMax(0.0, deadband);
             }
         }
+        // ---- 写保护 / 联锁（旧 CSV 缺列时使用安全默认值：不保护、不联锁） ----
+        p.writeProtected = boolFromToken(cellOf(row, QStringLiteral("writeprotected")), false);
+        p.writeProtectNote = cellOf(row, QStringLiteral("writeprotectnote"));
+        p.interlockEnabled = boolFromToken(cellOf(row, QStringLiteral("interlockenabled")), false);
+        {
+            const QString linkedText = cellOf(row, QStringLiteral("interlockpointid"));
+            bool linkedOk = false;
+            const int linkedId = linkedText.isEmpty() ? 0 : linkedText.toInt(&linkedOk);
+            if (!linkedText.isEmpty() && (!linkedOk || linkedId < 0)) {
+                invalidReasons << QCoreApplication::translate("PointModel", "Line %1: invalid interlock point id '%2', interlock disabled").arg(r + 1).arg(linkedText);
+                p.interlockEnabled = false;
+                p.interlockPointId = 0;
+            } else {
+                p.interlockPointId = linkedId;
+            }
+
+            const QString minText = cellOf(row, QStringLiteral("interlockmin"));
+            bool minOk = false;
+            const double minValue = minText.isEmpty() ? 0.0 : minText.toDouble(&minOk);
+            if (!minText.isEmpty() && !minOk) {
+                invalidReasons << QCoreApplication::translate("PointModel", "Line %1: invalid interlock minimum '%2', using 0").arg(r + 1).arg(minText);
+                p.interlockMin = 0.0;
+            } else {
+                p.interlockMin = minValue;
+            }
+
+            const QString maxText = cellOf(row, QStringLiteral("interlockmax"));
+            bool maxOk = false;
+            const double maxValue = maxText.isEmpty() ? 0.0 : maxText.toDouble(&maxOk);
+            if (!maxText.isEmpty() && !maxOk) {
+                invalidReasons << QCoreApplication::translate("PointModel", "Line %1: invalid interlock maximum '%2', using 0").arg(r + 1).arg(maxText);
+                p.interlockMax = 0.0;
+            } else {
+                p.interlockMax = maxValue;
+            }
+            if (p.interlockMin > p.interlockMax) {
+                invalidReasons << QCoreApplication::translate("PointModel", "Line %1: interlock minimum > maximum, interlock disabled").arg(r + 1);
+                p.interlockEnabled = false;
+            }
+        }
+        if (p.interlockEnabled && p.interlockPointId <= 0) {
+            invalidReasons << QCoreApplication::translate("PointModel", "Line %1: interlock enabled without a point id, interlock disabled").arg(r + 1);
+            p.interlockEnabled = false;
+        }
+
         if (p.name.isEmpty())
             p.name = QCoreApplication::translate("PointModel", "Point %1").arg(p.address);
         parsed.append(p);

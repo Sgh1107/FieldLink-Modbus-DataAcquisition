@@ -42,6 +42,9 @@ SOURCES += src/main.cpp\
         src/reliabilitymanager.cpp \
         src/securitymanager.cpp \
         src/pointmodel.cpp \
+        src/writeguard.cpp \
+        src/reportscheduler.cpp \
+        src/siteconfigbundle.cpp \
         src/verificationmanager.cpp \
         src/deliverymanager.cpp \
         src/crashlogger.cpp \
@@ -75,6 +78,9 @@ HEADERS  += header/mainwindow.h \
         header/reliabilitymanager.h \
         header/securitymanager.h \
         header/pointmodel.h \
+        header/writeguard.h \
+        header/reportscheduler.h \
+        header/siteconfigbundle.h \
         header/verificationmanager.h \
         header/deliverymanager.h \
         header/crashlogger.h \

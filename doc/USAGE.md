@@ -26,6 +26,9 @@
 17. 点表批量导入导出
 18. 数据库文件与外部查看
 19. 界面语言与翻译
+20. 定时报表与数据库自动备份
+21. 整站配置一键导出 / 导入
+22. 点位级写保护与联锁
 
 ---
 
@@ -431,9 +434,10 @@ data 消息由**轮询/批量读取成功**触发，先确认有轮询任务在�
 **支持格式**
 
 - **CSV**：带表头，列为
-  `id,name,serverAddress,registerType,address,count,dataType,scale,offset,unit,alarmLow,alarmHigh,archiveEnabled,archiveIntervalSec`
+  `id,name,serverAddress,registerType,address,count,dataType,scale,offset,unit,alarmLow,alarmHigh,archiveEnabled,archiveIntervalSec,byteOrder,deviceId,pollIntervalSec,archiveDeadband,writeProtected,writeProtectNote,interlockEnabled,interlockPointId,interlockMin,interlockMax`
   - `registerType` 可写数字 `0=Coils,1=DiscreteInputs,2=InputRegisters,3=HoldingRegisters`，也可写英文/中文名；
-  - `archiveEnabled` 接受 `1/0`、`true/false`、`是/否`；
+  - `archiveEnabled`、`writeProtected`、`interlockEnabled` 接受 `1/0`、`true/false`、`是/否`；
+  - 旧 CSV 缺少写保护/联锁列时按「不保护、不联锁」导入，保持向后兼容；
   - 导入时会**按表头名定位列**，列顺序可调整；无表头时回退到上述默认顺序；
   - 正确解析双引号包裹与 `""` 转义，字段含逗号/引号/换行也不会串行。
 - **JSON**：与内部 `points.json` 同构（对象数组）。
@@ -512,7 +516,7 @@ FROM mqtt_outbox ORDER BY priority DESC, id;
 ### 4. 注意事项
 
 - **WAL**：运行中最新数据可能还在 `xxx.db-wal` 里。外部工具看不到最新记录时，先关闭 FieldLink 再刷新；
-- **备份**：运行中备份必须把 `xxx.db`、`xxx.db-wal`、`xxx.db-shm` 三个文件一起拷，只拷 `.db` 会丢最近写入；
+- **备份**：运行中备份必须把 `xxx.db`、`xxx.db-wal`、`xxx.db-shm` 三个文件一起拷，只拷 `.db` 会丢最近写入；更省事的做法是用 **Advanced → Scheduled Reports & Backup** 的自动备份（内部 `VACUUM INTO`，运行中也能得到一致快照，见第二十章）；
 - **不要在程序运行时改表**：报警规则在启动时载入内存，直接改 `alarm_rules` 界面不会刷新，下次保存还可能被覆盖；要改请关程序改，或用界面改；
 - **不要改日志模式、不要 VACUUM**：外部工具若提示把 journal mode 改成 DELETE，选「否」；
 - **发布包要带 `sqldrivers/qsqlite.dll`**（`windeployqt` 会自动拷贝）。缺失时报 `QSQLITE driver not loaded`，表现为历史归档不可用、报警退化为仅内存、MQTT 离线队列打不开。
@@ -538,5 +542,111 @@ lrelease translations/fieldlink_zh_CN.ts -qm build/release/fieldlink_zh_CN.qm
 
 - 刻意不翻译的内容：CSV/JSON 表头别名与解析记号（兼容既有文件）、自动生成的 Markdown 报告正文与文件名、开发者日志（`qWarning`/审计信息）。
 
+---
 
+## 二十、定时报表与数据库自动备份
 
+入口：菜单 **Advanced → Scheduled Reports & Backup**。报表与备份可以分别启用、分别设置周期，互不影响。
+
+### 1. 定时报表
+
+- 启用后按「间隔（分钟）」生成 Markdown 报表，时间窗为**最近一个间隔**；
+- 报表内容：
+  - 每个点位的样本数、最小/最大/平均值、最新值、异常样本数（质量码非 Good）；
+  - 报警汇总：事件总数、Critical/Warning/Info 计数、未确认数，以及最近 50 条事件明细；
+- 默认输出目录 `%APPDATA%\fieldlink\fieldlink\reports`，文件名 `report_yyyyMMdd_HHmmss.md`；
+- 「保留最新」= 0 表示全部保留；>0 时按文件名时间戳删除最旧文件（只清理 `report_*.md`）；
+- 「立即生成报表」用于当场验证配置，不必等定时器。
+
+### 2. 数据库自动备份
+
+- 对 `history.db`、`alarms.db`、`mqtt_outbox.db` 逐个执行 SQLite **`VACUUM INTO`**：
+  - WAL 模式下也能得到**一致性快照**，不会漏掉还在 `.db-wal` 里的最新写入；
+  - 不需要停止采集，也不需要手工拷贝三个文件；
+- 备份文件名 `<库名>_yyyyMMdd_HHmmss_zzz.db`，每个库按自己的保留数独立轮换，互不挤占名额；
+- 源库不存在时跳过并在结果里计数，不算失败；
+- 「立即备份」用于当场验证配置。
+
+### 3. 配置键与失败处理
+
+| 配置键 | 含义 | 默认值 |
+| --- | --- | --- |
+| `report/enabled` | 启用定时报表 | `false` |
+| `report/intervalMinutes` | 报表周期（分钟） | `60` |
+| `report/dir` | 报表输出目录 | `%APPDATA%\fieldlink\fieldlink\reports` |
+| `report/retention` | 保留报表数量，0=全部 | `30` |
+| `backup/enabled` | 启用自动备份 | `false` |
+| `backup/intervalMinutes` | 备份周期（分钟） | `60` |
+| `backup/dir` | 备份目录 | `%APPDATA%\fieldlink\fieldlink\backups` |
+| `backup/retention` | 每个库保留数量，0=全部 | `14` |
+
+失败只在状态栏/日志中记录并弹出提示，不会中断采集主流程；报表正文为 UTF-8 Markdown，可直接用 VS Code / Typora 打开。
+
+---
+
+## 二十一、整站配置一键导出 / 导入
+
+入口：菜单 **Profile → Export Site Configuration... / Import Site Configuration...**。
+
+### 1. 导出
+
+- 生成单个 JSON 配置包，包含：
+  - `points.json`（点位表）、`templates.json`（设备模板）——文件存在才打包，缺失的会提示跳过；
+  - 应用全部 QSettings：设备、串口、MQTT、安全、界面、报表/备份等；
+- 每个文件带 base64 内容、字节数与 **SHA-256** 校验；
+- 写盘使用临时文件 + 原子替换，导出中断不会留下半个包。
+
+### 2. 导入
+
+导入前会完整校验，**任一失败整体拒绝、不写任何文件、不改任何设置**：
+
+- `format` / `version` 必须匹配；
+- 每个文件路径必须是相对路径：拒绝绝对路径、盘符、UNC、`..`、`.`、控制字符、重复路径；
+- 每个文件的 SHA-256 与大小必须匹配（防止手工改包/传输损坏）。
+
+校验通过后：
+
+1. 覆盖同名文件前，先把原文件备份到程序目录 `config_backups/<yyyyMMdd_HHmmss_zzz>/`（保持相对目录结构）；
+2. 写临时文件后原子替换目标文件；
+3. 应用配置包中的 QSettings；
+4. 立即重新加载设置、点位、模板、设备并重建轮询任务。
+
+> 安全、MQTT、远程服务相关设置建议**重启 FieldLink** 后完全生效。
+
+配置包内含安全设置与 MQTT 凭据（混淆存储），请按密码同等对待，不要公开分享。
+
+---
+
+## 二十二、点位级写保护与联锁
+
+入口：**Advanced → Point Manager → Add / Edit**，或直接编辑 `points.json` / CSV 后导入。
+
+### 1. 写保护
+
+- 勾选「Write protection」后，该点位覆盖的寄存器/位区间**禁止任何写入**；
+- 四个写入入口统一拦截，避免「某个入口忘了判断」：
+  1. 主界面手动写（Write）；
+  2. 读写组合（Read/Write）；
+  3. 批量写任务；
+  4. 远程 HTTP API `/api/write`；
+- 拒绝时状态栏/日志给出原因，并记录 `WRITE_BLOCKED` 审计（来源分别为 local / batch / remote）。
+
+### 2. 联锁
+
+- 勾选「Enable interlock」并选择联锁点位，设置允许区间 `[Interlock minimum, Interlock maximum]`；
+- 写目标点位前要求联锁点位：
+  - 当前质量码为 **Good**；
+  - 工程值处于允许区间（含边界）；
+- 以下情况一律拒绝（fail-safe，宁可不写）：
+  - 联锁点位已被删除；
+  - 联锁点位没有有效读数；
+  - 质量码为 Bad / Timeout / OutOfRange / Unknown；
+  - 工程值超出区间；
+- **写保护优先于联锁**：同时命中时按写保护拒绝。
+
+### 3. 区间跨度与持久化
+
+- 点位实际占用跨度按数据类型自动扩展：`float32/int32/uint32` 至少 2 个寄存器，`float64/int64/uint64` 至少 4 个，避免只保护首寄存器而漏掉后半段；
+- JSON 字段：`writeProtected`、`writeProtectNote`、`interlockEnabled`、`interlockPointId`、`interlockMin`、`interlockMax`；
+- CSV 增加同名列；旧文件缺列时默认**不保护、不联锁**，向后兼容；
+- 点位管理表新增「Write lock」「Interlock」两列，可直接查看状态。

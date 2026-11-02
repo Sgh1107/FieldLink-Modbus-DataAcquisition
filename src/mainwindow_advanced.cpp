@@ -17,6 +17,9 @@
 #include "reliabilitymanager.h"
 #include "securitymanager.h"
 #include "pointmodel.h"
+#include "writeguard.h"          // 点位级写保护 / 联锁
+#include "reportscheduler.h"     // 定时报表 + 数据库自动备份
+#include "siteconfigbundle.h"    // 整站配置一键导出 / 导入
 #include "dataparser.h"   // ByteOrder / byteOrderFromToken（模板字节序透传）
 #include "verificationmanager.h"
 #include "deliverymanager.h"
@@ -662,6 +665,19 @@ void MainWindow::onBatchReadTask(const BatchTask &task)
 
 void MainWindow::onBatchWriteTask(const BatchTask &task)
 {
+    // 点位级写保护 / 联锁：批量任务也必须走同一套判定，否则保护可被绕过。
+    QString guardReason;
+    if (!checkPointWriteAllowed(task.deviceId, task.serverAddress,
+                                static_cast<int>(task.registerType), task.startAddress,
+                                task.quantity, &guardReason)) {
+        logMessage(QStringLiteral("BATCH-WRITE-BLOCKED [%1] %2").arg(task.name, guardReason), 3);
+        if (m_securityManager)
+            m_securityManager->audit(QStringLiteral("batch"), QStringLiteral("WRITE_BLOCKED"),
+                                     guardReason);
+        m_batchTaskManager->onTaskFinished(task.id, false, guardReason, {});
+        return;
+    }
+
     QModbusClient *client = clientForDevice(task.deviceId);
     if (!client || client->state() != QModbusDevice::ConnectedState) {
         m_batchTaskManager->onTaskFinished(task.id, false, "Not connected", {});
@@ -783,6 +799,18 @@ void MainWindow::executeRemoteWrite(int serverAddress, int registerType, int sta
 {
     if (!modbusDevice || modbusDevice->state() != QModbusDevice::ConnectedState) {
         callback(QJsonObject{{"success", false}, {"error", "Modbus device not connected"}});
+        return;
+    }
+
+    // 点位级写保护 / 联锁：远程 API 不得绕过本地保护。
+    QString guardReason;
+    if (!checkPointWriteAllowed(0, serverAddress, registerType, startAddress,
+                                values.size(), &guardReason)) {
+        if (m_securityManager)
+            m_securityManager->audit(QStringLiteral("remote"), QStringLiteral("WRITE_BLOCKED"),
+                                     guardReason);
+        callback(QJsonObject{{"success", false}, {"error", guardReason},
+                             {"blocked", true}});
         return;
     }
 
@@ -1936,12 +1964,307 @@ void MainWindow::showDatabaseSettings()
         }
 
         refreshStatus();
+        // 数据库路径可能已变化：同步刷新定时备份的源库列表，避免继续备份旧路径。
+        configureReportScheduler();
         statusBar()->showMessage(tr("Database settings saved"), 4000);
         QMessageBox::information(&dialog, tr("Database Settings"),
                                  tr("Database settings saved. History and alarm databases now use the new paths."));
     });
 
     dialog.exec();
+}
+
+// ============ 定时报表 + 数据库自动备份 ============
+
+void MainWindow::configureReportScheduler()
+{
+    if (!m_reportScheduler)
+        return;
+
+    const QString appData = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    SchedulerConfig cfg;
+    cfg.reportEnabled = m_appSettings.value(QStringLiteral("report/enabled"), false).toBool();
+    cfg.reportIntervalMinutes = qMax(1, m_appSettings.value(QStringLiteral("report/intervalMinutes"), 60).toInt());
+    cfg.reportDir = m_appSettings.value(QStringLiteral("report/dir"),
+                                        appData + QStringLiteral("/reports")).toString();
+    cfg.reportRetention = m_appSettings.value(QStringLiteral("report/retention"), 30).toInt();
+
+    cfg.backupEnabled = m_appSettings.value(QStringLiteral("backup/enabled"), false).toBool();
+    cfg.backupIntervalMinutes = qMax(1, m_appSettings.value(QStringLiteral("backup/intervalMinutes"), 60).toInt());
+    cfg.backupDir = m_appSettings.value(QStringLiteral("backup/dir"),
+                                        appData + QStringLiteral("/backups")).toString();
+    cfg.backupRetention = m_appSettings.value(QStringLiteral("backup/retention"), 14).toInt();
+
+    const QString historyPath = m_appSettings.value(QStringLiteral("history/dbPath"),
+                                                    appData + QStringLiteral("/history.db")).toString();
+    const QString alarmPath = m_appSettings.value(QStringLiteral("alarm/dbPath"),
+                                                  QFileInfo(historyPath).absolutePath() + QStringLiteral("/alarms.db")).toString();
+    const QString outboxPath = m_appSettings.value(QStringLiteral("mqtt/outboxPath"),
+                                                   appData + QStringLiteral("/mqtt_outbox.db")).toString();
+    cfg.databasePaths = QStringList{historyPath, alarmPath, outboxPath};
+
+    m_reportScheduler->setConfig(cfg);
+    m_reportScheduler->start();
+}
+
+void MainWindow::showScheduledTasks()
+{
+    const QString appData = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QDialog dialog(this);
+    dialog.setWindowTitle(tr("Scheduled Reports & Database Backup"));
+    dialog.resize(640, 520);
+    auto *layout = new QVBoxLayout(&dialog);
+
+    // ---------- 定时报表 ----------
+    auto *reportGroup = new QGroupBox(tr("Scheduled Reports"), &dialog);
+    auto *reportForm = new QFormLayout(reportGroup);
+    auto *reportEnabled = new QCheckBox(tr("Enable scheduled reports"), reportGroup);
+    reportEnabled->setChecked(m_appSettings.value(QStringLiteral("report/enabled"), false).toBool());
+    auto *reportInterval = new QSpinBox(reportGroup);
+    reportInterval->setRange(1, 10080);
+    reportInterval->setSuffix(tr(" min"));
+    reportInterval->setValue(qMax(1, m_appSettings.value(QStringLiteral("report/intervalMinutes"), 60).toInt()));
+    auto *reportDirEdit = new QLineEdit(
+        m_appSettings.value(QStringLiteral("report/dir"), appData + QStringLiteral("/reports")).toString(),
+        reportGroup);
+    auto *reportBrowse = new QPushButton(tr("Browse..."), reportGroup);
+    auto *reportDirRow = new QWidget(reportGroup);
+    auto *reportDirLayout = new QHBoxLayout(reportDirRow);
+    reportDirLayout->setContentsMargins(0, 0, 0, 0);
+    reportDirLayout->addWidget(reportDirEdit);
+    reportDirLayout->addWidget(reportBrowse);
+    auto *reportRetention = new QSpinBox(reportGroup);
+    reportRetention->setRange(0, 3650);
+    reportRetention->setValue(m_appSettings.value(QStringLiteral("report/retention"), 30).toInt());
+    reportRetention->setSpecialValueText(tr("Keep all"));
+    auto *reportRunBtn = new QPushButton(tr("Generate Report Now"), reportGroup);
+    auto *reportStatus = new QLabel(tr("Not run yet"), reportGroup);
+    reportStatus->setWordWrap(true);
+    reportForm->addRow(QString(), reportEnabled);
+    reportForm->addRow(tr("Interval"), reportInterval);
+    reportForm->addRow(tr("Output directory"), reportDirRow);
+    reportForm->addRow(tr("Keep latest"), reportRetention);
+    reportForm->addRow(QString(), reportRunBtn);
+    reportForm->addRow(tr("Last result"), reportStatus);
+    layout->addWidget(reportGroup);
+
+    // ---------- 数据库备份 ----------
+    auto *backupGroup = new QGroupBox(tr("Database Auto Backup"), &dialog);
+    auto *backupForm = new QFormLayout(backupGroup);
+    auto *backupEnabled = new QCheckBox(tr("Enable automatic database backup"), backupGroup);
+    backupEnabled->setChecked(m_appSettings.value(QStringLiteral("backup/enabled"), false).toBool());
+    auto *backupInterval = new QSpinBox(backupGroup);
+    backupInterval->setRange(1, 10080);
+    backupInterval->setSuffix(tr(" min"));
+    backupInterval->setValue(qMax(1, m_appSettings.value(QStringLiteral("backup/intervalMinutes"), 60).toInt()));
+    auto *backupDirEdit = new QLineEdit(
+        m_appSettings.value(QStringLiteral("backup/dir"), appData + QStringLiteral("/backups")).toString(),
+        backupGroup);
+    auto *backupBrowse = new QPushButton(tr("Browse..."), backupGroup);
+    auto *backupDirRow = new QWidget(backupGroup);
+    auto *backupDirLayout = new QHBoxLayout(backupDirRow);
+    backupDirLayout->setContentsMargins(0, 0, 0, 0);
+    backupDirLayout->addWidget(backupDirEdit);
+    backupDirLayout->addWidget(backupBrowse);
+    auto *backupRetention = new QSpinBox(backupGroup);
+    backupRetention->setRange(0, 3650);
+    backupRetention->setValue(m_appSettings.value(QStringLiteral("backup/retention"), 14).toInt());
+    backupRetention->setSpecialValueText(tr("Keep all"));
+    auto *backupRunBtn = new QPushButton(tr("Back Up Now"), backupGroup);
+    auto *backupStatus = new QLabel(tr("Not run yet"), backupGroup);
+    backupStatus->setWordWrap(true);
+    backupForm->addRow(QString(), backupEnabled);
+    backupForm->addRow(tr("Interval"), backupInterval);
+    backupForm->addRow(tr("Backup directory"), backupDirRow);
+    backupForm->addRow(tr("Keep latest"), backupRetention);
+    backupForm->addRow(QString(), backupRunBtn);
+    backupForm->addRow(tr("Last result"), backupStatus);
+    layout->addWidget(backupGroup);
+
+    auto *hint = new QLabel(tr("Backups use SQLite VACUUM INTO, so they are consistent snapshots "
+                               "even while WAL files are in use. A restart is not required."),
+                            &dialog);
+    hint->setWordWrap(true);
+    layout->addWidget(hint);
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Close, &dialog);
+    layout->addWidget(buttons);
+
+    auto refreshStatus = [this, reportStatus, backupStatus]() {
+        if (!m_reportScheduler)
+            return;
+        reportStatus->setText(m_reportScheduler->lastReportTime().isValid()
+                                  ? tr("%1 (%2)")
+                                        .arg(m_reportScheduler->lastReportTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")),
+                                             m_reportScheduler->lastReportPath())
+                                  : tr("Not run yet"));
+        backupStatus->setText(m_reportScheduler->lastBackupTime().isValid()
+                                  ? tr("%1 (%2)")
+                                        .arg(m_reportScheduler->lastBackupTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")),
+                                             m_reportScheduler->lastBackupSummary())
+                                  : tr("Not run yet"));
+    };
+
+    connect(reportBrowse, &QPushButton::clicked, &dialog, [&]() {
+        const QString dir = QFileDialog::getExistingDirectory(
+            &dialog, tr("Select Report Output Directory"), reportDirEdit->text());
+        if (!dir.isEmpty())
+            reportDirEdit->setText(dir);
+    });
+    connect(backupBrowse, &QPushButton::clicked, &dialog, [&]() {
+        const QString dir = QFileDialog::getExistingDirectory(
+            &dialog, tr("Select Backup Directory"), backupDirEdit->text());
+        if (!dir.isEmpty())
+            backupDirEdit->setText(dir);
+    });
+    connect(reportRunBtn, &QPushButton::clicked, &dialog, [&]() {
+        if (!m_reportScheduler)
+            return;
+        // 手动执行前先把当前界面上的目录/周期写回调度器，避免"改了没保存就点运行"。
+        SchedulerConfig cfg = m_reportScheduler->config();
+        cfg.reportDir = reportDirEdit->text().trimmed();
+        cfg.reportIntervalMinutes = reportInterval->value();
+        cfg.reportRetention = reportRetention->value();
+        m_reportScheduler->setConfig(cfg);
+        const bool ok = m_reportScheduler->runReportsNow();
+        refreshStatus();
+        if (ok)
+            QMessageBox::information(&dialog, tr("Scheduled Reports"),
+                                     tr("Report generated:\n%1").arg(m_reportScheduler->lastReportPath()));
+        else
+            QMessageBox::warning(&dialog, tr("Scheduled Reports"),
+                                 tr("Report generation failed. Check the log for details."));
+    });
+    connect(backupRunBtn, &QPushButton::clicked, &dialog, [&]() {
+        if (!m_reportScheduler)
+            return;
+        SchedulerConfig cfg = m_reportScheduler->config();
+        cfg.backupDir = backupDirEdit->text().trimmed();
+        cfg.backupIntervalMinutes = backupInterval->value();
+        cfg.backupRetention = backupRetention->value();
+        m_reportScheduler->setConfig(cfg);
+        const bool ok = m_reportScheduler->runBackupNow();
+        refreshStatus();
+        if (ok)
+            QMessageBox::information(&dialog, tr("Database Auto Backup"),
+                                     tr("Backup completed:\n%1").arg(m_reportScheduler->lastBackupSummary()));
+        else
+            QMessageBox::warning(&dialog, tr("Database Auto Backup"),
+                                 tr("Backup failed. Check the log for details."));
+    });
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, [&]() {
+        m_appSettings.setValue(QStringLiteral("report/enabled"), reportEnabled->isChecked());
+        m_appSettings.setValue(QStringLiteral("report/intervalMinutes"), reportInterval->value());
+        m_appSettings.setValue(QStringLiteral("report/dir"), reportDirEdit->text().trimmed());
+        m_appSettings.setValue(QStringLiteral("report/retention"), reportRetention->value());
+        m_appSettings.setValue(QStringLiteral("backup/enabled"), backupEnabled->isChecked());
+        m_appSettings.setValue(QStringLiteral("backup/intervalMinutes"), backupInterval->value());
+        m_appSettings.setValue(QStringLiteral("backup/dir"), backupDirEdit->text().trimmed());
+        m_appSettings.setValue(QStringLiteral("backup/retention"), backupRetention->value());
+        m_appSettings.sync();
+        configureReportScheduler();
+        statusBar()->showMessage(tr("Scheduled task settings saved"), 4000);
+        dialog.accept();
+    });
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    refreshStatus();
+    dialog.exec();
+}
+
+// ============ 整站配置一键导出 / 导入 ============
+
+void MainWindow::exportSiteConfig()
+{
+    // 先落盘当前设置，保证导出的 bundle 与界面一致。
+    saveSettings();
+
+    const QString defaultName = QDir::homePath()
+        + QStringLiteral("/fieldlink-site-")
+        + QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss"))
+        + QStringLiteral(".json");
+    const QString filePath = QFileDialog::getSaveFileName(
+        this, tr("Export Site Configuration"), defaultName, tr("JSON Files (*.json)"));
+    if (filePath.isEmpty())
+        return;
+
+    QStringList skipped;
+    QString error;
+    const QStringList files{QStringLiteral("points.json"), QStringLiteral("templates.json")};
+    const QByteArray bundle = SiteConfigBundle::buildBundle(
+        QCoreApplication::applicationDirPath(), files, m_appSettings,
+        QCoreApplication::applicationVersion(), &skipped, &error);
+    if (bundle.isEmpty()) {
+        QMessageBox::warning(this, tr("Export Site Configuration"),
+                             tr("Export failed: %1").arg(error));
+        return;
+    }
+    if (!SiteConfigBundle::writeBundleFile(filePath, bundle, &error)) {
+        QMessageBox::warning(this, tr("Export Site Configuration"),
+                             tr("Cannot write bundle: %1").arg(error));
+        return;
+    }
+
+    QString message = tr("Site configuration exported to:\n%1").arg(filePath);
+    if (!skipped.isEmpty())
+        message += QStringLiteral("\n\n") + tr("Skipped missing files: %1").arg(skipped.join(QStringLiteral(", ")));
+    message += QStringLiteral("\n\n")
+               + tr("The bundle contains device, serial port, MQTT, security and UI settings. "
+                    "Store it like a password and do not share it publicly.");
+    QMessageBox::information(this, tr("Export Site Configuration"), message);
+    logMessage(tr("Site configuration exported: %1").arg(filePath));
+}
+
+void MainWindow::importSiteConfig()
+{
+    const QString filePath = QFileDialog::getOpenFileName(
+        this, tr("Import Site Configuration"), QDir::homePath(), tr("JSON Files (*.json)"));
+    if (filePath.isEmpty())
+        return;
+
+    QByteArray bundle;
+    QString error;
+    if (!SiteConfigBundle::readBundleFile(filePath, &bundle, &error)
+        || !SiteConfigBundle::validateBundle(bundle, &error)) {
+        QMessageBox::warning(this, tr("Import Site Configuration"),
+                             tr("Invalid bundle: %1").arg(error));
+        return;
+    }
+
+    if (QMessageBox::question(
+            this, tr("Import Site Configuration"),
+            tr("Importing will overwrite points.json / templates.json and the application settings "
+               "stored in this bundle.\n\n"
+               "Existing files are backed up under config_backups/ before being replaced.\n\n"
+               "Continue?"),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {
+        return;
+    }
+
+    QStringList written;
+    QStringList warnings;
+    if (!SiteConfigBundle::applyBundle(bundle, QCoreApplication::applicationDirPath(),
+                                       m_appSettings, &written, &warnings, &error)) {
+        QMessageBox::warning(this, tr("Import Site Configuration"),
+                             tr("Import failed: %1").arg(error));
+        return;
+    }
+
+    m_appSettings.sync();
+    loadSettings();
+    m_deviceManager->loadFromSettings(m_appSettings);
+    m_pointModel->loadFromFile(pointFilePath());
+    m_templateManager->loadFromFile(templateFilePath());
+    rebuildPointPollTasks();
+    configureReportScheduler();
+
+    QString message = tr("Site configuration imported. %1 file(s) written.").arg(written.size());
+    if (!warnings.isEmpty())
+        message += QStringLiteral("\n") + warnings.join(QStringLiteral("\n"));
+    message += QStringLiteral("\n\n")
+               + tr("Restart FieldLink to fully apply security, MQTT and remote-service settings.");
+    QMessageBox::information(this, tr("Import Site Configuration"), message);
+    logMessage(tr("Site configuration imported from: %1").arg(filePath));
 }
 
 void MainWindow::publishMqttTelemetry(int deviceId, int serverAddress, int registerType,
@@ -2359,8 +2682,8 @@ void MainWindow::showPointManager()
     dialog.resize(1280, 720);
     auto *layout = new QVBoxLayout(&dialog);
     auto *table = new QTableWidget(&dialog);
-    table->setColumnCount(19);
-    table->setHorizontalHeaderLabels({"ID", tr("Name"), tr("Device"), tr("Slave"), tr("Register"), tr("Address"), tr("Count"), tr("Data type"), tr("Scale"), tr("Offset"), tr("Unit"), tr("Alarm low"), tr("Alarm high"), tr("Archive"), tr("Archive interval"), tr("Poll interval"), tr("Archive deadband"), tr("Current value"), tr("Quality code")});
+    table->setColumnCount(21);
+    table->setHorizontalHeaderLabels({"ID", tr("Name"), tr("Device"), tr("Slave"), tr("Register"), tr("Address"), tr("Count"), tr("Data type"), tr("Scale"), tr("Offset"), tr("Unit"), tr("Alarm low"), tr("Alarm high"), tr("Archive"), tr("Archive interval"), tr("Poll interval"), tr("Archive deadband"), tr("Current value"), tr("Quality code"), tr("Write lock"), tr("Interlock")});
     table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
     table->setSelectionBehavior(QAbstractItemView::SelectRows);
     table->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -2378,7 +2701,7 @@ void MainWindow::showPointManager()
             const auto &p = points[row];
             const auto v = currentPointValue(m_pointModel, p.id);
             const QString deviceName = deviceDisplayName(p.deviceId);
-            const QStringList cells = {QString::number(p.id), p.name, deviceName, QString::number(p.serverAddress), registerTypeName(static_cast<int>(p.registerType)), QString::number(p.address), QString::number(p.count), p.dataType, QString::number(p.scale), QString::number(p.offset), p.unit, QString::number(p.alarmLow), QString::number(p.alarmHigh), p.archiveEnabled ? tr("Yes") : tr("No"), QString::number(p.archiveIntervalSec), QString::number(p.pollIntervalSec), QString::number(p.archiveDeadband), v.timestamp.isValid() ? QString::number(v.value, 'f', 3) : QStringLiteral("--"), pointQualityName(v.quality)};
+            const QStringList cells = {QString::number(p.id), p.name, deviceName, QString::number(p.serverAddress), registerTypeName(static_cast<int>(p.registerType)), QString::number(p.address), QString::number(p.count), p.dataType, QString::number(p.scale), QString::number(p.offset), p.unit, QString::number(p.alarmLow), QString::number(p.alarmHigh), p.archiveEnabled ? tr("Yes") : tr("No"), QString::number(p.archiveIntervalSec), QString::number(p.pollIntervalSec), QString::number(p.archiveDeadband), v.timestamp.isValid() ? QString::number(v.value, 'f', 3) : QStringLiteral("--"), pointQualityName(v.quality), p.writeProtected ? tr("Yes") : tr("No"), p.interlockEnabled ? tr("Point %1").arg(p.interlockPointId) : tr("No")};
             for (int col = 0; col < cells.size(); ++col)
                 table->setItem(row, col, new QTableWidgetItem(cells[col]));
         }
@@ -2418,13 +2741,40 @@ void MainWindow::showPointManager()
         auto *archiveInterval = new QSpinBox(&editor); archiveInterval->setRange(1, 86400); archiveInterval->setValue(isNew ? 5 : point.archiveIntervalSec);
         auto *pollInterval = new QSpinBox(&editor); pollInterval->setRange(1, 3600); pollInterval->setValue(isNew ? 1 : point.pollIntervalSec);
         auto *archiveDeadband = new QDoubleSpinBox(&editor); archiveDeadband->setRange(0, 999999999); archiveDeadband->setDecimals(6); archiveDeadband->setValue(isNew ? 0.0 : point.archiveDeadband);
-        form->addRow(tr("Device"), device); form->addRow(tr("Name"), name); form->addRow(tr("Slave address"), server); form->addRow(tr("Register type"), regType); form->addRow(tr("Address"), address); form->addRow(tr("Count"), count); form->addRow(tr("Data type"), dataType); form->addRow(tr("Byte order"), byteOrder); form->addRow(tr("Scale"), scale); form->addRow(tr("Offset"), offset); form->addRow(tr("Unit"), unit); form->addRow(tr("Alarm low"), alarmLow); form->addRow(tr("Alarm high"), alarmHigh); form->addRow(tr("Archive enabled"), archiveEnabled); form->addRow(tr("Archive interval (s)"), archiveInterval); form->addRow(tr("Poll interval (s)"), pollInterval); form->addRow(tr("Archive deadband"), archiveDeadband);
+        // 写保护 / 联锁
+        auto *writeProtected = new QCheckBox(&editor);
+        writeProtected->setChecked(isNew ? false : point.writeProtected);
+        auto *writeProtectNote = new QLineEdit(isNew ? QString() : point.writeProtectNote, &editor);
+        writeProtectNote->setPlaceholderText(tr("Optional note shown when a write is rejected"));
+        auto *interlockEnabled = new QCheckBox(&editor);
+        interlockEnabled->setChecked(isNew ? false : point.interlockEnabled);
+        auto *interlockPoint = new QComboBox(&editor);
+        interlockPoint->addItem(tr("None"), 0);
+        for (const PointDefinition &candidate : m_pointModel->points()) {
+            if (!isNew && candidate.id == point.id)
+                continue;   // 自联锁没有意义
+            interlockPoint->addItem(tr("%1 (ID%2)").arg(candidate.name).arg(candidate.id), candidate.id);
+        }
+        {
+            const int index = interlockPoint->findData(isNew ? 0 : point.interlockPointId);
+            interlockPoint->setCurrentIndex(index >= 0 ? index : 0);
+        }
+        auto *interlockMin = new QDoubleSpinBox(&editor); interlockMin->setRange(-999999999, 999999999); interlockMin->setDecimals(6); interlockMin->setValue(isNew ? 0.0 : point.interlockMin);
+        auto *interlockMax = new QDoubleSpinBox(&editor); interlockMax->setRange(-999999999, 999999999); interlockMax->setDecimals(6); interlockMax->setValue(isNew ? 0.0 : point.interlockMax);
+        form->addRow(tr("Device"), device); form->addRow(tr("Name"), name); form->addRow(tr("Slave address"), server); form->addRow(tr("Register type"), regType); form->addRow(tr("Address"), address); form->addRow(tr("Count"), count); form->addRow(tr("Data type"), dataType); form->addRow(tr("Byte order"), byteOrder); form->addRow(tr("Scale"), scale); form->addRow(tr("Offset"), offset); form->addRow(tr("Unit"), unit); form->addRow(tr("Alarm low"), alarmLow); form->addRow(tr("Alarm high"), alarmHigh); form->addRow(tr("Archive enabled"), archiveEnabled); form->addRow(tr("Archive interval (s)"), archiveInterval); form->addRow(tr("Poll interval (s)"), pollInterval); form->addRow(tr("Archive deadband"), archiveDeadband); form->addRow(tr("Write protection"), writeProtected); form->addRow(tr("Write protection note"), writeProtectNote); form->addRow(tr("Enable interlock"), interlockEnabled); form->addRow(tr("Interlock point"), interlockPoint); form->addRow(tr("Interlock minimum"), interlockMin); form->addRow(tr("Interlock maximum"), interlockMax);
         auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &editor);
         form->addRow(buttons);
         connect(buttons, &QDialogButtonBox::accepted, &editor, &QDialog::accept);
         connect(buttons, &QDialogButtonBox::rejected, &editor, &QDialog::reject);
         if (editor.exec() != QDialog::Accepted) return;
         point.name = name->text(); point.deviceId = device->currentData().toInt(); point.serverAddress = server->value(); point.registerType = registerTypeFromComboIndex(regType->currentIndex()); point.address = address->value(); point.count = count->value(); point.dataType = dataType->currentText(); point.byteOrder = static_cast<ByteOrder>(byteOrder->currentIndex()); point.scale = scale->value(); point.offset = offset->value(); point.unit = unit->text(); point.alarmLow = alarmLow->value(); point.alarmHigh = alarmHigh->value(); point.archiveEnabled = archiveEnabled->isChecked(); point.archiveIntervalSec = archiveInterval->value(); point.pollIntervalSec = pollInterval->value(); point.archiveDeadband = archiveDeadband->value();
+        point.writeProtected = writeProtected->isChecked();
+        point.writeProtectNote = writeProtectNote->text().trimmed();
+        point.interlockPointId = interlockPoint->currentData().toInt();
+        point.interlockEnabled = interlockEnabled->isChecked() && point.interlockPointId > 0;
+        // 区间写反时自动纠正，避免保存出一个永远不会放行的联锁。
+        point.interlockMin = qMin(interlockMin->value(), interlockMax->value());
+        point.interlockMax = qMax(interlockMin->value(), interlockMax->value());
         if (isNew) m_pointModel->addPoint(point); else m_pointModel->updatePoint(point);
         m_pointModel->saveToFile(pointFilePath()); refresh();
     };

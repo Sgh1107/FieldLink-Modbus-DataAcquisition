@@ -21,6 +21,7 @@ SOURCES += \
     test_security_config.cpp \
     test_p0_features.cpp \
     test_p1_alarm_mqtt.cpp \
+    test_p2_features.cpp \
     ../src/alarmmanager.cpp \
     ../src/alarmrepository.cpp \
     ../src/mqttoutbox.cpp \
@@ -34,6 +35,9 @@ SOURCES += \
     ../src/batchtaskmanager.cpp \
     ../src/dataparser.cpp \
     ../src/pointmodel.cpp \
+    ../src/writeguard.cpp \
+    ../src/reportscheduler.cpp \
+    ../src/siteconfigbundle.cpp \
     ../src/modbusdiagnostics.cpp \
     ../src/configprofile.cpp \
     ../src/remoteserver.cpp
@@ -53,6 +57,9 @@ HEADERS += \
     ../header/batchtaskmanager.h \
     ../header/dataparser.h \
     ../header/pointmodel.h \
+    ../header/writeguard.h \
+    ../header/reportscheduler.h \
+    ../header/siteconfigbundle.h \
     ../header/modbusdiagnostics.h \
     ../header/configprofile.h \
     ../header/remoteserver.h

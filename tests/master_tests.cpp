@@ -62,6 +62,10 @@ int p0FeatureFailed();
 void runP1AlarmMqttTests();
 int p1AlarmMqttPassed();
 int p1AlarmMqttFailed();
+// P2 定时报表/备份、整站配置、写保护联锁回归（定义在 test_p2_features.cpp）
+void runP2FeatureTests();
+int p2FeaturePassed();
+int p2FeatureFailed();
 
 // 全局开关：为 true 时跳过"依赖真实时间等待"的慢速用例。
 // 慢速用例必须等真实的连接超时/重连定时器（数秒到数十秒），
@@ -2276,6 +2280,11 @@ int main(int argc, char *argv[])
     runP1AlarmMqttTests();
     g_passed += p1AlarmMqttPassed();
     g_failed += p1AlarmMqttFailed();
+
+    // P2 定时报表/备份、整站配置、写保护联锁回归
+    runP2FeatureTests();
+    g_passed += p2FeaturePassed();
+    g_failed += p2FeatureFailed();
 
     printf("\n==== 汇总 ====\n");
     printf("PASS: %d  FAIL: %d  已确认已知问题: %d\n", g_passed, g_failed, g_issuesConfirmed);

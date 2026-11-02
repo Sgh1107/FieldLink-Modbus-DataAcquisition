@@ -21,6 +21,8 @@
 #include "reliabilitymanager.h"
 #include "securitymanager.h"
 #include "pointmodel.h"
+#include "writeguard.h"    // 点位级写保护 / 联锁
+#include "reportscheduler.h" // 定时报表 + 数据库自动备份
 #include "verificationmanager.h"
 #include "deliverymanager.h"
 #include "thememanager.h"  // 深色/浅色主题切换
@@ -697,6 +699,18 @@ void MainWindow::on_writeButton_clicked()
         return;
     }
 
+    // 点位级写保护 / 联锁：必须在任何 sendWriteRequest 之前拦截。
+    QString guardReason;
+    if (!checkPointWriteAllowed(0, ui->serverEdit->value(), static_cast<int>(table),
+                                start, count, &guardReason)) {
+        statusBar()->showMessage(guardReason, 6000);
+        logMessage(QStringLiteral("WRITE-BLOCKED %1").arg(guardReason), 3);
+        if (m_securityManager)
+            m_securityManager->audit(QStringLiteral("local"), QStringLiteral("WRITE_BLOCKED"),
+                                     guardReason);
+        return;
+    }
+
     for (uint i = 0; i < writeUnit.valueCount(); i++) {
         const int absolute = start + static_cast<int>(i);
         if (table == QModbusDataUnit::Coils)
@@ -773,6 +787,20 @@ void MainWindow::on_readWriteButton_clicked()
 
     QModbusDataUnit writeUnit = writeRequest();
     QModbusDataUnit::RegisterType table = writeUnit.registerType();
+
+    // 点位级写保护 / 联锁（读写组合请求同样要拦截）
+    QString guardReason;
+    if (!checkPointWriteAllowed(0, ui->serverEdit->value(), static_cast<int>(table),
+                                writeUnit.startAddress(),
+                                static_cast<int>(writeUnit.valueCount()), &guardReason)) {
+        statusBar()->showMessage(guardReason, 6000);
+        logMessage(QStringLiteral("READ-WRITE-BLOCKED %1").arg(guardReason), 3);
+        if (m_securityManager)
+            m_securityManager->audit(QStringLiteral("local"), QStringLiteral("WRITE_BLOCKED"),
+                                     guardReason);
+        return;
+    }
+
     for (uint i = 0; i < writeUnit.valueCount(); i++) {
         if (table == QModbusDataUnit::Coils)
             writeUnit.setValue(i, writeModel->m_coils[i + writeUnit.startAddress()]);
@@ -928,6 +956,21 @@ QModbusDataUnit MainWindow::writeRequest() const
     return QModbusDataUnit(table, startAddress, numberOfEntries);
 }
 
+bool MainWindow::checkPointWriteAllowed(int deviceId, int serverAddress, int registerType,
+                                        int startAddress, int count, QString *reason) const
+{
+    if (!m_pointModel)
+        return true;
+    const WriteGuardResult result = WriteGuard::check(
+        m_pointModel->points(), m_pointModel->currentValues(),
+        deviceId, serverAddress,
+        static_cast<QModbusDataUnit::RegisterType>(registerType),
+        startAddress, count);
+    if (reason)
+        *reason = result.reason;
+    return result.allowed;
+}
+
 void MainWindow::initAdvancedFeatures()
 {
     m_logViewer = new LogViewer(this);
@@ -996,6 +1039,20 @@ void MainWindow::initAdvancedFeatures()
     m_batchTaskManager = new BatchTaskManager(this);
     connect(m_batchTaskManager, &BatchTaskManager::executeReadTask, this, &MainWindow::onBatchReadTask);
     connect(m_batchTaskManager, &BatchTaskManager::executeWriteTask, this, &MainWindow::onBatchWriteTask);
+
+    // ---------- 定时报表 + 数据库自动备份 ----------
+    m_reportScheduler = new ReportScheduler(this);
+    m_reportScheduler->setReportSources(m_historyData, m_alarmRepository.data());
+    connect(m_reportScheduler, &ReportScheduler::reportGenerated, this, [this](const QString &path) {
+        logMessage(tr("Scheduled report generated: %1").arg(path));
+    });
+    connect(m_reportScheduler, &ReportScheduler::backupCompleted, this, [this](const QString &summary) {
+        logMessage(tr("Database backup completed: %1").arg(summary));
+    });
+    connect(m_reportScheduler, &ReportScheduler::error, this, [this](const QString &message) {
+        logMessage(tr("Scheduled task failed: %1").arg(message), 3);
+    });
+    configureReportScheduler();
     m_dashboard = new Dashboard();
     m_dashboard->setWindowTitle(tr("Industrial Data Dashboard"));
     m_dashboard->resize(900, 650);
@@ -1205,6 +1262,7 @@ void MainWindow::initMenus()
     advMenu->addAction(tr("Remote Service"), this, &MainWindow::toggleRemoteServer);
     advMenu->addAction(tr("MQTT Publishing"), this, &MainWindow::showMqttSettings);
     advMenu->addAction(tr("Database Settings"), this, &MainWindow::showDatabaseSettings);
+    advMenu->addAction(tr("Scheduled Reports & Backup"), this, &MainWindow::showScheduledTasks);
     advMenu->addAction(tr("Simulator (Modbus Slave)"), this, &MainWindow::showDeviceSimulator);
     advMenu->addAction(tr("Plugin Manager"), this, &MainWindow::showPluginManager);
     advMenu->addAction(tr("Point Manager"), this, &MainWindow::showPointManager);
@@ -1213,6 +1271,9 @@ void MainWindow::initMenus()
     QMenu *profileMenu = menuBar()->addMenu(tr("&Profile"));
     profileMenu->addAction(tr("Save Profile"), this, &MainWindow::saveProfile);
     profileMenu->addAction(tr("Load Profile"), this, &MainWindow::loadProfile);
+    profileMenu->addSeparator();
+    profileMenu->addAction(tr("Export Site Configuration..."), this, &MainWindow::exportSiteConfig);
+    profileMenu->addAction(tr("Import Site Configuration..."), this, &MainWindow::importSiteConfig);
 }
 
 // ============ 界面状态胶囊与多语言 ============

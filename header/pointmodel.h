@@ -45,6 +45,18 @@ struct PointDefinition {
     // 采集周期。与归档周期解耦：此前点位轮询周期直接借用 archiveIntervalSec*1000，
     // 想提高归档频率就不得不提高采集频率（或反之）。
     int pollIntervalSec = 1;
+
+    // ---------- 点位级写保护 / 联锁 ----------
+    // 写保护：为 true 时任何入口（手动/批量/远程）都不允许写该点位覆盖的地址。
+    bool writeProtected = false;
+    QString writeProtectNote;          // 可选备注，显示在点位管理与拒绝日志中
+    // 联锁：写该点位前要求 interlockPointId 的当前工程值处于
+    // [interlockMin, interlockMax] 且质量为 Good；读数缺失/质量非 Good 一律拒绝
+    // （fail-safe：宁可不写，也不要在未知工况下动作）。
+    bool interlockEnabled = false;
+    int interlockPointId = 0;          // 0 = 未绑定联锁点位
+    double interlockMin = 0.0;
+    double interlockMax = 0.0;
 };
 
 struct PointValue {
